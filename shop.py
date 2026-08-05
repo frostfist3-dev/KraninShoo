@@ -2,21 +2,34 @@ import random
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import DepositRequest, LicenseKey, Platform, Product, Purchase, Software, User
+
+# Прямой импорт из models (убран database.)
+from models import (
+    DepositRequest,
+    LicenseKey,
+    Platform,
+    Product,
+    Purchase,
+    Software,
+    User,
+)
 
 router = Router()
 
-# Твои реквизиты для оплаты
 CARDS = [
     "4441 1111 5555 7352 (Моно)",
     "4323 3473 8685 7285 (А-Банк)",
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-# ID админа, куда будут прилетать чеки на проверку
 ADMIN_ID = 8479717148
 
 
@@ -69,7 +82,6 @@ async def process_receipt(
   user_id = message.from_user.id
   photo_id = message.photo[-1].file_id
 
-  # Создаем запись заявки
   req = DepositRequest(user_id=user_id, amount=amount)
   session.add(req)
   await session.commit()
@@ -254,7 +266,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
   user = await session.get(User, user_id)
   software = await session.get(Software, product.software_id)
 
-  if user.balance < product.price:
+  if not user or user.balance < product.price:
     await callback.answer(
         "❌ Недостаточно средств на балансе! Пополните кошелек.", show_alert=True
     )
@@ -304,4 +316,3 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
   await callback.message.edit_text(
       success_text, reply_markup=keyboard, parse_mode="Markdown"
   )
-
