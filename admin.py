@@ -1,12 +1,10 @@
-
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from database.models import DepositRequest, LicenseKey, Product, Software, User
-
+from models import DepositRequest, LicenseKey, Product, Software, User
 router = Router()
 
 ADMIN_IDS = [8479717148]  # Твой Telegram ID
