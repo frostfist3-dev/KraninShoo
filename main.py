@@ -16,30 +16,40 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ==========================================
-# КОНФИГУРАЦИЯ
+# КОНФИГУРАЦИЯ И ПОДКЛЮЧЕНИЕ К БД
 # ==========================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///bot.db"
+    engine = create_async_engine(DATABASE_URL, echo=False)
 else:
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
-    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
+    # Приводим протокол к postgresql+asyncpg
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
+    
+    # Очищаем URL от параметров (?sslmode=..., ?channel_binding=...), которые ломают asyncpg
+    if "?" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.split("?")[0]
+        
+    # Включаем SSL безопасным способом через connect_args
+    engine = create_async_engine(
+        DATABASE_URL, 
+        echo=False, 
+        connect_args={"ssl": "require"}
+    )
 
-# Твои реквизиты для оплаты
+# Реквизиты для оплаты
 CARDS = [
     "4441 1111 5555 7352 (Моно)",
     "4323 3473 8685 7285 (А-Банк)",
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-ADMIN_ID = 8479717148
+ADMIN_ID = 8479717148  # Замени на свой настоящий Telegram ID
 ADMIN_IDS = [ADMIN_ID]
 
-engine = create_async_engine(DATABASE_URL, echo=False)
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
-
 router = Router()
 
 # ==========================================
@@ -103,7 +113,6 @@ class DepositRequest(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
-
 # ==========================================
 # MIDDLEWARE
 # ==========================================
@@ -116,7 +125,6 @@ class DbSessionMiddleware(BaseMiddleware):
         async with self.session_pool() as session:
             data["session"] = session
             return await handler(event, data)
-
 
 # ==========================================
 # СОСТОЯНИЯ (FSM)
@@ -133,9 +141,8 @@ class DepositStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_receipt = State()
 
-
 # ==========================================
-# ОСНОВНОЕ МЕНЮ И РЕГИСТРАЦИЯ (ДОБАВЛЕНО)
+# ОСНОВНОЕ МЕНЮ И РЕГИСТРАЦИЯ
 # ==========================================
 def get_main_menu_kb(user_id: int):
     keyboard = [
@@ -146,10 +153,8 @@ def get_main_menu_kb(user_id: int):
         keyboard.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-
 @router.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession):
-    # Регистрируем пользователя, если его нет в БД
     user = await session.get(User, message.from_user.id)
     if not user:
         user = User(id=message.from_user.id, username=message.from_user.username)
@@ -168,7 +173,6 @@ async def main_menu_handler(callback: CallbackQuery):
         reply_markup=get_main_menu_kb(callback.from_user.id)
     )
     await callback.answer()
-
 
 # ==========================================
 # КАТАЛОГ И ПОКУПКА
@@ -199,7 +203,7 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
     softwares = result.scalars().all()
 
     if not softwares:
-        text = f"🛒 **Kranin Shop — {platform.name}**\n\n❌ На данную платформу софт пока не добавлен."
+        text = f"🛒 **Kranin Shop — {platform.name if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")]])
         await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
         return
@@ -284,7 +288,6 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]])
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
-
 
 # ==========================================
 # ПОПОЛНЕНИЕ БАЛАНСА
@@ -401,7 +404,6 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена администратором.")
     except Exception:
         pass
-
 
 # ==========================================
 # ПАНЕЛЬ АДМИНИСТРАТОРА
@@ -555,7 +557,6 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession):
 
     await message.answer(f"✅ Загружено новых ключей: `{added}` для товара ID `{product_id}`", parse_mode="Markdown")
 
-
 # ==========================================
 # ЗАПУСК БОТА И ВЕБ-СЕРВЕРА
 # ==========================================
@@ -582,6 +583,10 @@ async def main():
     dp.include_router(router)
 
     await start_web_server()
+
+    # Автоматическое удаление старого Webhook перед началом Long Polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
     print("Бот и веб-заглушка успешно запущены!")
     await dp.start_polling(bot)
 
