@@ -200,7 +200,6 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
             session.add(user)
             await session.commit()
         else:
-            # Обновляем username, если он изменился
             if user.username != message.from_user.username:
                 user.username = message.from_user.username
                 await session.commit()
@@ -668,7 +667,7 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
         pass
 
 # ==========================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА (УДОБНАЯ ЗАГРУЗКА КЛЮЧЕЙ)
+# ПАНЕЛЬ АДМИНИСТРАТОРА
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery):
@@ -915,7 +914,6 @@ async def handle_ping(request):
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
-    app.router.add_head("/", handle_ping)  # Добавлено для корректной обработки HEAD запросов от Render
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
@@ -955,7 +953,6 @@ async def main():
 
     await start_web_server()
     
-    # Решение TelegramConflictError: принудительный сброс зависших апдейтов и вебхуков
     await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Бот и веб-заглушка запущены!")
