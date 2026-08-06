@@ -108,10 +108,8 @@ def user_display(message_or_callback) -> str:
 
 
 def parse_positive_amount(raw_text: str, max_amount: float = MAX_AMOUNT) -> float | None:
-    """
-    Безопасный парсинг положительной денежной суммы из текста.
-    Возвращает None, если значение некорректно (не число, <= 0, inf/nan, слишком большое).
-    """
+    # Безопасный парсинг положительной денежной суммы из текста.
+    # Возвращает None, если значение некорректно (не число, <= 0, inf/nan, слишком большое).
     if raw_text is None:
         return None
     try:
@@ -136,13 +134,11 @@ def log_balance_change(
     balance_after: float,
     related_id: int | None = None,
 ) -> None:
-    """
-    Добавляет запись в лог операций с балансом (таблица BalanceLog).
-    Не делает commit самостоятельно — запись уходит в базу вместе
-    с остальными изменениями текущей транзакции.
-    amount: дельта изменения баланса (положительная — начисление, отрицательная — списание)
-    balance_after: баланс пользователя ПОСЛЕ применения этой операции
-    """
+    # Добавляет запись в лог операций с балансом (таблица BalanceLog).
+    # Не делает commit самостоятельно — запись уходит в базу вместе
+    # с остальными изменениями текущей транзакции.
+    # amount: дельта изменения баланса (положительная — начисление, отрицательная — списание)
+    # balance_after: баланс пользователя ПОСЛЕ применения этой операции
     session.add(
         BalanceLog(
             user_id=user_id,
@@ -155,9 +151,7 @@ def log_balance_change(
 
 
 async def find_user_by_identifier(session: AsyncSession, raw_identifier: str) -> "User | None":
-    """
-    Ищет пользователя по Telegram ID (число) либо по username (с @ или без).
-    """
+    # Ищет пользователя по Telegram ID (число) либо по username (с @ или без).
     identifier = raw_identifier.strip()
     if identifier.startswith("@"):
         identifier = identifier[1:]
@@ -277,7 +271,7 @@ class WithdrawalRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class BalanceLog(Base):
-    """Журнал всех операций, меняющих баланс пользователя."""
+    # Журнал всех операций, меняющих баланс пользователя.
     __tablename__ = "balance_logs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
@@ -2276,11 +2270,11 @@ async def process_keys_upload(message: Message, state: FSMContext, session: Asyn
 # если процесс не слушает $PORT и не отвечает на HTTP. Бот работает через
 # long polling и сам по себе порт не открывает, поэтому поднимаем рядом
 # лёгкий aiohttp-сервер с простой HTML-страницей и /health для healthcheck.
-RENDER_STUB_HTML = """<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="utf-8">
-    <title>Kranin Shop Bot</title>
-    <style>
-        body { font-family: sans-serif; background:#0f172a; color:#e2e8f0; display:flex;
-               align-items:center; justify
+RENDER_STUB_HTML = (
+    "<!DOCTYPE html>"
+    "<html lang='ru'><head><meta charset='utf-8'>"
+    "<title>Kranin Shop Bot</title>"
+    "<style>"
+    "body{font-family:sans-serif;background:#0f172a;color:#e2e8f0;"
+    "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
+    "
