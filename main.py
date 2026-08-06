@@ -891,6 +891,17 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
     )
 
 # ==========================================
+# ФОЛЛБЕК ДЛЯ МЕДИА ВНЕ СОСТОЯНИЯ
+# ==========================================
+@router.message(F.photo | F.document)
+async def photo_without_state(message: Message):
+    await message.answer(
+        "⚠️ Я получил ваш файл, но заявка на пополнение не активирована.\n\n"
+        "Сначала перейдите в **«💳 Пополнить баланс»**, введите сумму и только после этого отправляйте чек!",
+        parse_mode="Markdown"
+    )
+
+# ==========================================
 # ЗАПУСК БОТА И ВЕБ-СЕРВЕРА
 # ==========================================
 async def handle_ping(request):
