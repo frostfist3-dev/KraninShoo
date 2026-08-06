@@ -102,6 +102,7 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(32), nullable=True)
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Platform(Base):
@@ -126,6 +127,7 @@ class Product(Base):
     price: Mapped[float] = mapped_column(Float)
     software = relationship("Software", back_populates="products")
     keys = relationship("LicenseKey", back_populates="product", cascade="all, delete-orphan")
+    subscriptions = relationship("RestockSubscription", back_populates="product", cascade="all, delete-orphan")
 
 class LicenseKey(Base):
     __tablename__ = "license_keys"
@@ -161,6 +163,28 @@ class WithdrawalRequest(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(50), unique=True)
+    amount: Mapped[float] = mapped_column(Float)
+    uses_left: Mapped[int] = mapped_column(Integer, default=1)
+
+class Review(Base):
+    __tablename__ = "reviews"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    rating: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class RestockSubscription(Base):
+    __tablename__ = "restock_subscriptions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    product = relationship("Product", back_populates="subscriptions")
+
 # ==========================================
 # MIDDLEWARE & STATES
 # ==========================================
@@ -172,6 +196,16 @@ class DbSessionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         async with self.session_pool() as session:
             data["session"] = session
+            # Проверка на бан
+            user_obj = getattr(event, "from_user", None)
+            if user_obj:
+                user = await session.get(User, user_obj.id)
+                if user and user.is_banned:
+                    if isinstance(event, Message):
+                        await event.answer("❌ Ваш аккаунт заблокирован в боте.")
+                    elif isinstance(event, CallbackQuery):
+                        await event.answer("❌ Ваш аккаунт заблокирован.", show_alert=True)
+                    return
             return await handler(event, data)
 
 class AdminStates(StatesGroup):
@@ -180,6 +214,12 @@ class AdminStates(StatesGroup):
     waiting_for_duration = State()
     waiting_for_price = State()
     waiting_for_keys = State()
+    waiting_for_promo_code = State()
+    waiting_for_promo_amount = State()
+    waiting_for_promo_uses = State()
+    waiting_for_broadcast_text = State()
+    waiting_for_user_id = State()
+    waiting_for_user_balance_change = State()
 
 class DepositStates(StatesGroup):
     waiting_for_amount = State()
@@ -189,6 +229,10 @@ class WithdrawalStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_card = State()
 
+class UserStates(StatesGroup):
+    waiting_for_promo_input = State()
+    waiting_for_review_text = State()
+
 # ==========================================
 # ГЛАВНОЕ МЕНЮ И СТАРТ
 # ==========================================
@@ -197,6 +241,8 @@ def get_main_menu_kb(user_id: int):
         [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
          InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo"),
+         InlineKeyboardButton(text="⭐ Отзывы", callback_data="show_reviews")],
         [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
         [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
     ]
@@ -263,6 +309,107 @@ async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, stat
         parse_mode="Markdown"
     )
     await callback.answer()
+
+# ==========================================
+# ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ)
+# ==========================================
+@router.callback_query(F.data == "enter_promo")
+async def enter_promo_handler(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.waiting_for_promo_input)
+    await callback.message.edit_text(
+        "🎟 **Активация промокода**\n\nВведите ваш промокод:",
+        reply_markup=cancel_kb("main_menu"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(UserStates.waiting_for_promo_input)
+async def process_promo_activation(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте промокод текстом.", reply_markup=cancel_kb("main_menu"))
+        return
+    code_text = message.text.strip()
+    res = await session.execute(select(PromoCode).filter_by(code=code_text))
+    promo = res.scalars().first()
+
+    if not promo or promo.uses_left <= 0:
+        await message.answer("❌ Промокод не найден или срок его активаций исчерпан!", reply_markup=cancel_kb("main_menu"))
+        await state.clear()
+        return
+
+    user = await session.get(User, message.from_user.id)
+    user.balance += promo.amount
+    promo.uses_left -= 1
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"🎉 **Промокод успешно активирован!**\nВам начислено `{promo.amount:.2f} грн` на баланс.",
+        reply_markup=get_main_menu_kb(message.from_user.id),
+        parse_mode="Markdown"
+    )
+
+# ==========================================
+# ОТЗЫВЫ
+# ==========================================
+@router.callback_query(F.data == "show_reviews")
+async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Review).order_by(Review.created_at.desc()).limit(5))
+    reviews = res.scalars().all()
+
+    text_msg = "⭐ **Последние отзывы клиентов**\n━━━━━━━━━━━━━━━━━━━\n\n"
+    if not reviews:
+        text_msg += "Пока нет ни одного отзыва. Будьте первыми!"
+    else:
+        for r in reviews:
+            stars = "⭐" * r.rating
+            date_str = r.created_at.strftime("%d.%m.%Y")
+            text_msg += f"{stars} от `ID {r.user_id}` ({date_str})\n💬 _{escape_md(r.text)}_\n──────────────\n"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="leave_review")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "leave_review")
+async def leave_review_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    user_id = callback.from_user.id
+    purchases_res = await session.execute(select(Purchase).where(Purchase.user_id == user_id))
+    if not purchases_res.scalars().first():
+        await callback.answer("❌ Вы можете оставлять отзывы только после совершения покупок в боте!", show_alert=True)
+        return
+
+    await state.set_state(UserStates.waiting_for_review_text)
+    await callback.message.edit_text(
+        "✍️ **Оставить отзыв**\n\nНапишите ваш текст отзыва (можно указать оценку от 1 до 5 в начале, например: `5 Отличный софт!`):",
+        reply_markup=cancel_kb("show_reviews"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(UserStates.waiting_for_review_text)
+async def save_review_handler(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте текст отзыва.", reply_markup=cancel_kb("show_reviews"))
+        return
+    text_val = message.text.strip()
+    rating = 5
+    if text_val[0].isdigit() and int(text_val[0]) in range(1, 6):
+        rating = int(text_val[0])
+        text_val = text_val[1:].strip()
+
+    review = Review(user_id=message.from_user.id, rating=rating, text=text_val)
+    session.add(review)
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        "✅ **Спасибо за ваш отзыв!** Он опубликован в общем списке.",
+        reply_markup=get_main_menu_kb(message.from_user.id),
+        parse_mode="Markdown"
+    )
 
 # ==========================================
 # ПРОФИЛЬ И КУПЛЕННЫЕ КЛЮЧИ
@@ -339,7 +486,7 @@ async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
     await callback.answer()
 
 # ==========================================
-# КАТАЛОГ И ПОКУПКИ
+# КАТАЛОГ И ПОКУПКИ С УВЕДОМЛЕНИЯМИ (RESTOCK)
 # ==========================================
 @router.callback_query(F.data == "shop")
 async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
@@ -417,13 +564,16 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
 
         if available_keys > 0:
             status_text = f"🟢 В наличии ({available_keys} шт.)"
+            buttons.append([InlineKeyboardButton(
+                text=f"{status_text} | {p.duration} — {p.price:.2f} грн",
+                callback_data=f"buy_product_{p.id}"
+            )])
         else:
             status_text = "🔴 Нет в наличии"
-
-        buttons.append([InlineKeyboardButton(
-            text=f"{status_text} | {p.duration} — {p.price:.2f} грн",
-            callback_data=f"buy_product_{p.id}"
-        )])
+            buttons.append([InlineKeyboardButton(
+                text=f"{status_text} | {p.duration} — {p.price:.2f} грн",
+                callback_data=f"notify_restock_{p.id}"
+            )])
 
     buttons.append([InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")])
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
@@ -431,6 +581,21 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
 
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
+
+@router.callback_query(F.data.startswith("notify_restock_"))
+async def notify_restock_handler(callback: CallbackQuery, session: AsyncSession):
+    product_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    existing = await session.execute(select(RestockSubscription).filter_by(user_id=user_id, product_id=product_id))
+    if existing.scalars().first():
+        await callback.answer("🔔 Вы уже подписаны на уведомление об этом товаре!", show_alert=True)
+        return
+
+    sub = RestockSubscription(user_id=user_id, product_id=product_id)
+    session.add(sub)
+    await session.commit()
+    await callback.answer("✅ Готово! Бот уведомит вас, когда ключи поступят в продажу.", show_alert=True)
 
 @router.callback_query(F.data.startswith("buy_product_"))
 async def process_purchase(callback: CallbackQuery, session: AsyncSession):
@@ -500,6 +665,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data="leave_review")],
         [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
         [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
@@ -848,7 +1014,7 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     await callback.answer()
 
 # ==========================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА (С ПОДТВЕРЖДЕНИЯМИ)
+# ПАНЕЛЬ АДМИНИСТРАТОРА И РАСШИРЕННЫЕ ФУНКЦИИ
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery, state: FSMContext):
@@ -866,13 +1032,204 @@ async def admin_menu(callback: CallbackQuery, state: FSMContext):
              InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
             [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"),
              InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
+            [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo"),
+             InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_start_broadcast")],
+            [InlineKeyboardButton(text="👤 Управление пользователем", callback_data="admin_user_manage")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
-# --- УДАЛЕНИЕ СОФТА С ПОДТВЕРЖДЕНИЕМ ---
+# --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
+@router.callback_query(F.data == "admin_create_promo", F.from_user.id.in_(ADMIN_IDS))
+async def admin_create_promo_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_promo_code)
+    await callback.message.edit_text(
+        "🎟 **Создание промокода (1/3)**\n\nВведите текстовый код промокода (например: `START2026`):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_promo_code, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_code_entered(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Введите текст промокода.")
+        return
+    await state.update_data(code=message.text.strip())
+    await state.set_state(AdminStates.waiting_for_promo_amount)
+    await message.answer("🎟 **Создание промокода (2/3)**\n\nВведите бонусную сумму в гривнах (число):", reply_markup=cancel_kb("admin_panel"))
+
+@router.message(AdminStates.waiting_for_promo_amount, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_amount_entered(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Введите корректное число для суммы.")
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(AdminStates.waiting_for_promo_uses)
+    await message.answer("🎟 **Создание промокода (3/3)**\n\nВведите максимальное количество активаций (число):", reply_markup=cancel_kb("admin_panel"))
+
+@router.message(AdminStates.waiting_for_promo_uses, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_uses_entered(message: Message, state: FSMContext, session: AsyncSession):
+    try:
+        uses = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ Введите целое число для активаций.")
+        return
+    data = await state.get_data()
+    code = data.get("code")
+    amount = data.get("amount")
+
+    promo = PromoCode(code=code, amount=amount, uses_left=uses)
+    session.add(promo)
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Промокод `{escape_md(code)}` на `{amount:.2f} грн` (активаций: `{uses}`) успешно создан!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- РАССЫЛКА СООБЩЕНИЙ ---
+@router.callback_query(F.data == "admin_start_broadcast", F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_broadcast_text)
+    await callback.message.edit_text(
+        "📢 **Рассылка сообщений**\n\nОтправьте текст или сообщение для рассылки всем пользователям бота:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_broadcast_text, F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_execute(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    await state.clear()
+    users_res = await session.execute(select(User.id))
+    user_ids = users_res.scalars().all()
+
+    success = 0
+    blocked = 0
+    await message.answer(f"⏳ Рассылка началась по {len(user_ids)} пользователям...")
+
+    for uid in user_ids:
+        try:
+            await message.send_copy(chat_id=uid)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            blocked += 1
+
+    await message.answer(
+        f"✅ **Рассылка завершена!**\n\n• Успешно доставлено: `{success}`\n• Заблокировали бота: `{blocked}`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕМ ---
+@router.callback_query(F.data == "admin_user_manage", F.from_user.id.in_(ADMIN_IDS))
+async def admin_user_manage_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await callback.message.edit_text(
+        "👤 **Управление пользователем**\n\nВведите Telegram ID пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_user_id, F.from_user.id.in_(ADMIN_IDS))
+async def admin_user_info_show(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("❌ Введите корректный ID числом.")
+        return
+    target_id = int(message.text.strip())
+    user = await session.get(User, target_id)
+    if not user:
+        await message.answer("❌ Пользователь с таким ID не найден в базе данных.", reply_markup=cancel_kb("admin_panel"))
+        return
+
+    await state.update_data(target_user_id=target_id)
+    purchases_cnt = await session.scalar(select(func.count(Purchase.id)).where(Purchase.user_id == target_id))
+
+    info_text = (
+        f"👤 **Информация о пользователе**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"👤 Username: @{escape_md(user.username) if user.username else 'отсутствует'}\n"
+        f"💰 Баланс: `{user.balance:.2f} грн`\n"
+        f"🛍 Покупок: `{purchases_cnt}`\n"
+        f"🚫 Заблокирован: `{'Да' if user.is_banned else 'Нет'}`\n"
+        f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y %H:%M')}`"
+    )
+
+    ban_btn_text = "🔓 Разблокировать" if user.is_banned else "🔒 Заблокировать"
+    ban_action = f"admin_unban_{target_id}" if user.is_banned else f"admin_ban_{target_id}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Изменить баланс", callback_data=f"admin_ch_bal_{target_id}")],
+        [InlineKeyboardButton(text=ban_btn_text, callback_data=ban_action)],
+        [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]
+    ])
+    await state.clear()
+    await message.answer(info_text, reply_markup=keyboard, parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("admin_ban_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_ban_user(callback: CallbackQuery, session: AsyncSession):
+    uid = int(callback.data.split("_")[2])
+    user = await session.get(User, uid)
+    if user:
+        user.is_banned = True
+        await session.commit()
+        await callback.answer("✅ Пользователь заблокирован!", show_alert=True)
+    else:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_unban_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_unban_user(callback: CallbackQuery, session: AsyncSession):
+    uid = int(callback.data.split("_")[2])
+    user = await session.get(User, uid)
+    if user:
+        user.is_banned = False
+        await session.commit()
+        await callback.answer("✅ Пользователь разблокирован!", show_alert=True)
+    else:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_ch_bal_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_change_balance_start(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.split("_")[3])
+    await state.update_data(target_user_id=uid)
+    await state.set_state(AdminStates.waiting_for_user_balance_change)
+    await callback.message.edit_text(
+        "💰 **Изменение баланса**\n\nВведите новое значение баланса или изменение (+100 / -50) числом:",
+        reply_markup=cancel_kb("admin_panel"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_user_balance_change, F.from_user.id.in_(ADMIN_IDS))
+async def admin_change_balance_finish(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    uid = data.get("target_user_id")
+    if not message.text:
+        return
+    try:
+        val = float(message.text.strip().replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Введите корректное число.")
+        return
+
+    user = await session.get(User, uid)
+    if user:
+        user.balance = val
+        await session.commit()
+        await state.clear()
+        await message.answer(f"✅ Баланс пользователя `{uid}` успешно изменен на `{val:.2f} грн`.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]))
+
+# --- УДАЛЕНИЕ СОФТА И ТАРИФОВ (СОХРАНЕНО ИЗ ПРОШЛОЙ ВЕРСИИ) ---
 @router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
     res = await session.execute(select(Software))
@@ -930,7 +1287,6 @@ async def admin_delete_software(callback: CallbackQuery, session: AsyncSession):
     )
     await callback.answer()
 
-# --- УДАЛЕНИЕ ТАРИФА С ПОДТВЕРЖДЕНИЕМ ---
 @router.callback_query(F.data == "admin_del_prod_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_prod_select(callback: CallbackQuery, session: AsyncSession):
     res = await session.execute(select(Product))
@@ -992,7 +1348,6 @@ async def admin_delete_product(callback: CallbackQuery, session: AsyncSession):
     )
     await callback.answer()
 
-# --- ОЧИСТКА КЛЮЧЕЙ С ПОДТВЕРЖДЕНИЕМ ---
 @router.callback_query(F.data == "admin_del_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_keys_select(callback: CallbackQuery, session: AsyncSession):
     products_res = await session.execute(select(Product))
@@ -1102,7 +1457,6 @@ async def delete_all_keys(callback: CallbackQuery, session: AsyncSession):
     )
     await callback.answer()
 
-# --- ЗАГРУЗКА КЛЮЧЕЙ ---
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
     products_res = await session.execute(select(Product))
@@ -1191,6 +1545,28 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
                 duplicates += 1
 
         await session.commit()
+        
+        # --- АВТОМАТИЧЕСКАЯ РАССЫЛКА ПОДПИСЧИКАМ О ПОСТУПЛЕНИИ (RESTOCK) ---
+        if added > 0:
+            subs_res = await session.execute(select(RestockSubscription).where(RestockSubscription.product_id == product_id))
+            subscriptions = subs_res.scalars().all()
+            if subscriptions:
+                software = await session.get(Software, product.software_id)
+                sw_name = software.name if software else "Товар"
+                for sub in subscriptions:
+                    try:
+                        await bot.send_message(
+                            sub.user_id,
+                            f"🔔 **Поступление товара!**\nДля товара `{escape_md(sw_name)}` (`{escape_md(product.duration)}`) появились новые ключи в наличии!",
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                # Удаляем подписки после уведомления
+                for sub in subscriptions:
+                    await session.delete(sub)
+                await session.commit()
+
         await state.clear()
 
         result_msg = f"✅ **Успешно загружено ключей: {added}**"
@@ -1264,7 +1640,6 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
         logger.error(f"Ошибка при сохранении софта: {e}")
         await message.answer("⚠️ Не удалось сохранить софт. Ошибка БД.")
 
-# --- СОЗДАНИЕ ТАРИФА (ВЫБОР СОФТА КНОПКАМИ ВМЕСТО ID) ---
 @router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
 async def add_prod_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     await state.clear()
