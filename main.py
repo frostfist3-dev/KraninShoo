@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import CommandObject, CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -91,6 +91,33 @@ def user_display(message_or_callback) -> str:
 
 
 # ==========================================
+# ЛОКАЛИЗАЦИЯ И ЯЗЫКИ
+# ==========================================
+LANGUAGES = {
+    "uk": {
+        "welcome": "💎 **Ласкаво просимо в Kranin Shop!**\n⚡️ Надійний сервіс цифрових ліцензій та софту.\n\n💰 **Ваш баланс:** `{balance:.2f} грн`\n\n👇 Виберіть потрібний розділ у меню нижче:",
+        "banned": "❌ Ваш акаунт заблоковано в боті.",
+        "lang_changed": "✅ Мову успішно змінено на українську.",
+        "lang_btn": "🌐 Змінити мову / Сменить язык"
+    },
+    "ru": {
+        "welcome": "💎 **Добро пожаловать в Kranin Shop!**\n⚡️ Надежный сервис цифровых лицензий и софта.\n\n💰 **Ваш баланс:** `{balance:.2f} грн`\n\n👇 Выберите интересующий раздел в меню ниже:",
+        "banned": "❌ Ваш аккаунт заблокирован в боте.",
+        "lang_changed": "✅ Язык успешно изменен на русский.",
+        "lang_btn": "🌐 Изменить язык / Змінити мову"
+    }
+}
+
+def get_language_kb():
+    keyboard = [
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data="lang_uk"),
+         InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+# ==========================================
 # МОДЕЛИ БАЗЫ ДАННЫХ
 # ==========================================
 class Base(DeclarativeBase):
@@ -103,6 +130,7 @@ class User(Base):
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    language: Mapped[str] = mapped_column(String(10), default="uk")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Platform(Base):
@@ -196,15 +224,16 @@ class DbSessionMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         async with self.session_pool() as session:
             data["session"] = session
-            # Проверка на бан
             user_obj = getattr(event, "from_user", None)
             if user_obj:
                 user = await session.get(User, user_obj.id)
                 if user and user.is_banned:
+                    lang = user.language if user.language in LANGUAGES else "uk"
+                    msg_text = LANGUAGES[lang]["banned"]
                     if isinstance(event, Message):
-                        await event.answer("❌ Ваш аккаунт заблокирован в боте.")
+                        await event.answer(msg_text)
                     elif isinstance(event, CallbackQuery):
-                        await event.answer("❌ Ваш аккаунт заблокирован.", show_alert=True)
+                        await event.answer(msg_text, show_alert=True)
                     return
             return await handler(event, data)
 
@@ -236,7 +265,8 @@ class UserStates(StatesGroup):
 # ==========================================
 # ГЛАВНОЕ МЕНЮ И СТАРТ
 # ==========================================
-def get_main_menu_kb(user_id: int):
+def get_main_menu_kb(user_id: int, lang: str = "uk"):
+    texts = LANGUAGES.get(lang, LANGUAGES["uk"])
     keyboard = [
         [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
@@ -244,6 +274,7 @@ def get_main_menu_kb(user_id: int):
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo"),
          InlineKeyboardButton(text="⭐ Отзывы", callback_data="show_reviews")],
         [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
         [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
     ]
     if user_id in ADMIN_IDS:
@@ -251,13 +282,9 @@ def get_main_menu_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def get_main_menu_text(balance: float) -> str:
-    return (
-        "💎 **Добро пожаловать в Kranin Shop!**\n"
-        "⚡️ Надежный сервис цифровых лицензий и софта.\n\n"
-        f"💰 **Ваш баланс:** `{balance:.2f} грн`\n\n"
-        "👇 Выберите интересующий раздел в меню ниже:"
-    )
+def get_main_menu_text(balance: float, lang: str = "uk") -> str:
+    texts = LANGUAGES.get(lang, LANGUAGES["uk"])
+    return texts["welcome"].format(balance=balance)
 
 
 def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
@@ -279,7 +306,8 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
             user = User(
                 id=message.from_user.id,
                 username=message.from_user.username,
-                referred_by=referrer_id
+                referred_by=referrer_id,
+                language="uk"
             )
             session.add(user)
             await session.commit()
@@ -288,9 +316,10 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
                 user.username = message.from_user.username
                 await session.commit()
 
+        lang = user.language if user and user.language in LANGUAGES else "uk"
         await message.answer(
-            get_main_menu_text(user.balance),
-            reply_markup=get_main_menu_kb(message.from_user.id),
+            get_main_menu_text(user.balance, lang),
+            reply_markup=get_main_menu_kb(message.from_user.id, lang),
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -303,12 +332,45 @@ async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, stat
     await state.clear()
     user = await session.get(User, callback.from_user.id)
     balance = user.balance if user else 0.0
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+    
     await callback.message.edit_text(
-        get_main_menu_text(balance),
-        reply_markup=get_main_menu_kb(callback.from_user.id),
+        get_main_menu_text(balance, lang),
+        reply_markup=get_main_menu_kb(callback.from_user.id, lang),
         parse_mode="Markdown"
     )
     await callback.answer()
+
+# ==========================================
+# СМЕНА ЯЗЫКА
+# ==========================================
+@router.callback_query(F.data == "change_lang")
+async def change_lang_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🌐 **Виберіть мову / Выберите язык:**",
+        reply_markup=get_language_kb(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.in_({"lang_uk", "lang_ru"}))
+async def set_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    lang_code = "uk" if callback.data == "lang_uk" else "ru"
+    user = await session.get(User, callback.from_user.id)
+    if user:
+        user.language = lang_code
+        await session.commit()
+
+    texts = LANGUAGES[lang_code]
+    balance = user.balance if user else 0.0
+
+    await callback.message.edit_text(
+        get_main_menu_text(balance, lang_code),
+        reply_markup=get_main_menu_kb(callback.from_user.id, lang_code),
+        parse_mode="Markdown"
+    )
+    await callback.answer(texts["lang_changed"])
 
 # ==========================================
 # ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ)
@@ -343,9 +405,10 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     await session.commit()
     await state.clear()
 
+    lang = user.language if user and user.language in LANGUAGES else "uk"
     await message.answer(
         f"🎉 **Промокод успешно активирован!**\nВам начислено `{promo.amount:.2f} грн` на баланс.",
-        reply_markup=get_main_menu_kb(message.from_user.id),
+        reply_markup=get_main_menu_kb(message.from_user.id, lang),
         parse_mode="Markdown"
     )
 
@@ -405,9 +468,12 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
     await session.commit()
     await state.clear()
 
+    user = await session.get(User, message.from_user.id)
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+
     await message.answer(
         "✅ **Спасибо за ваш отзыв!** Он опубликован в общем списке.",
-        reply_markup=get_main_menu_kb(message.from_user.id),
+        reply_markup=get_main_menu_kb(message.from_user.id, lang),
         parse_mode="Markdown"
     )
 
@@ -779,12 +845,13 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
     await session.commit()
     await state.clear()
 
+    lang = user.language if user and user.language in LANGUAGES else "uk"
     await message.answer(
         f"✅ **Заявка на вывод создана!**\n\n"
         f"💰 Сумма: `{amount:.2f} грн`\n"
         f"💳 Карта: `{escape_md(card)}`\n\n"
         f"⏳ Ожидайте обработки администратором.",
-        reply_markup=get_main_menu_kb(user_id),
+        reply_markup=get_main_menu_kb(user_id, lang),
         parse_mode="Markdown"
     )
 
@@ -915,9 +982,12 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
     await session.commit()
 
     await state.clear()
+    user = await session.get(User, user_id)
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+
     await message.answer(
         "⏳ **Чек принят!** Заявка отправлена администратору на проверку.",
-        reply_markup=get_main_menu_kb(user_id),
+        reply_markup=get_main_menu_kb(user_id, lang),
         parse_mode="Markdown"
     )
 
@@ -1162,6 +1232,7 @@ async def admin_user_info_show(message: Message, state: FSMContext, session: Asy
         f"💰 Баланс: `{user.balance:.2f} грн`\n"
         f"🛍 Покупок: `{purchases_cnt}`\n"
         f"🚫 Заблокирован: `{'Да' if user.is_banned else 'Нет'}`\n"
+        f"🌐 Язык: `{user.language}`\n"
         f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y %H:%M')}`"
     )
 
@@ -1229,7 +1300,7 @@ async def admin_change_balance_finish(message: Message, state: FSMContext, sessi
         await state.clear()
         await message.answer(f"✅ Баланс пользователя `{uid}` успешно изменен на `{val:.2f} грн`.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]))
 
-# --- УДАЛЕНИЕ СОФТА И ТАРИФОВ (СОХРАНЕНО ИЗ ПРОШЛОЙ ВЕРСИИ) ---
+# --- УДАЛЕНИЕ СОФТА И ТАРИФОВ ---
 @router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
     res = await session.execute(select(Software))
@@ -1546,7 +1617,6 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
 
         await session.commit()
         
-        # --- АВТОМАТИЧЕСКАЯ РАССЫЛКА ПОДПИСЧИКАМ О ПОСТУПЛЕНИИ (RESTOCK) ---
         if added > 0:
             subs_res = await session.execute(select(RestockSubscription).where(RestockSubscription.product_id == product_id))
             subscriptions = subs_res.scalars().all()
@@ -1562,7 +1632,6 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
                         )
                     except Exception:
                         pass
-                # Удаляем подписки после уведомления
                 for sub in subscriptions:
                     await session.delete(sub)
                 await session.commit()
@@ -1778,8 +1847,22 @@ async def main():
             except Exception as e:
                 logger.info(f"Миграция timestamptz пропущена/уже выполнена: {e}")
 
+        # Миграция для is_banned
         try:
-            await conn.execute(text("ALTER TABLE purchases ADD COLUMN duration VARCHAR(50) DEFAULT ''"))
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN DEFAULT FALSE;"))
+            logger.info("Колонка users.is_banned добавлена/проверена.")
+        except Exception as e:
+            logger.info(f"Миграция is_banned пропущена: {e}")
+
+        # Миграция для language (выбор языка)
+        try:
+            await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS language VARCHAR(10) DEFAULT 'uk';"))
+            logger.info("Колонка users.language добавлена/проверена.")
+        except Exception as e:
+            logger.info(f"Миграция language пропущена: {e}")
+
+        try:
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS duration VARCHAR(50) DEFAULT ''"))
             logger.info("Колонка purchases.duration добавлена.")
         except Exception as e:
             logger.info(f"Колонка purchases.duration уже существует/миграция пропущена: {e}")
