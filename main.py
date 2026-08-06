@@ -16,13 +16,11 @@ import shop
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Настройка подключения к БД
 if not DATABASE_URL:
   DATABASE_URL = "sqlite+aiosqlite:///bot.db"
 else:
   DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://")
   DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-
   if "sslmode=" in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.split("?")[0] + "?ssl=require"
 
@@ -32,14 +30,12 @@ async_session = async_sessionmaker(
 )
 
 
-# Middleware БД
 async def db_session_middleware(handler, event, data):
   async with async_session() as session:
     data["session"] = session
     return await handler(event, data)
 
 
-# Веб-сервер для прохождения Health Check на Render
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
 
@@ -52,11 +48,13 @@ async def start_web_server():
   port = int(os.getenv("PORT", 8080))
   site = web.TCPSite(runner, "0.0.0.0", port)
   await site.start()
+  # Держим веб-сервер активным
+  await asyncio.Event().wait()
 
 
-async def main():
+async def start_bot():
   if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+    raise ValueError("BOT_TOKEN не задан!")
 
   bot = Bot(token=BOT_TOKEN)
   dp = Dispatcher(storage=MemoryStorage())
@@ -67,17 +65,18 @@ async def main():
   dp.include_router(shop.router)
   dp.include_router(admin.router)
 
-  # Инициализация таблиц
   async with engine.begin() as conn:
     await conn.run_sync(Base.metadata.create_all)
 
-  # Запуск веб-сервера для Render
-  await start_web_server()
-
-  # Сброс вебхука и запуск поллинга
+  # Сбрасываем старый вебхук и накопившиеся входящие апдейты
   await bot.delete_webhook(drop_pending_updates=True)
-  print("Бот и веб-сервер успешно запущены!")
+  print("Бот успешно запущен в режиме polling!")
   await dp.start_polling(bot)
+
+
+async def main():
+  # Запускаем параллельно веб-сервер и поллинг бота
+  await asyncio.gather(start_web_server(), start_bot())
 
 
 if __name__ == "__main__":
