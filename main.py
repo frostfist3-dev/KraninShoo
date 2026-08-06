@@ -20,6 +20,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    func,
     select,
     text,
 )
@@ -62,8 +63,7 @@ CARDS = [
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-ADMIN_ID = 8479717148
-ADMIN_IDS = [ADMIN_ID]
+ADMIN_IDS = [8479717148]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 router = Router()
@@ -129,6 +129,15 @@ class DepositRequest(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+class WithdrawalRequest(Base):
+    __tablename__ = "withdrawal_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    amount: Mapped[float] = mapped_column(Float)
+    card: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 # ==========================================
 # MIDDLEWARE & STATES
 # ==========================================
@@ -154,13 +163,18 @@ class DepositStates(StatesGroup):
     waiting_for_amount = State()
     waiting_for_receipt = State()
 
+class WithdrawalStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_card = State()
+
 # ==========================================
 # ГЛАВНОЕ МЕНЮ И СТАРТ
 # ==========================================
 def get_main_menu_kb(user_id: int):
     keyboard = [
         [InlineKeyboardButton(text="🛒 Открыть магазин", callback_data="shop")],
-        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")]
+        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")]
     ]
     if user_id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
@@ -186,8 +200,9 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
             await session.commit()
 
         await message.answer(
-            "👋 Главное меню Kranin Shop\n\nВыберите раздел:",
-            reply_markup=get_main_menu_kb(message.from_user.id)
+            f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{user.balance:.2f} грн`\n\nВыберите раздел:",
+            reply_markup=get_main_menu_kb(message.from_user.id),
+            parse_mode="Markdown"
         )
     except Exception as e:
         await session.rollback()
@@ -195,15 +210,18 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
         await message.answer("⚠️ Произошла ошибка. Попробуйте снова.")
 
 @router.callback_query(F.data == "main_menu")
-async def main_menu_handler(callback: CallbackQuery):
+async def main_menu_handler(callback: CallbackQuery, session: AsyncSession):
+    user = await session.get(User, callback.from_user.id)
+    balance = user.balance if user else 0.0
     await callback.message.edit_text(
-        "👋 Главное меню Kranin Shop\n\nВыберите раздел:",
-        reply_markup=get_main_menu_kb(callback.from_user.id)
+        f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{balance:.2f} грн`\n\nВыберите раздел:",
+        reply_markup=get_main_menu_kb(callback.from_user.id),
+        parse_mode="Markdown"
     )
     await callback.answer()
 
 # ==========================================
-# КАТАЛОГ И ПОКУПКИ
+# КАТАЛОГ И ПОКУПКИ (С НАЧИСЛЕНИЕМ 5% РЕФЕРАЛУ)
 # ==========================================
 @router.callback_query(F.data == "shop")
 async def show_platforms(callback: CallbackQuery, session: AsyncSession):
@@ -268,7 +286,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
         available_keys = len(keys_res.scalars().all())
 
         status = "🟢" if available_keys > 0 else "🔴"
-        buttons.append([InlineKeyboardButton(text=f"{status} {p.duration} — {p.price} RUB", callback_data=f"buy_product_{p.id}")])
+        buttons.append([InlineKeyboardButton(text=f"{status} {p.duration} — {p.price:.2f} грн", callback_data=f"buy_product_{p.id}")])
 
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"platform_{software.platform_id}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -286,7 +304,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     software = await session.get(Software, product.software_id)
 
     if user.balance < product.price:
-        await callback.answer("❌ Недостаточно средств на балансе!", show_alert=True)
+        await callback.answer(f"❌ Недостаточно средств! Требуется {product.price:.2f} грн", show_alert=True)
         return
 
     key_res = await session.execute(select(LicenseKey).filter_by(product_id=product.id, is_sold=False).limit(1))
@@ -299,6 +317,21 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     user.balance -= product.price
     license_key.is_sold = True
 
+    # 🤝 Реферальный бонус 5%
+    if user.referred_by:
+        referrer = await session.get(User, user.referred_by)
+        if referrer:
+            ref_bonus = round(product.price * 0.05, 2)
+            referrer.balance += ref_bonus
+            try:
+                await callback.bot.send_message(
+                    referrer.id,
+                    f"🎉 **Реферальный бонус!**\nВаш реферал совершил покупку. Вам начислено `{ref_bonus:.2f} грн` на баланс!",
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление рефереру {referrer.id}: {e}")
+
     purchase = Purchase(
         user_id=user.id,
         product_name=f"{software.name} ({product.duration})",
@@ -310,6 +343,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     success_text = (
         f"✅ **Покупка успешно завершена!**\n\n"
         f"📦 Товар: `{software.name} — {product.duration}`\n"
+        f"💳 Списано: `{product.price:.2f} грн`\n"
         f"🔑 Ваш ключ:\n`{license_key.key_string}`\n\n"
         f"📌 Нажмите на ключ, чтобы скопировать."
     )
@@ -318,13 +352,181 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ==========================================
-# ПОПОЛНЕНИЕ БАЛАНСА
+# РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ (ОТ 500 ГРН)
+# ==========================================
+@router.callback_query(F.data == "ref_program")
+async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    user_id = callback.from_user.id
+    user = await session.get(User, user_id)
+
+    ref_count_res = await session.execute(select(func.count(User.id)).where(User.referred_by == user_id))
+    total_refs = ref_count_res.scalar() or 0
+
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+
+    text_msg = (
+        f"🤝 **Реферальная программа**\n\n"
+        f"Приглашайте друзей и получайте **5%** от каждой их покупки!\n"
+        f"Эти деньги поступают на ваш общий баланс. Вы можете использовать их для покупки софта или **вывести на карту** (от 500 грн).\n\n"
+        f"👥 Приглашено рефералов: `{total_refs}`\n"
+        f"💰 Ваш баланс: `{user.balance:.2f} грн`\n\n"
+        f"🔗 Ваша реферальная ссылка:\n`{ref_link}`"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Вывести средства (от 500 грн)", callback_data="start_withdrawal")],
+            [InlineKeyboardButton(text="🛒 Купить софт за баланс", callback_data="shop")],
+            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]
+        ]
+    )
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+
+@router.callback_query(F.data == "start_withdrawal")
+async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    user = await session.get(User, callback.from_user.id)
+    if user.balance < 500:
+        await callback.answer(f"❌ Минимальная сумма вывода 500 грн. На вашем балансе: {user.balance:.2f} грн", show_alert=True)
+        return
+
+    await state.set_state(WithdrawalStates.waiting_for_amount)
+    await callback.message.edit_text(
+        f"📤 **Вывод средств**\n\nВаш доступный баланс: `{user.balance:.2f} грн`\n"
+        f"Введите сумму вывода (минимум 500 грн):",
+        parse_mode="Markdown"
+    )
+
+@router.message(WithdrawalStates.waiting_for_amount)
+async def process_withdrawal_amount(message: Message, state: FSMContext, session: AsyncSession):
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        user = await session.get(User, message.from_user.id)
+
+        if amount < 500:
+            await message.answer("❌ Минимальная сумма вывода — 500 грн. Введите сумму повторно:")
+            return
+        if amount > user.balance:
+            await message.answer(f"❌ У вас недостаточно средств! Доступно: `{user.balance:.2f} грн`. Введите сумму:", parse_mode="Markdown")
+            return
+
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму числом!")
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(WithdrawalStates.waiting_for_card)
+    await message.answer("💳 Введите номер банковской карты для получения выплаты:")
+
+@router.message(WithdrawalStates.waiting_for_card)
+async def process_withdrawal_card(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    card = message.text.strip()
+    data = await state.get_data()
+    amount = data["amount"]
+    user_id = message.from_user.id
+
+    user = await session.get(User, user_id)
+    if user.balance < amount:
+        await message.answer("❌ Недостаточно средств на балансе.")
+        await state.clear()
+        return
+
+    # Списываем средства до подтверждения администратором
+    user.balance -= amount
+    req = WithdrawalRequest(user_id=user_id, amount=amount, card=card)
+    session.add(req)
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ **Заявка на вывод создана!**\n\n"
+        f"💰 Сумма: `{amount:.2f} грн`\n"
+        f"💳 Карта: `{card}`\n\n"
+        f"⏳ Ожидайте обработки администратором.",
+        parse_mode="Markdown"
+    )
+
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить выплату", callback_data=f"approve_wdr_{req.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_wdr_{req.id}")
+        ]]
+    )
+
+    # Уведомление всем администраторам
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📤 **Заявка на вывод средств #{req.id}**\n\n"
+                    f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
+                    f"💰 Сумма: `{amount:.2f} грн`\n"
+                    f"💳 Карта: `{card}`"
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о выводе админу {admin_id}: {e}")
+
+@router.callback_query(F.data.startswith("approve_wdr_"), F.from_user.id.in_(ADMIN_IDS))
+async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req = await session.get(WithdrawalRequest, req_id)
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "approved"
+    await session.commit()
+
+    await callback.message.edit_text(text=callback.message.text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None)
+    try:
+        await bot.send_message(
+            req.user_id,
+            f"🎉 **Ваша заявка на вывод `{req.amount:.2f} грн` успешно обработана!**\nСредства отправлены на карту `{req.card}`.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+@router.callback_query(F.data.startswith("reject_wdr_"), F.from_user.id.in_(ADMIN_IDS))
+async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req = await session.get(WithdrawalRequest, req_id)
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "rejected"
+    # Возврат баланса пользователю при отказе
+    user = await session.get(User, req.user_id)
+    if user:
+        user.balance += req.amount
+
+    await session.commit()
+
+    await callback.message.edit_text(text=callback.message.text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None)
+    try:
+        await bot.send_message(
+            req.user_id,
+            f"❌ Ваша заявка на вывод `{req.amount:.2f} грн` была отклонена. Средства возвращены на ваш баланс.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+# ==========================================
+# ПОПОЛНЕНИЕ БАЛАНСА (С РАССЫЛКОЙ ВСЕМ АДМИНАМ)
 # ==========================================
 @router.callback_query(F.data == "deposit")
 async def start_deposit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositStates.waiting_for_amount)
     await callback.message.edit_text(
-        "💳 **Пополнение баланса**\n\nВведите сумму пополнения числом:",
+        "💳 **Пополнение баланса**\n\nВведите сумму пополнения в гривнах числом:",
         parse_mode="Markdown"
     )
 
@@ -344,7 +546,7 @@ async def process_deposit_amount(message: Message, state: FSMContext):
 
     text_msg = (
         f"💳 **Оплата по реквизитам**\n\n"
-        f"Сумма: `{amount} RUB`\n\n"
+        f"Сумма: `{amount:.2f} грн`\n\n"
         f"Реквизиты:\n`{selected_card}`\n\n"
         f"📌 Переведите указанную сумму и **отправьте сюда фото чека**."
     )
@@ -371,17 +573,22 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         ]]
     )
 
-    await bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=photo_id,
-        caption=(
-            f"📥 **Заявка на пополнение #{req.id}**\n\n"
-            f"👤 Пользователь: `{user_id}` (@{message.from_user.username})\n"
-            f"💰 Сумма: `{amount} RUB`"
-        ),
-        reply_markup=admin_kb,
-        parse_mode="Markdown"
-    )
+    # Фикс: отправка рассылки чека ВСЕМ администраторам из ADMIN_IDS
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_photo(
+                chat_id=admin_id,
+                photo=photo_id,
+                caption=(
+                    f"📥 **Заявка на пополнение #{req.id}**\n\n"
+                    f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
+                    f"💰 Сумма: `{amount:.2f} грн`"
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить чек администратору {admin_id}: {e}")
 
 @router.callback_query(F.data.startswith("approve_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -400,7 +607,7 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
 
     await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None)
     try:
-        await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount} RUB!**", parse_mode="Markdown")
+        await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
     except Exception:
         pass
 
@@ -522,7 +729,7 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
     await state.update_data(duration=duration)
     await state.set_state(AdminStates.waiting_for_price)
 
-    text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nОтправьте **цену** (число):"
+    text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nОтправьте **цену в грн** (число):"
     await callback.message.edit_text(text_msg, parse_mode="Markdown")
     await callback.answer()
 
@@ -547,7 +754,7 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
         f"✅ **Тариф успешно создан!**\n\n"
         f"• ID товара для загрузки ключей: `{new_product.id}`\n"
         f"• Срок: `{duration}`\n"
-        f"• Цена: `{price} RUB`",
+        f"• Цена: `{price:.2f} грн`",
         parse_mode="Markdown"
     )
 
@@ -612,10 +819,11 @@ async def main():
                 await conn.execute(text("ALTER TABLE users ALTER COLUMN referred_by TYPE BIGINT;"))
                 await conn.execute(text("ALTER TABLE purchases ALTER COLUMN user_id TYPE BIGINT;"))
                 await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN user_id TYPE BIGINT;"))
+                await conn.execute(text("ALTER TABLE withdrawal_requests ALTER COLUMN user_id TYPE BIGINT;"))
             except Exception as e:
                 logger.info(f"Миграция колонок уже выполнена: {e}")
 
-    # Инициализация базовх платформ Android/iOS
+    # Инициализация базовых платформ Android/iOS
     async with async_session_maker() as session:
         result = await session.execute(select(Platform))
         platforms = result.scalars().all()
