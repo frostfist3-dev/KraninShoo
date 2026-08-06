@@ -39,6 +39,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Чтение ID админов из переменных окружения или значения по умолчанию
+raw_admin_ids = os.getenv("ADMIN_IDS", "8479717148")
+ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()]
+
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///bot.db"
     engine = create_async_engine(DATABASE_URL, echo=False)
@@ -62,8 +66,6 @@ CARDS = [
     "4323 3473 8685 7285 (А-Банк)",
     "5232 4410 4407 1160 (Альянс)",
 ]
-
-ADMIN_IDS = [8479717148]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 router = Router()
@@ -221,7 +223,7 @@ async def main_menu_handler(callback: CallbackQuery, session: AsyncSession):
     await callback.answer()
 
 # ==========================================
-# КАТАЛОГ И ПОКУПКИ (С НАЧИСЛЕНИЕМ 5% РЕФЕРАЛУ)
+# КАТАЛОГ И ПОКУПКИ
 # ==========================================
 @router.callback_query(F.data == "shop")
 async def show_platforms(callback: CallbackQuery, session: AsyncSession):
@@ -317,7 +319,6 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     user.balance -= product.price
     license_key.is_sold = True
 
-    # 🤝 Реферальный бонус 5%
     if user.referred_by:
         referrer = await session.get(User, user.referred_by)
         if referrer:
@@ -352,7 +353,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
 
 # ==========================================
-# РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ (ОТ 500 ГРН)
+# РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ
 # ==========================================
 @router.callback_query(F.data == "ref_program")
 async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -431,7 +432,6 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         await state.clear()
         return
 
-    # Списываем средства до подтверждения администратором
     user.balance -= amount
     req = WithdrawalRequest(user_id=user_id, amount=amount, card=card)
     session.add(req)
@@ -453,7 +453,6 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         ]]
     )
 
-    # Уведомление всем администраторам
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -502,7 +501,6 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
         return
 
     req.status = "rejected"
-    # Возврат баланса пользователю при отказе
     user = await session.get(User, req.user_id)
     if user:
         user.balance += req.amount
@@ -520,7 +518,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
         pass
 
 # ==========================================
-# ПОПОЛНЕНИЕ БАЛАНСА (С РАССЫЛКОЙ ВСЕМ АДМИНАМ)
+# ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ (ФОТО / ФАЙЛЫ)
 # ==========================================
 @router.callback_query(F.data == "deposit")
 async def start_deposit(callback: CallbackQuery, state: FSMContext):
@@ -548,16 +546,15 @@ async def process_deposit_amount(message: Message, state: FSMContext):
         f"💳 **Оплата по реквизитам**\n\n"
         f"Сумма: `{amount:.2f} грн`\n\n"
         f"Реквизиты:\n`{selected_card}`\n\n"
-        f"📌 Переведите указанную сумму и **отправьте сюда фото чека**."
+        f"📌 Переведите указанную сумму и **отправьте сюда фото или файл чека**."
     )
     await message.answer(text_msg, parse_mode="Markdown")
 
-@router.message(DepositStates.waiting_for_receipt, F.photo)
+@router.message(DepositStates.waiting_for_receipt, F.photo | F.document)
 async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
     data = await state.get_data()
     amount = data["amount"]
     user_id = message.from_user.id
-    photo_id = message.photo[-1].file_id
 
     req = DepositRequest(user_id=user_id, amount=amount)
     session.add(req)
@@ -573,20 +570,32 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         ]]
     )
 
-    # Фикс: отправка рассылки чека ВСЕМ администраторам из ADMIN_IDS
+    caption_text = (
+        f"📥 **Заявка на пополнение #{req.id}**\n\n"
+        f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
+        f"💰 Сумма: `{amount:.2f} грн`"
+    )
+
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_photo(
-                chat_id=admin_id,
-                photo=photo_id,
-                caption=(
-                    f"📥 **Заявка на пополнение #{req.id}**\n\n"
-                    f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
-                    f"💰 Сумма: `{amount:.2f} грн`"
-                ),
-                reply_markup=admin_kb,
-                parse_mode="Markdown"
-            )
+            if message.photo:
+                photo_id = message.photo[-1].file_id
+                await bot.send_photo(
+                    chat_id=admin_id,
+                    photo=photo_id,
+                    caption=caption_text,
+                    reply_markup=admin_kb,
+                    parse_mode="Markdown"
+                )
+            elif message.document:
+                doc_id = message.document.file_id
+                await bot.send_document(
+                    chat_id=admin_id,
+                    document=doc_id,
+                    caption=caption_text,
+                    reply_markup=admin_kb,
+                    parse_mode="Markdown"
+                )
         except Exception as e:
             logger.error(f"Не удалось отправить чек администратору {admin_id}: {e}")
 
@@ -605,7 +614,7 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
         user.balance += req.amount
     await session.commit()
 
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None)
+    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None) if callback.message.photo else await callback.message.edit_text(text=callback.message.text + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None)
     try:
         await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
     except Exception:
@@ -623,14 +632,14 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     req.status = "rejected"
     await session.commit()
 
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
+    await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None) if callback.message.photo else await callback.message.edit_text(text=callback.message.text + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
     try:
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
     except Exception:
         pass
 
 # ==========================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА
+# ПАНЕЛЬ АДМИНИСТРАТОРА (УДОБНАЯ ЗАГРУЗКА КЛЮЧЕЙ)
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery):
@@ -639,11 +648,106 @@ async def admin_menu(callback: CallbackQuery):
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw")],
             [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod")],
-            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys")],
+            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select")],
             [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")],
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+
+# Удобный выбор товара для загрузки ключей
+@router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
+async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
+    products_res = await session.execute(select(Product))
+    products = products_res.scalars().all()
+
+    if not products:
+        await callback.message.edit_text(
+            "❌ Сначала создайте хотя бы один тариф товара!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
+        )
+        return
+
+    text_msg = "📥 **Загрузка ключей | Выберите тариф**\n\nВыберите товар, для которого хотите загрузить ключи:"
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"🔑 {sw_name} ({p.duration}) — {p.price:.2f} грн", callback_data=f"key_prod_sel_{p.id}")])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("key_prod_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def start_key_upload(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    product_id = int(callback.data.split("_")[3])
+    product = await session.get(Product, product_id)
+    software = await session.get(Software, product.software_id)
+
+    await state.update_data(product_id=product_id)
+    await state.set_state(AdminStates.waiting_for_keys)
+
+    text_msg = (
+        f"📥 **Загрузка ключей для:** `{software.name} — {product.duration}`\n\n"
+        f"Отправьте ключи **текстовым сообщением** (каждый с новой строки) "
+        f"или прикрепите **.txt файл** с ключами:"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
+async def save_keys(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    product_id = data.get("product_id")
+
+    keys_text = ""
+    if message.document:
+        if not message.document.file_name.endswith(".txt"):
+            await message.answer("❌ Пожалуйста, отправьте файл в формате `.txt`.")
+            return
+        file = await bot.get_file(message.document.file_id)
+        downloaded = await bot.download_file(file.file_path)
+        keys_text = downloaded.read().decode("utf-8")
+    elif message.text:
+        keys_text = message.text
+
+    keys = [k.strip() for k in keys_text.strip().split("\n") if k.strip()]
+
+    if not keys:
+        await message.answer("❌ Сообщение или файл не содержат ключей!")
+        return
+
+    try:
+        product = await session.get(Product, product_id)
+        if not product:
+            await message.answer("❌ Ошибка: Выбранный тариф не найден в БД.")
+            await state.clear()
+            return
+
+        added = 0
+        duplicates = 0
+        for k in keys:
+            exists = await session.execute(select(LicenseKey).filter_by(key_string=k))
+            if not exists.scalars().first():
+                session.add(LicenseKey(product_id=product_id, key_string=k, is_sold=False))
+                added += 1
+            else:
+                duplicates += 1
+
+        await session.commit()
+        await state.clear()
+
+        result_msg = f"✅ **Успешно загружено ключей: {added}**"
+        if duplicates > 0:
+            result_msg += f"\n⚠️ Пропущено дубликатов: `{duplicates}`"
+
+        await message.answer(result_msg, parse_mode="Markdown")
+
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Ошибка сохранения ключей: {e}")
+        await message.answer("⚠️ Не удалось сохранить ключи. Ошибка БД.")
 
 @router.callback_query(F.data == "admin_add_sw", F.from_user.id.in_(ADMIN_IDS))
 async def add_sw_start(callback: CallbackQuery, state: FSMContext):
@@ -752,47 +856,11 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
 
     await message.answer(
         f"✅ **Тариф успешно создан!**\n\n"
-        f"• ID товара для загрузки ключей: `{new_product.id}`\n"
+        f"• ID товара: `{new_product.id}`\n"
         f"• Срок: `{duration}`\n"
         f"• Цена: `{price:.2f} грн`",
         parse_mode="Markdown"
     )
-
-@router.callback_query(F.data == "admin_add_keys", F.from_user.id.in_(ADMIN_IDS))
-async def add_keys_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_for_keys)
-    text_msg = (
-        "📥 **Загрузка ключей**\n\nОтправьте сообщение, где:\n1️⃣ Первая строка — **ID товара**\n"
-        "2️⃣ Со второй строки — ключи (каждый с новой строки)."
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
-
-@router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
-async def save_keys(message: Message, state: FSMContext, session: AsyncSession):
-    lines = message.text.strip().split("\n")
-    if len(lines) < 2:
-        await message.answer("❌ Отправьте ID товара и хотя бы 1 ключ.")
-        return
-
-    try:
-        product_id = int(lines[0].strip())
-        keys = [k.strip() for k in lines[1:] if k.strip()]
-    except ValueError:
-        await message.answer("❌ Первая строка должна быть числовым ID товара.")
-        return
-
-    added = 0
-    for k in keys:
-        exists = await session.execute(select(LicenseKey).filter_by(key_string=k))
-        if not exists.scalars().first():
-            session.add(LicenseKey(product_id=product_id, key_string=k, is_sold=False))
-            added += 1
-
-    await session.commit()
-    await state.clear()
-
-    await message.answer(f"✅ Загружено ключей: `{added}` для товара ID `{product_id}`", parse_mode="Markdown")
 
 # ==========================================
 # ЗАПУСК БОТА И ВЕБ-СЕРВЕРА
@@ -823,7 +891,6 @@ async def main():
             except Exception as e:
                 logger.info(f"Миграция колонок уже выполнена: {e}")
 
-    # Инициализация базовых платформ Android/iOS
     async with async_session_maker() as session:
         result = await session.execute(select(Platform))
         platforms = result.scalars().all()
