@@ -81,7 +81,7 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(32), nullable=True)
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Platform(Base):
     __tablename__ = "platforms"
@@ -120,7 +120,7 @@ class Purchase(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     product_name: Mapped[str] = mapped_column(String(100))
     key_issued: Mapped[str] = mapped_column(String(255))
-    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class DepositRequest(Base):
     __tablename__ = "deposit_requests"
@@ -128,7 +128,7 @@ class DepositRequest(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     amount: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(20), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class WithdrawalRequest(Base):
     __tablename__ = "withdrawal_requests"
@@ -137,7 +137,7 @@ class WithdrawalRequest(Base):
     amount: Mapped[float] = mapped_column(Float)
     card: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 # ==========================================
 # MIDDLEWARE & STATES
@@ -491,6 +491,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         ]]
     )
 
+    delivered = False
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -504,8 +505,20 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
                 reply_markup=admin_kb,
                 parse_mode="Markdown"
             )
+            delivered = True
         except Exception as e:
-            logger.error(f"Не удалось отправить уведомление о выводе админу {admin_id}: {e}")
+            logger.exception(f"Не удалось отправить уведомление о выводе админу {admin_id}: {e}")
+
+    if not delivered:
+        logger.error(
+            f"Заявка на вывод #{req.id} создана, но НИ ОДНОМУ админу не доставлено уведомление. "
+            f"Проверь ADMIN_IDS={ADMIN_IDS} и что админ(ы) нажали /start боту."
+        )
+        await message.answer(
+            "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
+            f"Свяжитесь с поддержкой и укажите номер заявки: `#{req.id}`",
+            parse_mode="Markdown"
+        )
 
 @router.callback_query(F.data.startswith("approve_wdr_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -622,6 +635,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         f"💰 Сумма: `{amount:.2f} грн`"
     )
 
+    delivered = False
     for admin_id in ADMIN_IDS:
         try:
             if message.photo:
@@ -642,8 +656,21 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
                     reply_markup=admin_kb,
                     parse_mode="Markdown"
                 )
+            delivered = True
         except Exception as e:
-            logger.error(f"Не удалось отправить чек администратору {admin_id}: {e}")
+            logger.exception(f"Не удалось отправить чек администратору {admin_id}: {e}")
+
+    if not delivered:
+        logger.error(
+            f"Заявка на пополнение #{req.id} создана, но НИ ОДНОМУ админу не доставлено уведомление. "
+            f"Проверь ADMIN_IDS={ADMIN_IDS} и что админ(ы) нажали /start боту."
+        )
+        await message.answer(
+            "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
+            "Свяжитесь с поддержкой и укажите этот номер заявки: "
+            f"`#{req.id}`",
+            parse_mode="Markdown"
+        )
 
 # Фолбэк: пользователь в состоянии ожидания чека, но прислал не фото/файл (например текст)
 @router.message(DepositStates.waiting_for_receipt)
@@ -984,6 +1011,17 @@ async def main():
                 await conn.execute(text("ALTER TABLE withdrawal_requests ALTER COLUMN user_id TYPE BIGINT;"))
             except Exception as e:
                 logger.info(f"Миграция колонок пропущена/уже выполнена: {e}")
+
+            try:
+                # Переводим все datetime-колонки на TIMESTAMP WITH TIME ZONE,
+                # т.к. в коде используются offset-aware значения (datetime.now(timezone.utc)),
+                # а asyncpg не умеет писать их в TIMESTAMP WITHOUT TIME ZONE.
+                await conn.execute(text("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
+                await conn.execute(text("ALTER TABLE purchases ALTER COLUMN purchased_at TYPE TIMESTAMPTZ USING purchased_at AT TIME ZONE 'UTC';"))
+                await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
+                await conn.execute(text("ALTER TABLE withdrawal_requests ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
+            except Exception as e:
+                logger.info(f"Миграция timestamptz пропущена/уже выполнена: {e}")
 
     async with async_session_maker() as session:
         result = await session.execute(select(Platform))
