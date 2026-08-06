@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import random
 from datetime import datetime
@@ -26,8 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ==========================================
-# КОНФИГУРАЦИЯ И ПОДКЛЮЧЕНИЕ К БД
+# ЛОГИРОВАНИЕ И КОНФИГУРАЦИЯ БД
 # ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -35,28 +42,27 @@ if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///bot.db"
     engine = create_async_engine(DATABASE_URL, echo=False)
 else:
-    # Приводим протокол к postgresql+asyncpg
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
-    
-    # Очищаем URL от параметров (?sslmode=..., ?channel_binding=...), которые ломают asyncpg
     if "?" in DATABASE_URL:
         DATABASE_URL = DATABASE_URL.split("?")[0]
         
-    # Включаем SSL безопасным способом через connect_args
+    connect_args = {}
+    if any(domain in DATABASE_URL for domain in ["oregon-postgres", "frankfurt-postgres", "render.com"]):
+        connect_args = {"ssl": "require"}
+
     engine = create_async_engine(
         DATABASE_URL, 
         echo=False, 
-        connect_args={"ssl": "require"}
+        connect_args=connect_args
     )
 
-# Реквизиты для оплаты
 CARDS = [
     "4441 1111 5555 7352 (Моно)",
     "4323 3473 8685 7285 (А-Банк)",
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-ADMIN_ID = 8479717148  # Твой Telegram ID
+ADMIN_ID = 8479717148
 ADMIN_IDS = [ADMIN_ID]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -124,7 +130,7 @@ class DepositRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 # ==========================================
-# MIDDLEWARE
+# MIDDLEWARE & STATES
 # ==========================================
 class DbSessionMiddleware(BaseMiddleware):
     def __init__(self, session_pool):
@@ -136,9 +142,6 @@ class DbSessionMiddleware(BaseMiddleware):
             data["session"] = session
             return await handler(event, data)
 
-# ==========================================
-# СОСТОЯНИЯ (FSM)
-# ==========================================
 class AdminStates(StatesGroup):
     waiting_for_software_platform = State()
     waiting_for_software_name = State()
@@ -152,7 +155,7 @@ class DepositStates(StatesGroup):
     waiting_for_receipt = State()
 
 # ==========================================
-# ОСНОВНОЕ МЕНЮ И РЕГИСТРАЦИЯ
+# ГЛАВНОЕ МЕНЮ И СТАРТ
 # ==========================================
 def get_main_menu_kb(user_id: int):
     keyboard = [
@@ -165,26 +168,31 @@ def get_main_menu_kb(user_id: int):
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, session: AsyncSession):
-    user = await session.get(User, message.from_user.id)
-    if not user:
-        referrer_id = None
-        if command.args and command.args.isdigit():
-            possible_ref = int(command.args)
-            if possible_ref != message.from_user.id:
-                referrer_id = possible_ref
+    try:
+        user = await session.get(User, message.from_user.id)
+        if not user:
+            referrer_id = None
+            if command.args and command.args.isdigit():
+                possible_ref = int(command.args)
+                if possible_ref != message.from_user.id:
+                    referrer_id = possible_ref
 
-        user = User(
-            id=message.from_user.id, 
-            username=message.from_user.username,
-            referred_by=referrer_id
+            user = User(
+                id=message.from_user.id, 
+                username=message.from_user.username,
+                referred_by=referrer_id
+            )
+            session.add(user)
+            await session.commit()
+
+        await message.answer(
+            "👋 Главное меню Kranin Shop\n\nВыберите раздел:",
+            reply_markup=get_main_menu_kb(message.from_user.id)
         )
-        session.add(user)
-        await session.commit()
-
-    await message.answer(
-        "👋 Главное меню Kranin Shop\n\nВыберите раздел:",
-        reply_markup=get_main_menu_kb(message.from_user.id)
-    )
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Ошибка в cmd_start: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте снова.")
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_handler(callback: CallbackQuery):
@@ -195,7 +203,7 @@ async def main_menu_handler(callback: CallbackQuery):
     await callback.answer()
 
 # ==========================================
-# КАТАЛОГ И ПОКУПКА
+# КАТАЛОГ И ПОКУПКИ
 # ==========================================
 @router.callback_query(F.data == "shop")
 async def show_platforms(callback: CallbackQuery, session: AsyncSession):
@@ -278,14 +286,14 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     software = await session.get(Software, product.software_id)
 
     if user.balance < product.price:
-        await callback.answer("❌ Недостаточно средств на балансе! Пополните кошелек.", show_alert=True)
+        await callback.answer("❌ Недостаточно средств на балансе!", show_alert=True)
         return
 
     key_res = await session.execute(select(LicenseKey).filter_by(product_id=product.id, is_sold=False).limit(1))
     license_key = key_res.scalars().first()
 
     if not license_key:
-        await callback.answer("❌ Ключи этого номинала временно закончились!", show_alert=True)
+        await callback.answer("❌ Ключи этого номинала закончились!", show_alert=True)
         return
 
     user.balance -= product.price
@@ -302,8 +310,8 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     success_text = (
         f"✅ **Покупка успешно завершена!**\n\n"
         f"📦 Товар: `{software.name} — {product.duration}`\n"
-        f"🔑 Ваш лицензионный ключ:\n`{license_key.key_string}`\n\n"
-        f"📌 *Скопируйте ключ кликом по нему.*"
+        f"🔑 Ваш ключ:\n`{license_key.key_string}`\n\n"
+        f"📌 Нажмите на ключ, чтобы скопировать."
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]])
@@ -316,7 +324,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 async def start_deposit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositStates.waiting_for_amount)
     await callback.message.edit_text(
-        "💳 **Пополнение баланса**\n\nВведите сумму пополнения в рублях (или грн):",
+        "💳 **Пополнение баланса**\n\nВведите сумму пополнения числом:",
         parse_mode="Markdown"
     )
 
@@ -336,9 +344,9 @@ async def process_deposit_amount(message: Message, state: FSMContext):
 
     text_msg = (
         f"💳 **Оплата по реквизитам**\n\n"
-        f"Сумма к оплате: `{amount}`\n\n"
-        f"Реквизиты для перевода:\n`{selected_card}`\n\n"
-        f"📌 Переведите точную сумму на карту выше, а затем **отправьте сюда фото чека или скриншот перевода**."
+        f"Сумма: `{amount} RUB`\n\n"
+        f"Реквизиты:\n`{selected_card}`\n\n"
+        f"📌 Переведите указанную сумму и **отправьте сюда фото чека**."
     )
     await message.answer(text_msg, parse_mode="Markdown")
 
@@ -354,10 +362,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
     await session.commit()
 
     await state.clear()
-    await message.answer(
-        "⏳ **Заявка отправлена!**\nАдминистратор проверит перевод и зачислит баланс.",
-        parse_mode="Markdown"
-    )
+    await message.answer("⏳ **Заявка отправлена!** Ожидайте подтверждения администратора.", parse_mode="Markdown")
 
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -370,7 +375,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         chat_id=ADMIN_ID,
         photo=photo_id,
         caption=(
-            f"📥 **Новая заявка на пополнение #{req.id}**\n\n"
+            f"📥 **Заявка на пополнение #{req.id}**\n\n"
             f"👤 Пользователь: `{user_id}` (@{message.from_user.username})\n"
             f"💰 Сумма: `{amount} RUB`"
         ),
@@ -393,13 +398,9 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
         user.balance += req.amount
     await session.commit()
 
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**",
-        reply_markup=None
-    )
-
+    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None)
     try:
-        await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount} RUB!**\nТеперь вы можете купить ключ в магазине.", parse_mode="Markdown")
+        await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount} RUB!**", parse_mode="Markdown")
     except Exception:
         pass
 
@@ -415,13 +416,9 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     req.status = "rejected"
     await session.commit()
 
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n❌ **ОТКЛОНЕНО**",
-        reply_markup=None
-    )
-
+    await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
     try:
-        await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена администратором.")
+        await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
     except Exception:
         pass
 
@@ -430,7 +427,7 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery):
-    text_msg = "🛠 **Kranin Shop | Панель администратора**\n\nВыберите действие:"
+    text_msg = "🛠 **Панель администратора**\n\nВыберите действие:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw")],
@@ -444,11 +441,11 @@ async def admin_menu(callback: CallbackQuery):
 @router.callback_query(F.data == "admin_add_sw", F.from_user.id.in_(ADMIN_IDS))
 async def add_sw_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_software_platform)
-    text_msg = "➕ **Добавление софта (Шаг 1/2)**\n\nВыберите платформу, для которой создается софт:"
+    text_msg = "➕ **Добавление софта (Шаг 1/2)**\n\nВыберите платформу:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 Android (ID: 1)", callback_data="sw_platform_1")],
-            [InlineKeyboardButton(text="🍏 iOS (ID: 2)", callback_data="sw_platform_2")],
+            [InlineKeyboardButton(text="🤖 Android", callback_data="sw_platform_1")],
+            [InlineKeyboardButton(text="🍏 iOS", callback_data="sw_platform_2")],
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
         ]
     )
@@ -467,21 +464,35 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_software_name, F.from_user.id.in_(ADMIN_IDS))
 async def save_software(message: Message, state: FSMContext, session: AsyncSession):
-    data = await state.get_data()
-    platform_id = data["platform_id"]
-    name = message.text.strip()
+    try:
+        data = await state.get_data()
+        platform_id = data.get("platform_id")
+        name = message.text.strip()
 
-    new_sw = Software(platform_id=platform_id, name=name)
-    session.add(new_sw)
-    await session.commit()
-    await state.clear()
+        platform = await session.get(Platform, platform_id)
+        if not platform:
+            await message.answer(f"❌ Платформа ID `{platform_id}` не найдена в системе.")
+            await state.clear()
+            return
 
-    await message.answer(f"✅ Софт `{name}` успешно добавлен!\n🔑 ID нового софта: `{new_sw.id}`", parse_mode="Markdown")
+        new_sw = Software(platform_id=platform_id, name=name)
+        session.add(new_sw)
+        await session.commit()
+        await state.clear()
+
+        await message.answer(
+            f"✅ Софт `{name}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`", 
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Ошибка при сохранении софта: {e}")
+        await message.answer("⚠️ Не удалось сохранить софт. Ошибка БД.")
 
 @router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
 async def add_prod_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_sw_id)
-    text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**, к которому добавляем тариф:"
+    text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**:"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
@@ -494,7 +505,7 @@ async def process_sw_id(message: Message, state: FSMContext):
     await state.update_data(software_id=int(message.text))
     await state.set_state(AdminStates.waiting_for_duration)
 
-    text_msg = "➕ **Создание тарифа (Шаг 2/3)**\n\nВыберите длительность ключа:"
+    text_msg = "➕ **Создание тарифа (Шаг 2/3)**\n\nВыберите длительность:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏳ 1 день", callback_data="duration_1 день")],
@@ -511,7 +522,7 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
     await state.update_data(duration=duration)
     await state.set_state(AdminStates.waiting_for_price)
 
-    text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nТеперь отправьте **цену** (например: `450` или `1500.0`):"
+    text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nОтправьте **цену** (число):"
     await callback.message.edit_text(text_msg, parse_mode="Markdown")
     await callback.answer()
 
@@ -520,7 +531,7 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
     try:
         price = float(message.text.strip().replace(",", "."))
     except ValueError:
-        await message.answer("❌ Неверный формат цены. Введите число (например: 500)")
+        await message.answer("❌ Неверный формат цены. Введите число.")
         return
 
     data = await state.get_data()
@@ -536,8 +547,7 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
         f"✅ **Тариф успешно создан!**\n\n"
         f"• ID товара для загрузки ключей: `{new_product.id}`\n"
         f"• Срок: `{duration}`\n"
-        f"• Цена: `{price} RUB`\n\n"
-        f"Загрузите ключи через раздел «📥 Загрузить ключи», используя ID `{new_product.id}`.",
+        f"• Цена: `{price} RUB`",
         parse_mode="Markdown"
     )
 
@@ -545,8 +555,8 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
 async def add_keys_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_keys)
     text_msg = (
-        "📥 **Загрузка ключей**\n\nОтправьте сообщение, где:\n1️⃣ Первая строка — **ID товара (тарифа)**\n"
-        "2️⃣ Со второй строки — сами ключи (каждый с новой строки).\n\nПример:\n`3`\n`KEY-1`\n`KEY-2`"
+        "📥 **Загрузка ключей**\n\nОтправьте сообщение, где:\n1️⃣ Первая строка — **ID товара**\n"
+        "2️⃣ Со второй строки — ключи (каждый с новой строки)."
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -555,14 +565,14 @@ async def add_keys_start(callback: CallbackQuery, state: FSMContext):
 async def save_keys(message: Message, state: FSMContext, session: AsyncSession):
     lines = message.text.strip().split("\n")
     if len(lines) < 2:
-        await message.answer("❌ Слишком мало строк.")
+        await message.answer("❌ Отправьте ID товара и хотя бы 1 ключ.")
         return
 
     try:
         product_id = int(lines[0].strip())
         keys = [k.strip() for k in lines[1:] if k.strip()]
     except ValueError:
-        await message.answer("❌ Первая строка должна быть ID товара.")
+        await message.answer("❌ Первая строка должна быть числовым ID товара.")
         return
 
     added = 0
@@ -575,7 +585,7 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession):
     await session.commit()
     await state.clear()
 
-    await message.answer(f"✅ Загружено новых ключей: `{added}` для товара ID `{product_id}`", parse_mode="Markdown")
+    await message.answer(f"✅ Загружено ключей: `{added}` для товара ID `{product_id}`", parse_mode="Markdown")
 
 # ==========================================
 # ЗАПУСК БОТА И ВЕБ-СЕРВЕРА
@@ -596,7 +606,6 @@ async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         
-        # Автоматическая миграция типы данных для Telegram ID (BigInteger) в PostgreSQL
         if "postgresql" in DATABASE_URL:
             try:
                 await conn.execute(text("ALTER TABLE users ALTER COLUMN id TYPE BIGINT;"))
@@ -604,7 +613,19 @@ async def main():
                 await conn.execute(text("ALTER TABLE purchases ALTER COLUMN user_id TYPE BIGINT;"))
                 await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN user_id TYPE BIGINT;"))
             except Exception as e:
-                print(f"Миграция БД выполнена или не требуется: {e}")
+                logger.info(f"Миграция колонок уже выполнена: {e}")
+
+    # Инициализация базовх платформ Android/iOS
+    async with async_session_maker() as session:
+        result = await session.execute(select(Platform))
+        platforms = result.scalars().all()
+        if not platforms:
+            session.add_all([
+                Platform(id=1, name="Android"),
+                Platform(id=2, name="iOS")
+            ])
+            await session.commit()
+            logger.info("Базовые платформы Android и iOS успешно добавлены в БД.")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -613,11 +634,9 @@ async def main():
     dp.include_router(router)
 
     await start_web_server()
-
-    # Сбрасываем старый Webhook перед запуском Long Polling
     await bot.delete_webhook(drop_pending_updates=True)
 
-    print("Бот и веб-заглушка успешно запущены!")
+    logger.info("Бот и веб-заглушка запущены!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
