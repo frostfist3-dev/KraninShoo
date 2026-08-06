@@ -11,7 +11,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiohttp import web
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, select
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    select,
+    text,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -46,7 +56,7 @@ CARDS = [
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-ADMIN_ID = 8479717148  # Замени на свой настоящий Telegram ID
+ADMIN_ID = 8479717148  # Твой Telegram ID
 ADMIN_IDS = [ADMIN_ID]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -182,7 +192,7 @@ async def show_platforms(callback: CallbackQuery, session: AsyncSession):
     result = await session.execute(select(Platform))
     platforms = result.scalars().all()
 
-    text = "🛒 **Kranin Shop | Выбор платформы**\n\n📱 Выберите устройство, для которого покупаете софт:"
+    text_msg = "🛒 **Kranin Shop | Выбор платформы**\n\n📱 Выберите устройство, для которого покупаете софт:"
     buttons = []
     for p in platforms:
         icon = "🤖" if "android" in p.name.lower() else "🍏"
@@ -191,7 +201,7 @@ async def show_platforms(callback: CallbackQuery, session: AsyncSession):
     buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("platform_"))
@@ -203,12 +213,12 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
     softwares = result.scalars().all()
 
     if not softwares:
-        text = f"🛒 **Kranin Shop — {platform.name if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
+        text_msg = f"🛒 **Kranin Shop — {platform.name if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")]])
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         return
 
-    text = f"🛒 **Kranin Shop — {platform.name}**\n\n⚡️ Выберите нужный софт:"
+    text_msg = f"🛒 **Kranin Shop — {platform.name}**\n\n⚡️ Выберите нужный софт:"
     buttons = []
     for sw in softwares:
         buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"software_{sw.id}")])
@@ -216,7 +226,7 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
     buttons.append([InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("software_"))
@@ -228,12 +238,12 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
     products = result.scalars().all()
 
     if not products:
-        text = f"🛒 **{software.name}**\n\n❌ Тарифы для этого софта пока отсутствуют."
+        text_msg = f"🛒 **{software.name}**\n\n❌ Тарифы для этого софта пока отсутствуют."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к софту", callback_data=f"platform_{software.platform_id}")]])
-        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         return
 
-    text = f"🛒 **{software.name}**\n\n📌 Выберите тариф:"
+    text_msg = f"🛒 **{software.name}**\n\n📌 Выберите тариф:"
     buttons = []
     for p in products:
         keys_res = await session.execute(select(LicenseKey).filter_by(product_id=p.id, is_sold=False))
@@ -245,7 +255,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"platform_{software.platform_id}")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("buy_product_"))
@@ -314,13 +324,13 @@ async def process_deposit_amount(message: Message, state: FSMContext):
     await state.update_data(amount=amount, card=selected_card)
     await state.set_state(DepositStates.waiting_for_receipt)
 
-    text = (
+    text_msg = (
         f"💳 **Оплата по реквизитам**\n\n"
         f"Сумма к оплате: `{amount}`\n\n"
         f"Реквизиты для перевода:\n`{selected_card}`\n\n"
         f"📌 Переведите точную сумму на карту выше, а затем **отправьте сюда фото чека или скриншот перевода**."
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text_msg, parse_mode="Markdown")
 
 @router.message(DepositStates.waiting_for_receipt, F.photo)
 async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
@@ -410,7 +420,7 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery):
-    text = "🛠 **Kranin Shop | Панель администратора**\n\nВыберите действие:"
+    text_msg = "🛠 **Kranin Shop | Панель администратора**\n\nВыберите действие:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw")],
@@ -419,12 +429,12 @@ async def admin_menu(callback: CallbackQuery):
             [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.callback_query(F.data == "admin_add_sw", F.from_user.id.in_(ADMIN_IDS))
 async def add_sw_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_software_platform)
-    text = "➕ **Добавление софта (Шаг 1/2)**\n\nВыберите платформу, для которой создается софт:"
+    text_msg = "➕ **Добавление софта (Шаг 1/2)**\n\nВыберите платформу, для которой создается софт:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Android (ID: 1)", callback_data="sw_platform_1")],
@@ -432,7 +442,7 @@ async def add_sw_start(callback: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
         ]
     )
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.callback_query(F.data.startswith("sw_platform_"), F.from_user.id.in_(ADMIN_IDS))
 async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
@@ -440,9 +450,9 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
     await state.update_data(platform_id=platform_id)
     await state.set_state(AdminStates.waiting_for_software_name)
 
-    text = "➕ **Добавление софта (Шаг 2/2)**\n\nВведите название софта (например: `Flexnote`):"
+    text_msg = "➕ **Добавление софта (Шаг 2/2)**\n\nВведите название софта (например: `Flexnote`):"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.message(AdminStates.waiting_for_software_name, F.from_user.id.in_(ADMIN_IDS))
@@ -461,9 +471,9 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
 @router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
 async def add_prod_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_sw_id)
-    text = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**, к которому добавляем тариф:"
+    text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**, к которому добавляем тариф:"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.message(AdminStates.waiting_for_sw_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_sw_id(message: Message, state: FSMContext):
@@ -474,7 +484,7 @@ async def process_sw_id(message: Message, state: FSMContext):
     await state.update_data(software_id=int(message.text))
     await state.set_state(AdminStates.waiting_for_duration)
 
-    text = "➕ **Создание тарифа (Шаг 2/3)**\n\nВыберите длительность ключа:"
+    text_msg = "➕ **Создание тарифа (Шаг 2/3)**\n\nВыберите длительность ключа:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏳ 1 день", callback_data="duration_1 день")],
@@ -483,7 +493,7 @@ async def process_sw_id(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
         ]
     )
-    await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await message.answer(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.callback_query(F.data.startswith("duration_"), F.from_user.id.in_(ADMIN_IDS))
 async def process_duration(callback: CallbackQuery, state: FSMContext):
@@ -491,8 +501,8 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
     await state.update_data(duration=duration)
     await state.set_state(AdminStates.waiting_for_price)
 
-    text = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nТеперь отправьте **цену** (например: `450` или `1500.0`):"
-    await callback.message.edit_text(text, parse_mode="Markdown")
+    text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nТеперь отправьте **цену** (например: `450` или `1500.0`):"
+    await callback.message.edit_text(text_msg, parse_mode="Markdown")
     await callback.answer()
 
 @router.message(AdminStates.waiting_for_price, F.from_user.id.in_(ADMIN_IDS))
@@ -524,12 +534,12 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
 @router.callback_query(F.data == "admin_add_keys", F.from_user.id.in_(ADMIN_IDS))
 async def add_keys_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_keys)
-    text = (
+    text_msg = (
         "📥 **Загрузка ключей**\n\nОтправьте сообщение, где:\n1️⃣ Первая строка — **ID товара (тарифа)**\n"
         "2️⃣ Со второй строки — сами ключи (каждый с новой строки).\n\nПример:\n`3`\n`KEY-1`\n`KEY-2`"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
-    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 @router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
 async def save_keys(message: Message, state: FSMContext, session: AsyncSession):
@@ -575,6 +585,8 @@ async def start_web_server():
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Добавляем отсутствующую колонку referred_by в базу данных при старте
+        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;"))
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -584,7 +596,7 @@ async def main():
 
     await start_web_server()
 
-    # Автоматическое удаление старого Webhook перед началом Long Polling
+    # Сбрасываем старый Webhook перед запуском Long Polling
     await bot.delete_webhook(drop_pending_updates=True)
 
     print("Бот и веб-заглушка успешно запущены!")
