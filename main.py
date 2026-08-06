@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Чтение ID админов из переменных окружения или значения по умолчанию
 raw_admin_ids = os.getenv("ADMIN_IDS", "8479717148")
 ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()]
 
@@ -82,7 +81,7 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(32), nullable=True)
     balance: Mapped[float] = mapped_column(Float, default=0.0)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class Platform(Base):
     __tablename__ = "platforms"
@@ -121,7 +120,7 @@ class Purchase(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     product_name: Mapped[str] = mapped_column(String(100))
     key_issued: Mapped[str] = mapped_column(String(255))
-    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class DepositRequest(Base):
     __tablename__ = "deposit_requests"
@@ -129,7 +128,7 @@ class DepositRequest(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     amount: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(20), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class WithdrawalRequest(Base):
     __tablename__ = "withdrawal_requests"
@@ -138,7 +137,7 @@ class WithdrawalRequest(Base):
     amount: Mapped[float] = mapped_column(Float)
     card: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 # ==========================================
 # MIDDLEWARE & STATES
@@ -271,6 +270,9 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
 async def show_products(callback: CallbackQuery, session: AsyncSession):
     software_id = int(callback.data.split("_")[1])
     software = await session.get(Software, software_id)
+    if not software:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
 
     result = await session.execute(select(Product).filter_by(software_id=software_id))
     products = result.scalars().all()
@@ -302,10 +304,14 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     user_id = callback.from_user.id
 
     product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("❌ Товар не найден!", show_alert=True)
+        return
+
     user = await session.get(User, user_id)
     software = await session.get(Software, product.software_id)
 
-    if user.balance < product.price:
+    if not user or user.balance < product.price:
         await callback.answer(f"❌ Недостаточно средств! Требуется {product.price:.2f} грн", show_alert=True)
         return
 
@@ -333,9 +339,10 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление рефереру {referrer.id}: {e}")
 
+    sw_name = software.name if software else "Товар"
     purchase = Purchase(
         user_id=user.id,
-        product_name=f"{software.name} ({product.duration})",
+        product_name=f"{sw_name} ({product.duration})",
         key_issued=license_key.key_string,
     )
     session.add(purchase)
@@ -343,7 +350,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 
     success_text = (
         f"✅ **Покупка успешно завершена!**\n\n"
-        f"📦 Товар: `{software.name} — {product.duration}`\n"
+        f"📦 Товар: `{sw_name} — {product.duration}`\n"
         f"💳 Списано: `{product.price:.2f} грн`\n"
         f"🔑 Ваш ключ:\n`{license_key.key_string}`\n\n"
         f"📌 Нажмите на ключ, чтобы скопировать."
@@ -359,6 +366,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     user_id = callback.from_user.id
     user = await session.get(User, user_id)
+    balance = user.balance if user else 0.0
 
     ref_count_res = await session.execute(select(func.count(User.id)).where(User.referred_by == user_id))
     total_refs = ref_count_res.scalar() or 0
@@ -371,7 +379,7 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
         f"Приглашайте друзей и получайте **5%** от каждой их покупки!\n"
         f"Эти деньги поступают на ваш общий баланс. Вы можете использовать их для покупки софта или **вывести на карту** (от 500 грн).\n\n"
         f"👥 Приглашено рефералов: `{total_refs}`\n"
-        f"💰 Ваш баланс: `{user.balance:.2f} грн`\n\n"
+        f"💰 Ваш баланс: `{balance:.2f} грн`\n\n"
         f"🔗 Ваша реферальная ссылка:\n`{ref_link}`"
     )
 
@@ -387,13 +395,14 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
 @router.callback_query(F.data == "start_withdrawal")
 async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     user = await session.get(User, callback.from_user.id)
-    if user.balance < 500:
-        await callback.answer(f"❌ Минимальная сумма вывода 500 грн. На вашем балансе: {user.balance:.2f} грн", show_alert=True)
+    balance = user.balance if user else 0.0
+    if balance < 500:
+        await callback.answer(f"❌ Минимальная сумма вывода 500 грн. На вашем балансе: {balance:.2f} грн", show_alert=True)
         return
 
     await state.set_state(WithdrawalStates.waiting_for_amount)
     await callback.message.edit_text(
-        f"📤 **Вывод средств**\n\nВаш доступный баланс: `{user.balance:.2f} грн`\n"
+        f"📤 **Вывод средств**\n\nВаш доступный баланс: `{balance:.2f} грн`\n"
         f"Введите сумму вывода (минимум 500 грн):",
         parse_mode="Markdown"
     )
@@ -402,17 +411,18 @@ async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, s
 async def process_withdrawal_amount(message: Message, state: FSMContext, session: AsyncSession):
     try:
         amount = float(message.text.strip().replace(",", "."))
-        user = await session.get(User, message.from_user.id)
-
-        if amount < 500:
-            await message.answer("❌ Минимальная сумма вывода — 500 грн. Введите сумму повторно:")
-            return
-        if amount > user.balance:
-            await message.answer(f"❌ У вас недостаточно средств! Доступно: `{user.balance:.2f} грн`. Введите сумму:", parse_mode="Markdown")
-            return
-
     except ValueError:
         await message.answer("❌ Введите корректную сумму числом!")
+        return
+
+    user = await session.get(User, message.from_user.id)
+    balance = user.balance if user else 0.0
+
+    if amount < 500:
+        await message.answer("❌ Минимальная сумма вывода — 500 грн. Введите сумму повторно:")
+        return
+    if amount > balance:
+        await message.answer(f"❌ У вас недостаточно средств! Доступно: `{balance:.2f} грн`. Введите сумму:", parse_mode="Markdown")
         return
 
     await state.update_data(amount=amount)
@@ -427,7 +437,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
     user_id = message.from_user.id
 
     user = await session.get(User, user_id)
-    if user.balance < amount:
+    if not user or user.balance < amount:
         await message.answer("❌ Недостаточно средств на балансе.")
         await state.clear()
         return
@@ -481,7 +491,8 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
     req.status = "approved"
     await session.commit()
 
-    await callback.message.edit_text(text=callback.message.text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None)
+    current_text = callback.message.text or ""
+    await callback.message.edit_text(text=current_text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None)
     try:
         await bot.send_message(
             req.user_id,
@@ -507,7 +518,8 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
 
     await session.commit()
 
-    await callback.message.edit_text(text=callback.message.text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None)
+    current_text = callback.message.text or ""
+    await callback.message.edit_text(text=current_text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None)
     try:
         await bot.send_message(
             req.user_id,
@@ -553,7 +565,7 @@ async def process_deposit_amount(message: Message, state: FSMContext):
 @router.message(DepositStates.waiting_for_receipt, F.photo | F.document)
 async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
     data = await state.get_data()
-    amount = data["amount"]
+    amount = data.get("amount", 0.0)
     user_id = message.from_user.id
 
     req = DepositRequest(user_id=user_id, amount=amount)
@@ -614,7 +626,13 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
         user.balance += req.amount
     await session.commit()
 
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None) if callback.message.photo else await callback.message.edit_text(text=callback.message.text + "\n\n✅ **ПОДТВЕРЖДЕНО**", reply_markup=None)
+    if callback.message.caption is not None:
+        new_caption = (callback.message.caption or "") + "\n\n✅ **ПОДТВЕРЖДЕНО**"
+        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    else:
+        new_text = (callback.message.text or "") + "\n\n✅ **ПОДТВЕРЖДЕНО**"
+        await callback.message.edit_text(text=new_text, reply_markup=None)
+
     try:
         await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
     except Exception:
@@ -632,7 +650,13 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     req.status = "rejected"
     await session.commit()
 
-    await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None) if callback.message.photo else await callback.message.edit_text(text=callback.message.text + "\n\n❌ **ОТКЛОНЕНО**", reply_markup=None)
+    if callback.message.caption is not None:
+        new_caption = (callback.message.caption or "") + "\n\n❌ **ОТКЛОНЕНО**"
+        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    else:
+        new_text = (callback.message.text or "") + "\n\n❌ **ОТКЛОНЕНО**"
+        await callback.message.edit_text(text=new_text, reply_markup=None)
+
     try:
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
     except Exception:
@@ -654,7 +678,6 @@ async def admin_menu(callback: CallbackQuery):
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
-# Удобный выбор товара для загрузки ключей
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
     products_res = await session.execute(select(Product))
@@ -682,13 +705,18 @@ async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession
 async def start_key_upload(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
     product_id = int(callback.data.split("_")[3])
     product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
     software = await session.get(Software, product.software_id)
+    sw_name = software.name if software else "Софт"
 
     await state.update_data(product_id=product_id)
     await state.set_state(AdminStates.waiting_for_keys)
 
     text_msg = (
-        f"📥 **Загрузка ключей для:** `{software.name} — {product.duration}`\n\n"
+        f"📥 **Загрузка ключей для:** `{sw_name} — {product.duration}`\n\n"
         f"Отправьте ключи **текстовым сообщением** (каждый с новой строки) "
         f"или прикрепите **.txt файл** с ключами:"
     )
@@ -703,12 +731,12 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
 
     keys_text = ""
     if message.document:
-        if not message.document.file_name.endswith(".txt"):
+        if not (message.document.file_name and message.document.file_name.endswith(".txt")):
             await message.answer("❌ Пожалуйста, отправьте файл в формате `.txt`.")
             return
         file = await bot.get_file(message.document.file_id)
         downloaded = await bot.download_file(file.file_path)
-        keys_text = downloaded.read().decode("utf-8")
+        keys_text = downloaded.getvalue().decode("utf-8")
     elif message.text:
         keys_text = message.text
 
@@ -889,7 +917,7 @@ async def main():
                 await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN user_id TYPE BIGINT;"))
                 await conn.execute(text("ALTER TABLE withdrawal_requests ALTER COLUMN user_id TYPE BIGINT;"))
             except Exception as e:
-                logger.info(f"Миграция колонок уже выполнена: {e}")
+                logger.info(f"Миграция колонок пропущена/уже выполнена: {e}")
 
     async with async_session_maker() as session:
         result = await session.execute(select(Platform))
