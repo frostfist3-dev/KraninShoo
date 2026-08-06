@@ -67,7 +67,6 @@ CARDS = [
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-# Фиксированный порядок тарифов по сроку — используется в админке и в профиле
 DURATIONS = ["1 день", "7 дней", "30 дней"]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
@@ -75,12 +74,6 @@ router = Router()
 
 
 def escape_md(value) -> str:
-    """
-    Экранирует спецсимволы легаси-Markdown Telegram (_ * ` [), чтобы
-    произвольный текст (юзернеймы, номера карт, ключи, названия софта)
-    не ломал parse_mode="Markdown" и не приводил к молчаливому падению
-    отправки сообщения (can't parse entities).
-    """
     if value is None:
         return ""
     value = str(value)
@@ -90,7 +83,6 @@ def escape_md(value) -> str:
 
 
 def user_display(message_or_callback) -> str:
-    """Безопасное для Markdown отображение @username пользователя."""
     u = message_or_callback.from_user
     username = u.username
     if username:
@@ -203,19 +195,24 @@ class WithdrawalStates(StatesGroup):
 # ==========================================
 def get_main_menu_kb(user_id: int):
     keyboard = [
-        [InlineKeyboardButton(text="🛒 Открыть магазин", callback_data="shop")],
-        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+        [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
          InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
         [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
         [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
     ]
     if user_id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def get_main_menu_text(balance: float) -> str:
-    return f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{balance:.2f} грн`\n\nВыберите раздел:"
+    return (
+        "💎 **Добро пожаловать в Kranin Shop!**\n"
+        "⚡️ Надежный сервис цифровых лицензий и софта.\n\n"
+        f"💰 **Ваш баланс:** `{balance:.2f} грн`\n\n"
+        "👇 Выберите интересующий раздел в меню ниже:"
+    )
 
 
 def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
@@ -282,10 +279,13 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FS
     total_purchases = total_res.scalar() or 0
 
     text_msg = (
-        f"👤 **Профиль**\n\n"
-        f"💰 Баланс: `{balance:.2f} грн`\n"
-        f"🛍 Всего покупок: `{total_purchases}`\n\n"
-        f"Выберите категорию, чтобы посмотреть свои купленные ключи:"
+        f"👤 **Личный кабинет**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 **ID аккаунта:** `{user_id}`\n"
+        f"💰 **Баланс:** `{balance:.2f} грн`\n"
+        f"🛍 **Всего покупок:** `{total_purchases}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔑 **Ваши купленные ключи по категориям:**"
     )
 
     buttons = []
@@ -294,9 +294,9 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FS
             select(func.count(Purchase.id)).where(Purchase.user_id == user_id, Purchase.duration == d)
         )
         cnt = cnt_res.scalar() or 0
-        buttons.append([InlineKeyboardButton(text=f"🔑 {d} ({cnt})", callback_data=f"profile_dur_{idx}")])
+        buttons.append([InlineKeyboardButton(text=f"📂 Срок: {d} (активных ключей: {cnt})", callback_data=f"profile_dur_{idx}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
@@ -314,20 +314,21 @@ async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
         select(Purchase)
         .where(Purchase.user_id == user_id, Purchase.duration == duration)
         .order_by(Purchase.purchased_at.desc())
-        .limit(25)
+        .limit(20)
     )
     purchases = res.scalars().all()
 
     if not purchases:
-        text_msg = f"🔑 **Ключи — {duration}**\n\nУ вас пока нет купленных ключей в этой категории."
+        text_msg = f"🔑 **Ключи ({duration})**\n\nУ вас пока нет купленных ключей в этой категории."
     else:
-        lines = [f"🔑 **Ключи — {duration}** (последние {len(purchases)}):\n"]
+        lines = [f"🔑 **Ключи ({duration})** — последние покупки:\n"]
         for p in purchases:
             date_str = p.purchased_at.strftime("%d.%m.%Y %H:%M")
             lines.append(
-                f"📦 {escape_md(p.product_name)}\n"
+                f"📦 *{escape_md(p.product_name)}*\n"
                 f"🔐 `{p.key_issued}`\n"
-                f"🕒 {date_str}\n"
+                f"🕒 _{date_str}_\n"
+                f"──────────────"
             )
         text_msg = "\n".join(lines)
 
@@ -347,13 +348,16 @@ async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: 
     result = await session.execute(select(Platform))
     platforms = result.scalars().all()
 
-    text_msg = "🛒 **Kranin Shop | Выбор платформы**\n\n📱 Выберите устройство, для которого покупаете софт:"
+    text_msg = (
+        "🛒 **Магазин лицензий**\n\n"
+        "📱 Выберите платформу вашего устройства:"
+    )
     buttons = []
     for p in platforms:
         icon = "🤖" if "android" in p.name.lower() else "🍏"
         buttons.append([InlineKeyboardButton(text=f"{icon} {p.name}", callback_data=f"platform_{p.id}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -368,18 +372,18 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
     softwares = result.scalars().all()
 
     if not softwares:
-        text_msg = f"🛒 **Kranin Shop — {escape_md(platform.name) if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")]])
+        text_msg = f"🛒 **Каталог — {escape_md(platform.name) if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 К выбору платформ", callback_data="shop")]])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         await callback.answer()
         return
 
-    text_msg = f"🛒 **Kranin Shop — {escape_md(platform.name)}**\n\n⚡️ Выберите нужный софт:"
+    text_msg = f"🛒 **Каталог — {escape_md(platform.name)}**\n\n⚡️ Выберите нужный софт:"
     buttons = []
     for sw in softwares:
         buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"software_{sw.id}")])
 
-    buttons.append([InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")])
+    buttons.append([InlineKeyboardButton(text="🔙 К платформам", callback_data="shop")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -399,23 +403,30 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
     if not products:
         text_msg = f"🛒 **{escape_md(software.name)}**\n\n❌ Тарифы для этого софта пока отсутствуют."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад к софту", callback_data=f"platform_{software.platform_id}")],
+            [InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         await callback.answer()
         return
 
-    text_msg = f"🛒 **{escape_md(software.name)}**\n\n📌 Выберите тариф:"
+    text_msg = f"🛒 **Софт:** `{escape_md(software.name)}`\n\n📌 Выберите тариф подписки:"
     buttons = []
     for p in products:
         keys_res = await session.execute(select(LicenseKey).filter_by(product_id=p.id, is_sold=False))
         available_keys = len(keys_res.scalars().all())
 
-        status = "🟢" if available_keys > 0 else "🔴"
-        buttons.append([InlineKeyboardButton(text=f"{status} {p.duration} — {p.price:.2f} грн", callback_data=f"buy_product_{p.id}")])
+        if available_keys > 0:
+            status_text = f"🟢 В наличии ({available_keys} шт.)"
+        else:
+            status_text = "🔴 Нет в наличии"
 
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"platform_{software.platform_id}")])
+        buttons.append([InlineKeyboardButton(
+            text=f"{status_text} | {p.duration} — {p.price:.2f} грн",
+            callback_data=f"buy_product_{p.id}"
+        )])
+
+    buttons.append([InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")])
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -439,8 +450,6 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         await callback.answer(f"❌ Недостаточно средств! Требуется {product.price:.2f} грн", show_alert=True)
         return
 
-    # FOR UPDATE предотвращает продажу одного и того же ключа двум покупателям
-    # при одновременных запросах (на SQLite игнорируется, на Postgres блокирует строку)
     key_res = await session.execute(
         select(LicenseKey)
         .filter_by(product_id=product.id, is_sold=False)
@@ -481,18 +490,20 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     await session.commit()
 
     success_text = (
-        f"✅ **Покупка успешно завершена!**\n\n"
-        f"📦 Товар: {escape_md(sw_name)} — {escape_md(product.duration)}\n"
-        f"💳 Списано: `{product.price:.2f} грн`\n"
-        f"🔑 Ваш ключ:\n`{license_key.key_string}`\n\n"
-        f"📌 Нажмите на ключ, чтобы скопировать.\n"
-        f"💾 Ключ также сохранён в разделе «👤 Профиль» — не потеряется."
+        f"✅ **Покупка успешно завершена!**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
+        f"💳 **Списано с баланса:** `{product.price:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 **Ваш лицензионный ключ:**\n`{license_key.key_string}`\n\n"
+        f"📌 *Нажмите на ключ, чтобы скопировать.*\n"
+        f"💾 *Ключ надёжно сохранён в разделе «👤 Мой профиль».*"
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Мои ключи", callback_data="profile")],
-        [InlineKeyboardButton(text="🛒 Продолжить покупки", callback_data=f"platform_{software.platform_id}" if software else "shop")],
-        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
+        [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
+        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
@@ -514,19 +525,20 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
 
     text_msg = (
-        f"🤝 **Реферальная программа**\n\n"
-        f"Приглашайте друзей и получайте **5%** от каждой их покупки!\n"
-        f"Эти деньги поступают на ваш общий баланс. Вы можете использовать их для покупки софта или **вывести на карту** (от 500 грн).\n\n"
-        f"👥 Приглашено рефералов: `{total_refs}`\n"
-        f"💰 Ваш баланс: `{balance:.2f} грн`\n\n"
-        f"🔗 Ваша реферальная ссылка:\n`{ref_link}`"
+        f"🤝 **Реферальная программа**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Приглашайте друзей по вашей ссылке и получайте **5%** от суммы каждой их покупки прямо на баланс!\n\n"
+        f"👥 **Приглашено друзей:** `{total_refs}`\n"
+        f"💰 **Доступный баланс:** `{balance:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 **Ваша реферальная ссылка:**\n`{ref_link}`"
     )
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📤 Вывести средства (от 500 грн)", callback_data="start_withdrawal")],
-            [InlineKeyboardButton(text="🛒 Купить софт за баланс", callback_data="shop")],
-            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]
+            [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -542,8 +554,9 @@ async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, s
 
     await state.set_state(WithdrawalStates.waiting_for_amount)
     await callback.message.edit_text(
-        f"📤 **Вывод средств**\n\nВаш доступный баланс: `{balance:.2f} грн`\n"
-        f"Введите сумму вывода (минимум 500 грн):",
+        f"📤 **Вывод средств**\n\n"
+        f"💳 Ваш доступный баланс: `{balance:.2f} грн`\n\n"
+        f"Введите сумму для вывода (минимум 500 грн):",
         reply_markup=cancel_kb("ref_program"),
         parse_mode="Markdown"
     )
@@ -589,7 +602,6 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         return
 
     user_id = message.from_user.id
-
     user = await session.get(User, user_id)
     if not user or user.balance < amount:
         await message.answer("❌ Недостаточно средств на балансе.")
@@ -618,13 +630,13 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         ]]
     )
 
-    delivered = False
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 chat_id=admin_id,
                 text=(
-                    f"📤 **Заявка на вывод средств #{req.id}**\n\n"
+                    f"📤 **Заявка на вывод средств #{req.id}**\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
                     f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
                     f"💰 Сумма: `{amount:.2f} грн`\n"
                     f"💳 Карта: `{escape_md(card)}`"
@@ -632,20 +644,8 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
                 reply_markup=admin_kb,
                 parse_mode="Markdown"
             )
-            delivered = True
         except Exception as e:
             logger.exception(f"Не удалось отправить уведомление о выводе админу {admin_id}: {e}")
-
-    if not delivered:
-        logger.error(
-            f"Заявка на вывод #{req.id} создана, но НИ ОДНОМУ админу не доставлено уведомление. "
-            f"Проверь ADMIN_IDS={ADMIN_IDS} и что админ(ы) нажали /start боту."
-        )
-        await message.answer(
-            "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
-            f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME} и укажите номер заявки: `#{req.id}`",
-            parse_mode="Markdown"
-        )
 
 @router.callback_query(F.data.startswith("approve_wdr_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -700,7 +700,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
     await callback.answer()
 
 # ==========================================
-# ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ (ФОТО / ФАЙЛЫ)
+# ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ
 # ==========================================
 @router.callback_query(F.data == "deposit")
 async def start_deposit(callback: CallbackQuery, state: FSMContext):
@@ -730,10 +730,12 @@ async def process_deposit_amount(message: Message, state: FSMContext):
     await state.set_state(DepositStates.waiting_for_receipt)
 
     text_msg = (
-        f"💳 **Оплата по реквизитам**\n\n"
-        f"Сумма: `{amount:.2f} грн`\n\n"
-        f"Реквизиты:\n`{selected_card}`\n\n"
-        f"📌 Переведите указанную сумму и **отправьте сюда фото или файл чека**."
+        f"💳 **Оплата по реквизитам**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **Сумма к оплате:** `{amount:.2f} грн`\n\n"
+        f"📌 **Реквизиты для перевода:**\n`{selected_card}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📸 Переведите точную сумму и **отправьте сюда фото или файл чека**."
     )
     await message.answer(text_msg, reply_markup=cancel_kb("main_menu"), parse_mode="Markdown")
 
@@ -749,7 +751,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
 
     await state.clear()
     await message.answer(
-        "⏳ **Заявка отправлена!** Ожидайте подтверждения администратора.",
+        "⏳ **Чек принят!** Заявка отправлена администратору на проверку.",
         reply_markup=get_main_menu_kb(user_id),
         parse_mode="Markdown"
     )
@@ -762,48 +764,33 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
     )
 
     caption_text = (
-        f"📥 **Заявка на пополнение #{req.id}**\n\n"
+        f"📥 **Заявка на пополнение #{req.id}**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
         f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
         f"💰 Сумма: `{amount:.2f} грн`"
     )
 
-    delivered = False
     for admin_id in ADMIN_IDS:
         try:
             if message.photo:
-                photo_id = message.photo[-1].file_id
                 await bot.send_photo(
                     chat_id=admin_id,
-                    photo=photo_id,
+                    photo=message.photo[-1].file_id,
                     caption=caption_text,
                     reply_markup=admin_kb,
                     parse_mode="Markdown"
                 )
             elif message.document:
-                doc_id = message.document.file_id
                 await bot.send_document(
                     chat_id=admin_id,
-                    document=doc_id,
+                    document=message.document.file_id,
                     caption=caption_text,
                     reply_markup=admin_kb,
                     parse_mode="Markdown"
                 )
-            delivered = True
         except Exception as e:
             logger.exception(f"Не удалось отправить чек администратору {admin_id}: {e}")
 
-    if not delivered:
-        logger.error(
-            f"Заявка на пополнение #{req.id} создана, но НИ ОДНОМУ админу не доставлено уведомление. "
-            f"Проверь ADMIN_IDS={ADMIN_IDS} и что админ(ы) нажали /start боту."
-        )
-        await message.answer(
-            "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
-            f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME} и укажите номер заявки: `#{req.id}`",
-            parse_mode="Markdown"
-        )
-
-# Фолбэк: пользователь в состоянии ожидания чека, но прислал не фото/файл (например текст)
 @router.message(DepositStates.waiting_for_receipt)
 async def process_receipt_wrong_type(message: Message):
     await message.answer(
@@ -828,11 +815,9 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
     await session.commit()
 
     if callback.message.caption is not None:
-        new_caption = (callback.message.caption or "") + "\n\n✅ ПОДТВЕРЖДЕНО"
-        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
     else:
-        new_text = (callback.message.text or "") + "\n\n✅ ПОДТВЕРЖДЕНО"
-        await callback.message.edit_text(text=new_text, reply_markup=None)
+        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
 
     try:
         await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
@@ -853,11 +838,9 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     await session.commit()
 
     if callback.message.caption is not None:
-        new_caption = (callback.message.caption or "") + "\n\n❌ ОТКЛОНЕНО"
-        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
     else:
-        new_text = (callback.message.text or "") + "\n\n❌ ОТКЛОНЕНО"
-        await callback.message.edit_text(text=new_text, reply_markup=None)
+        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
 
     try:
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
@@ -866,23 +849,261 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     await callback.answer()
 
 # ==========================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА
+# ПАНЕЛЬ АДМИНИСТРАТОРА (С ПОДТВЕРЖДЕНИЯМИ)
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 async def admin_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    text_msg = "🛠 **Панель администратора**\n\nВыберите действие:"
+    text_msg = (
+        "🛠 **Панель администратора**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "Выберите необходимое действие:"
+    )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw")],
-            [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod")],
-            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select")],
-            [InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")],
+            [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw"),
+             InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
+            [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"),
+             InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
+            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"),
+             InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
+# --- УДАЛЕНИЕ СОФТА С ПОДТВЕРЖДЕНИЕМ ---
+@router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
+    if not softwares:
+        await callback.answer("❌ Нет доступного софта для удаления!", show_alert=True)
+        return
+
+    buttons = []
+    for sw in softwares:
+        buttons.append([InlineKeyboardButton(text=f"❌ {sw.name} [ID: {sw.id}]", callback_data=f"confirm_del_sw_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(
+        "🗑 **Удаление софта**\n\nВыберите софт для удаления (вместе с ним удалятся тарифы и ключи):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_sw_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_software(callback: CallbackQuery, session: AsyncSession):
+    sw_id = int(callback.data.split("_")[3])
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить окончательно", callback_data=f"do_del_sw_{sw_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_del_sw_select")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\nВы действительно хотите удалить софт `{escape_md(sw.name)}`?\n*Все связанные тарифы и ключи будут стерты безвозвратно!*",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_sw_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_software(callback: CallbackQuery, session: AsyncSession):
+    sw_id = int(callback.data.split("_")[3])
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+    
+    sw_name = sw.name
+    await session.delete(sw)
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"✅ Софт `{escape_md(sw_name)}` успешно удален.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+# --- УДАЛЕНИЕ ТАРИФА С ПОДТВЕРЖДЕНИЕМ ---
+@router.callback_query(F.data == "admin_del_prod_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_prod_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Product))
+    products = res.scalars().all()
+    if not products:
+        await callback.answer("❌ Нет доступных тарифов для удаления!", show_alert=True)
+        return
+
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"❌ {sw_name} — {p.duration} ({p.price:.2f} грн)", callback_data=f"confirm_del_prod_{p.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(
+        "🗑 **Удаление тарифа**\n\nВыберите тариф для удаления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_product(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    sw = await session.get(Software, prod.software_id)
+    sw_name = sw.name if sw else "Софт"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить тариф", callback_data=f"do_del_prod_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_del_prod_select")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\nУдалить тариф `{escape_md(sw_name)}` — `{escape_md(prod.duration)}` (`{prod.price:.2f} грн`)?",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_product(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    await session.delete(prod)
+    await session.commit()
+
+    await callback.message.edit_text(
+        "✅ Тариф и все связанные с ним ключи успешно удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+# --- ОЧИСТКА КЛЮЧЕЙ С ПОДТВЕРЖДЕНИЕМ ---
+@router.callback_query(F.data == "admin_del_keys_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_keys_select(callback: CallbackQuery, session: AsyncSession):
+    products_res = await session.execute(select(Product))
+    products = products_res.scalars().all()
+
+    if not products:
+        await callback.answer("❌ Нет доступных тарифов!", show_alert=True)
+        return
+
+    text_msg = "🗑 **Очистка ключей**\n\nВыберите тариф для управления ключами:"
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"🧹 {sw_name} ({p.duration})", callback_data=f"clear_keys_prod_{p.id}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("clear_keys_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def clear_keys_menu(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    product = await session.get(Product, prod_id)
+    if not product:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    software = await session.get(Software, product.software_id)
+    sw_name = software.name if software else "Софт"
+
+    unsold_res = await session.execute(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
+    unsold_count = unsold_res.scalar() or 0
+
+    sold_res = await session.execute(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == True))
+    sold_count = sold_res.scalar() or 0
+
+    text_msg = (
+        f"🗑 **Управление ключами тарифа**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Софт: `{escape_md(sw_name)}`\n"
+        f"⏳ Срок: `{escape_md(product.duration)}`\n\n"
+        f"🟢 Непроданных ключей: `{unsold_count}`\n"
+        f"🔴 Проданных ключей: `{sold_count}`\n"
+        f"━━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 Удалить непроданные ({unsold_count})", callback_data=f"confirm_del_unsold_{prod_id}")],
+        [InlineKeyboardButton(text=f"🔥 Удалить абсолютно ВСЕ ключи", callback_data=f"confirm_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="🔙 К списку тарифов", callback_data="admin_del_keys_select")],
+        [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_unsold_keys(callback: CallbackQuery):
+    prod_id = callback.data.split("_")[3]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить непроданные", callback_data=f"do_del_unsold_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
+    ])
+    await callback.message.edit_text("⚠️ Вы действительно хотите удалить все **непроданные** ключи этого тарифа?", reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
+async def delete_unsold_keys(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    res = await session.execute(select(LicenseKey).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
+    keys = res.scalars().all()
+    count = len(keys)
+    for k in keys:
+        await session.delete(k)
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"✅ Успешно удалено непроданных ключей: `{count}`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_all_keys(callback: CallbackQuery):
+    prod_id = callback.data.split("_")[3]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 ДА, УДАЛИТЬ ВСЕ КЛЮЧИ", callback_data=f"do_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
+    ])
+    await callback.message.edit_text("⚠️ **ВНИМАНИЕ!** Вы хотите удалить **ВСЕ** ключи (включая проданные). Это может нарушить историю выданных ключей покупателям. Продолжить?", reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
+async def delete_all_keys(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    res = await session.execute(select(LicenseKey).where(LicenseKey.product_id == prod_id))
+    keys = res.scalars().all()
+    count = len(keys)
+    for k in keys:
+        await session.delete(k)
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"✅ Успешно удалено ВСЕХ ключей: `{count}`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+# --- ЗАГРУЗКА КЛЮЧЕЙ ---
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
     products_res = await session.execute(select(Product))
@@ -896,7 +1117,7 @@ async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession
         await callback.answer()
         return
 
-    text_msg = "📥 **Загрузка ключей | Выберите тариф**\n\nВыберите товар, для которого хотите загрузить ключи:"
+    text_msg = "📥 **Загрузка ключей**\n\nВыберите тариф, для которого хотите загрузить ключи:"
     buttons = []
     for p in products:
         sw = await session.get(Software, p.software_id)
@@ -922,7 +1143,8 @@ async def start_key_upload(callback: CallbackQuery, state: FSMContext, session: 
     await state.set_state(AdminStates.waiting_for_keys)
 
     text_msg = (
-        f"📥 **Загрузка ключей для:** `{escape_md(sw_name)} — {escape_md(product.duration)}`\n\n"
+        f"📥 **Загрузка ключей**\n"
+        f"📦 Товар: `{escape_md(sw_name)} — {escape_md(product.duration)}`\n\n"
         f"Отправьте ключи **текстовым сообщением** (каждый с новой строки) "
         f"или прикрепите **.txt файл** с ключами:"
     )
@@ -1160,9 +1382,6 @@ async def main():
                 logger.info(f"Миграция колонок пропущена/уже выполнена: {e}")
 
             try:
-                # Переводим все datetime-колонки на TIMESTAMP WITH TIME ZONE,
-                # т.к. в коде используются offset-aware значения (datetime.now(timezone.utc)),
-                # а asyncpg не умеет писать их в TIMESTAMP WITHOUT TIME ZONE.
                 await conn.execute(text("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
                 await conn.execute(text("ALTER TABLE purchases ALTER COLUMN purchased_at TYPE TIMESTAMPTZ USING purchased_at AT TIME ZONE 'UTC';"))
                 await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
@@ -1170,7 +1389,6 @@ async def main():
             except Exception as e:
                 logger.info(f"Миграция timestamptz пропущена/уже выполнена: {e}")
 
-        # Добавляем колонку duration в purchases, если её ещё нет (для старых БД, sqlite и postgres)
         try:
             await conn.execute(text("ALTER TABLE purchases ADD COLUMN duration VARCHAR(50) DEFAULT ''"))
             logger.info("Колонка purchases.duration добавлена.")
