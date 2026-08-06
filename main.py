@@ -49,14 +49,14 @@ else:
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
     if "?" in DATABASE_URL:
         DATABASE_URL = DATABASE_URL.split("?")[0]
-        
+
     connect_args = {}
     if any(domain in DATABASE_URL for domain in ["oregon-postgres", "frankfurt-postgres", "render.com"]):
         connect_args = {"ssl": "require"}
 
     engine = create_async_engine(
-        DATABASE_URL, 
-        echo=False, 
+        DATABASE_URL,
+        echo=False,
         connect_args=connect_args
     )
 
@@ -80,7 +80,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     username: Mapped[str | None] = mapped_column(String(32), nullable=True)
     balance: Mapped[float] = mapped_column(Float, default=0.0)
-    referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 class Platform(Base):
@@ -193,7 +193,7 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
                     referrer_id = possible_ref
 
             user = User(
-                id=message.from_user.id, 
+                id=message.from_user.id,
                 username=message.from_user.username,
                 referred_by=referrer_id
             )
@@ -257,6 +257,7 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
         text_msg = f"🛒 **Kranin Shop — {platform.name if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")]])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+        await callback.answer()
         return
 
     text_msg = f"🛒 **Kranin Shop — {platform.name}**\n\n⚡️ Выберите нужный софт:"
@@ -285,6 +286,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
         text_msg = f"🛒 **{software.name}**\n\n❌ Тарифы для этого софта пока отсутствуют."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к софту", callback_data=f"platform_{software.platform_id}")]])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+        await callback.answer()
         return
 
     text_msg = f"🛒 **{software.name}**\n\n📌 Выберите тариф:"
@@ -319,7 +321,14 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         await callback.answer(f"❌ Недостаточно средств! Требуется {product.price:.2f} грн", show_alert=True)
         return
 
-    key_res = await session.execute(select(LicenseKey).filter_by(product_id=product.id, is_sold=False).limit(1))
+    # FOR UPDATE предотвращает продажу одного и того же ключа двум покупателям
+    # при одновременных запросах (на SQLite игнорируется, на Postgres блокирует строку)
+    key_res = await session.execute(
+        select(LicenseKey)
+        .filter_by(product_id=product.id, is_sold=False)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
     license_key = key_res.scalars().first()
 
     if not license_key:
@@ -362,6 +371,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]])
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 # ==========================================
 # РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ
@@ -395,6 +405,7 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 @router.callback_query(F.data == "start_withdrawal")
 async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
@@ -410,9 +421,13 @@ async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, s
         f"Введите сумму вывода (минимум 500 грн):",
         parse_mode="Markdown"
     )
+    await callback.answer()
 
 @router.message(WithdrawalStates.waiting_for_amount)
 async def process_withdrawal_amount(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 500")
+        return
     try:
         amount = float(message.text.strip().replace(",", "."))
     except ValueError:
@@ -435,9 +450,18 @@ async def process_withdrawal_amount(message: Message, state: FSMContext, session
 
 @router.message(WithdrawalStates.waiting_for_card)
 async def process_withdrawal_card(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    if not message.text:
+        await message.answer("❌ Отправьте номер карты текстом.")
+        return
+
     card = message.text.strip()
     data = await state.get_data()
-    amount = data["amount"]
+    amount = data.get("amount")
+    if amount is None:
+        await message.answer("⚠️ Сессия вывода устарела, начните заново через «Реферальная система».")
+        await state.clear()
+        return
+
     user_id = message.from_user.id
 
     user = await session.get(User, user_id)
@@ -505,6 +529,7 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
         )
     except Exception:
         pass
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("reject_wdr_"), F.from_user.id.in_(ADMIN_IDS))
 async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -532,6 +557,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
         )
     except Exception:
         pass
+    await callback.answer()
 
 # ==========================================
 # ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ (ФОТО / ФАЙЛЫ)
@@ -543,9 +569,13 @@ async def start_deposit(callback: CallbackQuery, state: FSMContext):
         "💳 **Пополнение баланса**\n\nВведите сумму пополнения в гривнах числом:",
         parse_mode="Markdown"
     )
+    await callback.answer()
 
 @router.message(DepositStates.waiting_for_amount)
 async def process_deposit_amount(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 300")
+        return
     try:
         amount = float(message.text.strip().replace(",", "."))
         if amount <= 0:
@@ -615,6 +645,11 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         except Exception as e:
             logger.error(f"Не удалось отправить чек администратору {admin_id}: {e}")
 
+# Фолбэк: пользователь в состоянии ожидания чека, но прислал не фото/файл (например текст)
+@router.message(DepositStates.waiting_for_receipt)
+async def process_receipt_wrong_type(message: Message):
+    await message.answer("📌 Пожалуйста, отправьте **фото или файл** чека об оплате.", parse_mode="Markdown")
+
 @router.callback_query(F.data.startswith("approve_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     req_id = int(callback.data.split("_")[2])
@@ -641,6 +676,7 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
         await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
     except Exception:
         pass
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("reject_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -665,6 +701,7 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
     except Exception:
         pass
+    await callback.answer()
 
 # ==========================================
 # ПАНЕЛЬ АДМИНИСТРАТОРА
@@ -681,6 +718,7 @@ async def admin_menu(callback: CallbackQuery):
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
@@ -692,6 +730,7 @@ async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession
             "❌ Сначала создайте хотя бы один тариф товара!",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
         )
+        await callback.answer()
         return
 
     text_msg = "📥 **Загрузка ключей | Выберите тариф**\n\nВыберите товар, для которого хотите загрузить ключи:"
@@ -735,7 +774,7 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
 
     keys_text = ""
     if message.document:
-        if not (message.document.file_name and message.document.file_name.endswith(".txt")):
+        if not (message.document.file_name and message.document.file_name.lower().endswith(".txt")):
             await message.answer("❌ Пожалуйста, отправьте файл в формате `.txt`.")
             return
         file = await bot.get_file(message.document.file_id)
@@ -793,6 +832,7 @@ async def add_sw_start(callback: CallbackQuery, state: FSMContext):
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("sw_platform_"), F.from_user.id.in_(ADMIN_IDS))
 async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
@@ -807,6 +847,9 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_software_name, F.from_user.id.in_(ADMIN_IDS))
 async def save_software(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Введите название софта текстом.")
+        return
     try:
         data = await state.get_data()
         platform_id = data.get("platform_id")
@@ -824,7 +867,7 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
         await state.clear()
 
         await message.answer(
-            f"✅ Софт `{name}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`", 
+            f"✅ Софт `{name}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`",
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -838,10 +881,11 @@ async def add_prod_start(callback: CallbackQuery, state: FSMContext):
     text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**:"
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 @router.message(AdminStates.waiting_for_sw_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_sw_id(message: Message, state: FSMContext):
-    if not message.text.isdigit():
+    if not message.text or not message.text.isdigit():
         await message.answer("❌ ID должен быть числом. Попробуйте снова.")
         return
 
@@ -871,6 +915,9 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_price, F.from_user.id.in_(ADMIN_IDS))
 async def process_price_and_save(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте цену текстом (числом).")
+        return
     try:
         price = float(message.text.strip().replace(",", "."))
     except ValueError:
@@ -878,8 +925,12 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
         return
 
     data = await state.get_data()
-    software_id = data["software_id"]
-    duration = data["duration"]
+    software_id = data.get("software_id")
+    duration = data.get("duration")
+    if software_id is None or duration is None:
+        await message.answer("⚠️ Сессия создания тарифа устарела, начните заново.")
+        await state.clear()
+        return
 
     new_product = Product(software_id=software_id, duration=duration, price=price)
     session.add(new_product)
@@ -923,7 +974,7 @@ async def start_web_server():
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        
+
         if "postgresql" in DATABASE_URL:
             try:
                 await conn.execute(text("ALTER TABLE users ALTER COLUMN id TYPE BIGINT;"))
@@ -952,7 +1003,7 @@ async def main():
     dp.include_router(router)
 
     await start_web_server()
-    
+
     await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Бот и веб-заглушка запущены!")
