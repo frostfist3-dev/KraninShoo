@@ -19,6 +19,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    delete,
     func,
     select,
 )
@@ -261,6 +262,7 @@ class WithdrawalStates(StatesGroup):
 
 class UserStates(StatesGroup):
     waiting_for_promo_input = State()
+    waiting_for_review_rating = State()
     waiting_for_review_text = State()
 
 # ==========================================
@@ -441,7 +443,7 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     )
 
 # ==========================================
-# ОТЗЫВЫ
+# ОТЗЫВЫ (С ВЫБОРОМ ОЦЕНКИ КНОПКАМИ ⭐)
 # ==========================================
 @router.callback_query(F.data == "show_reviews")
 async def show_reviews_handler(callback: CallbackQuery):
@@ -468,9 +470,34 @@ async def leave_review_start(callback: CallbackQuery, state: FSMContext, session
         await callback.answer("❌ Вы можете оставлять отзывы только после совершения покупок в боте!", show_alert=True)
         return
 
-    await state.set_state(UserStates.waiting_for_review_text)
+    await state.set_state(UserStates.waiting_for_review_rating)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐⭐⭐⭐⭐ (5/5)", callback_data="review_stars_5")],
+        [InlineKeyboardButton(text="⭐⭐⭐⭐ (4/5)", callback_data="review_stars_4")],
+        [InlineKeyboardButton(text="⭐⭐⭐ (3/5)", callback_data="review_stars_3")],
+        [InlineKeyboardButton(text="⭐⭐ (2/5)", callback_data="review_stars_2")],
+        [InlineKeyboardButton(text="⭐ (1/5)", callback_data="review_stars_1")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")]
+    ])
+
     await callback.message.edit_text(
-        "✍️ **Оставить отзыв**\n\nНапишите ваш отзыв. Вы можете начать с оценки от 1 до 5, например: `5 Все отлично работает!`:",
+        "⭐ **Оставить отзыв**\n\nПожалуйста, выберите вашу оценку от 1 до 5 звезд:",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("review_stars_"))
+async def process_review_rating(callback: CallbackQuery, state: FSMContext):
+    rating = int(callback.data.split("_")[2])
+    await state.update_data(rating=rating)
+    await state.set_state(UserStates.waiting_for_review_text)
+
+    stars_str = "⭐" * rating
+    await callback.message.edit_text(
+        f"✍️ **Ваша оценка:** {stars_str} ({rating}/5)\n\n"
+        f"Напишите ваш отзыв текстом в ответ на это сообщение:",
         reply_markup=cancel_kb("show_reviews"),
         parse_mode="Markdown"
     )
@@ -481,11 +508,10 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
     if not message.text:
         await message.answer("❌ Отправьте текст отзыва.", reply_markup=cancel_kb("show_reviews"))
         return
+
     text_val = message.text.strip()
-    rating = 5
-    if text_val[0].isdigit() and int(text_val[0]) in range(1, 6):
-        rating = int(text_val[0])
-        text_val = text_val[1:].strip()
+    data = await state.get_data()
+    rating = data.get("rating", 5)
 
     review = Review(user_id=message.from_user.id, rating=rating, text=text_val)
     session.add(review)
@@ -495,7 +521,6 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
     user = await session.get(User, message.from_user.id)
     lang = user.language if user and user.language in LANGUAGES else "uk"
 
-    # Отправка отзыва администраторам с кнопкой удаления
     admin_msg = (
         f"⭐ **Новый отзыв от покупателя!**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
@@ -1748,202 +1773,140 @@ async def clear_keys_menu(callback: CallbackQuery, session: AsyncSession):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("confirm_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
-async def confirm_delete_unsold_keys(callback: CallbackQuery):
-    prod_id = callback.data.split("_")[3]
+async def confirm_del_unsold(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[3])
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить непроданные", callback_data=f"do_del_unsold_{prod_id}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
     ])
-    await callback.message.edit_text("⚠️ Вы действительно хотите удалить все **непроданные** ключи этого тарифа?", reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
+    await callback.message.edit_text("⚠️ Вы уверены, что хотите удалить ВСЕ непроданные ключи этого тарифа?", reply_markup=keyboard)
 
 @router.callback_query(F.data.startswith("do_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
-async def delete_unsold_keys(callback: CallbackQuery, session: AsyncSession):
+async def do_del_unsold(callback: CallbackQuery, session: AsyncSession):
     prod_id = int(callback.data.split("_")[3])
-    res = await session.execute(select(LicenseKey).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
-    keys = res.scalars().all()
-    count = len(keys)
-    for k in keys:
-        await session.delete(k)
+    await session.execute(delete(LicenseKey).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
     await session.commit()
-
     await callback.message.edit_text(
-        f"✅ Успешно удалено непроданных ключей: `{count}`",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-        parse_mode="Markdown"
+        "✅ Непроданные ключи успешно удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
     )
-    await callback.answer()
 
 @router.callback_query(F.data.startswith("confirm_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
-async def confirm_delete_all_keys(callback: CallbackQuery):
-    prod_id = callback.data.split("_")[3]
+async def confirm_del_all_keys(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[4])
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔥 ДА, УДАЛИТЬ ВСЕ КЛЮЧИ", callback_data=f"do_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="🔥 Да, удалить абсолютно ВСЕ ключи", callback_data=f"do_del_all_keys_{prod_id}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
     ])
-    await callback.message.edit_text("⚠️ **ВНИМАНИЕ!** Вы хотите удалить **ВСЕ** ключи (включая проданные). Это может нарушить историю выданных ключей покупателям. Продолжить?", reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
+    await callback.message.edit_text("⚠️ Вы уверены? Это удалит и проданные, и непроданные ключи этого тарифа!", reply_markup=keyboard)
 
 @router.callback_query(F.data.startswith("do_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
-async def delete_all_keys(callback: CallbackQuery, session: AsyncSession):
-    prod_id = int(callback.data.split("_")[3])
-    res = await session.execute(select(LicenseKey).where(LicenseKey.product_id == prod_id))
-    keys = res.scalars().all()
-    count = len(keys)
-    for k in keys:
-        await session.delete(k)
+async def do_del_all_keys(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[4])
+    await session.execute(delete(LicenseKey).where(LicenseKey.product_id == prod_id))
     await session.commit()
-
     await callback.message.edit_text(
-        f"✅ Успешно удалено ВСЕХ ключей: `{count}`",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-        parse_mode="Markdown"
+        "🔥 Все ключи тарифа успешно удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
     )
-    await callback.answer()
 
+# --- ЗАГРУЗКА КЛЮЧЕЙ ---
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
-async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession):
-    products_res = await session.execute(select(Product))
-    products = products_res.scalars().all()
-
+async def admin_add_keys_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Product))
+    products = res.scalars().all()
     if not products:
-        await callback.message.edit_text(
-            "❌ Сначала создайте хотя бы один тариф товара!",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
-        )
-        await callback.answer()
+        await callback.answer("❌ Сначала создайте хотя бы один тариф!", show_alert=True)
         return
 
-    text_msg = "📥 **Загрузка ключей**\n\nВыберите тариф, для которого хотите загрузить ключи:"
     buttons = []
     for p in products:
         sw = await session.get(Software, p.software_id)
         sw_name = sw.name if sw else "Софт"
-        buttons.append([InlineKeyboardButton(text=f"🔑 {sw_name} ({p.duration}) — {p.price:.2f} грн", callback_data=f"key_prod_sel_{p.id}")])
-
+        buttons.append([InlineKeyboardButton(text=f"🔑 {sw_name} ({p.duration})", callback_data=f"add_keys_prod_{p.id}")])
     buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+
+    await callback.message.edit_text("📥 **Загрузка ключей**\n\nВыберите тариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
-@router.callback_query(F.data.startswith("key_prod_sel_"), F.from_user.id.in_(ADMIN_IDS))
-async def start_key_upload(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    product_id = int(callback.data.split("_")[3])
-    product = await session.get(Product, product_id)
-    if not product:
-        await callback.answer("❌ Тариф не найден!", show_alert=True)
-        return
-
-    software = await session.get(Software, product.software_id)
-    sw_name = software.name if software else "Софт"
-
-    await state.update_data(product_id=product_id)
+@router.callback_query(F.data.startswith("add_keys_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_keys_start(callback: CallbackQuery, state: FSMContext):
+    prod_id = int(callback.data.split("_")[3])
+    await state.update_data(product_id=prod_id)
     await state.set_state(AdminStates.waiting_for_keys)
-
-    text_msg = (
-        f"📥 **Загрузка ключей**\n"
-        f"📦 Товар: `{escape_md(sw_name)} — {escape_md(product.duration)}`\n\n"
-        f"Отправьте ключи **текстовым сообщением** (каждый с новой строки) "
-        f"или прикрепите **.txt файл** с ключами:"
-    )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 К выбору тарифа", callback_data="admin_add_keys_select")]])
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text("📥 **Загрузка ключей**\n\nОтправьте ключи списком (каждый ключ с новой строки):", reply_markup=cancel_kb("admin_panel"), parse_mode="Markdown")
     await callback.answer()
 
 @router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
-async def save_keys(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
-    data = await state.get_data()
-    product_id = data.get("product_id")
-
-    keys_text = ""
-    if message.document:
-        if not (message.document.file_name and message.document.file_name.lower().endswith(".txt")):
-            await message.answer("❌ Пожалуйста, отправьте файл в формате `.txt`.")
-            return
-        file = await bot.get_file(message.document.file_id)
-        downloaded = await bot.download_file(file.file_path)
-        keys_text = downloaded.getvalue().decode("utf-8")
-    elif message.text:
-        keys_text = message.text
-
-    keys = [k.strip() for k in keys_text.strip().split("\n") if k.strip()]
-
-    if not keys:
-        await message.answer("❌ Сообщение или файл не содержат ключей!")
+async def process_keys_upload(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    if not message.text:
+        await message.answer("❌ Отправьте ключи текстом.")
         return
 
-    try:
-        product = await session.get(Product, product_id)
-        if not product:
-            await message.answer("❌ Ошибка: Выбранный тариф не найден в БД.")
-            await state.clear()
-            return
+    data = await state.get_data()
+    prod_id = data.get("product_id")
+    keys = [k.strip() for k in message.text.strip().split("\n") if k.strip()]
 
-        added = 0
-        duplicates = 0
-        for k in keys:
-            exists = await session.execute(select(LicenseKey).filter_by(key_string=k))
-            if not exists.scalars().first():
-                session.add(LicenseKey(product_id=product_id, key_string=k, is_sold=False))
-                added += 1
-            else:
-                duplicates += 1
+    added_count = 0
+    for k in keys:
+        try:
+            lk = LicenseKey(product_id=prod_id, key_string=k)
+            session.add(lk)
+            await session.flush()
+            added_count += 1
+        except Exception:
+            await session.rollback()
 
+    await session.commit()
+    await state.clear()
+
+    if added_count > 0:
+        subs_res = await session.execute(select(RestockSubscription).where(RestockSubscription.product_id == prod_id))
+        subs = subs_res.scalars().all()
+        prod = await session.get(Product, prod_id)
+        sw = await session.get(Software, prod.software_id) if prod else None
+        sw_name = sw.name if sw else "Товар"
+
+        for sub in subs:
+            try:
+                await bot.send_message(
+                    sub.user_id,
+                    f"🔔 **Пополнение товара!**\n\nТовар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            await session.delete(sub)
         await session.commit()
-        
-        if added > 0:
-            subs_res = await session.execute(select(RestockSubscription).where(RestockSubscription.product_id == product_id))
-            subscriptions = subs_res.scalars().all()
-            if subscriptions:
-                software = await session.get(Software, product.software_id)
-                sw_name = software.name if software else "Товар"
-                for sub in subscriptions:
-                    try:
-                        await bot.send_message(
-                            sub.user_id,
-                            f"🔔 **Поступление товара!**\nДля товара `{escape_md(sw_name)}` (`{escape_md(product.duration)}`) появились новые ключи в наличии!",
-                            parse_mode="Markdown"
-                        )
-                    except Exception:
-                        pass
-                for sub in subscriptions:
-                    await session.delete(sub)
-                await session.commit()
 
-        await state.clear()
-
-        result_msg = f"✅ **Успешно загружено ключей: {added}**"
-        if duplicates > 0:
-            result_msg += f"\n⚠️ Пропущено дубликатов: `{duplicates}`"
-
-        await message.answer(
-            result_msg,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        await session.rollback()
-        logger.error(f"Ошибка сохранения ключей: {e}")
-        await message.answer("⚠️ Не удалось сохранить ключи. Ошибка БД.")
-
+    await message.answer(
+        f"✅ Успешно добавлено `{added_count}` ключей!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
 
 # ==========================================
-# ЗАПУСК БОТА
+# ЗАПУСК БОТА И ИНИЦИАЛИЗАЦИЯ
 # ==========================================
 async def main():
-    if not BOT_TOKEN:
-        logger.error("Переменная окружения BOT_TOKEN не задана!")
-        return
-
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+        # Автоматическое создание базовых платформ, если база пустая
+        async_session = async_sessionmaker(engine, expire_on_commit=False)
+        async with async_session() as session:
+            res = await session.execute(select(Platform))
+            if not res.scalars().all():
+                session.add(Platform(name="Android"))
+                session.add(Platform(name="iOS"))
+                await session.commit()
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(DbSessionMiddleware(session_pool=async_session_maker))
     dp.include_router(router)
 
-    logger.info("Бот успешно запущен!")
+    logger.info("Бот запущен!")
     await dp.start_polling(bot)
 
 
