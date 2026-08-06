@@ -5,7 +5,7 @@ from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -164,10 +164,20 @@ def get_main_menu_kb(user_id: int):
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, session: AsyncSession):
+async def cmd_start(message: Message, command: CommandObject, session: AsyncSession):
     user = await session.get(User, message.from_user.id)
     if not user:
-        user = User(id=message.from_user.id, username=message.from_user.username)
+        referrer_id = None
+        if command.args and command.args.isdigit():
+            possible_ref = int(command.args)
+            if possible_ref != message.from_user.id:
+                referrer_id = possible_ref
+
+        user = User(
+            id=message.from_user.id, 
+            username=message.from_user.username,
+            referred_by=referrer_id
+        )
         session.add(user)
         await session.commit()
 
@@ -585,8 +595,16 @@ async def start_web_server():
 async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Добавляем отсутствующую колонку referred_by в базу данных при старте
-        await conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT;"))
+        
+        # Автоматическая миграция типы данных для Telegram ID (BigInteger) в PostgreSQL
+        if "postgresql" in DATABASE_URL:
+            try:
+                await conn.execute(text("ALTER TABLE users ALTER COLUMN id TYPE BIGINT;"))
+                await conn.execute(text("ALTER TABLE users ALTER COLUMN referred_by TYPE BIGINT;"))
+                await conn.execute(text("ALTER TABLE purchases ALTER COLUMN user_id TYPE BIGINT;"))
+                await conn.execute(text("ALTER TABLE deposit_requests ALTER COLUMN user_id TYPE BIGINT;"))
+            except Exception as e:
+                print(f"Миграция БД выполнена или не требуется: {e}")
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
