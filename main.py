@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT")
 
 raw_admin_ids = os.getenv("ADMIN_IDS", "8479717148")
 ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()]
@@ -66,8 +67,36 @@ CARDS = [
     "5232 4410 4407 1160 (Альянс)",
 ]
 
+# Фиксированный порядок тарифов по сроку — используется в админке и в профиле
+DURATIONS = ["1 день", "7 дней", "30 дней"]
+
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 router = Router()
+
+
+def escape_md(value) -> str:
+    """
+    Экранирует спецсимволы легаси-Markdown Telegram (_ * ` [), чтобы
+    произвольный текст (юзернеймы, номера карт, ключи, названия софта)
+    не ломал parse_mode="Markdown" и не приводил к молчаливому падению
+    отправки сообщения (can't parse entities).
+    """
+    if value is None:
+        return ""
+    value = str(value)
+    for ch in ("\\", "_", "*", "`", "["):
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
+def user_display(message_or_callback) -> str:
+    """Безопасное для Markdown отображение @username пользователя."""
+    u = message_or_callback.from_user
+    username = u.username
+    if username:
+        return f"@{escape_md(username)}"
+    return "без юзернейма"
+
 
 # ==========================================
 # МОДЕЛИ БАЗЫ ДАННЫХ
@@ -120,6 +149,7 @@ class Purchase(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     product_name: Mapped[str] = mapped_column(String(100))
     key_issued: Mapped[str] = mapped_column(String(255))
+    duration: Mapped[str] = mapped_column(String(50), default="")
     purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class DepositRequest(Base):
@@ -174,16 +204,28 @@ class WithdrawalStates(StatesGroup):
 def get_main_menu_kb(user_id: int):
     keyboard = [
         [InlineKeyboardButton(text="🛒 Открыть магазин", callback_data="shop")],
-        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
-        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")]
+        [InlineKeyboardButton(text="👤 Профиль", callback_data="profile"),
+         InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
     ]
     if user_id in ADMIN_IDS:
         keyboard.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+
+def get_main_menu_text(balance: float) -> str:
+    return f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{balance:.2f} грн`\n\nВыберите раздел:"
+
+
+def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=target)]])
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, session: AsyncSession):
+async def cmd_start(message: Message, command: CommandObject, session: AsyncSession, state: FSMContext):
     try:
+        await state.clear()
         user = await session.get(User, message.from_user.id)
         if not user:
             referrer_id = None
@@ -205,7 +247,7 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
                 await session.commit()
 
         await message.answer(
-            f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{user.balance:.2f} грн`\n\nВыберите раздел:",
+            get_main_menu_text(user.balance),
             reply_markup=get_main_menu_kb(message.from_user.id),
             parse_mode="Markdown"
         )
@@ -215,21 +257,93 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
         await message.answer("⚠️ Произошла ошибка. Попробуйте снова.")
 
 @router.callback_query(F.data == "main_menu")
-async def main_menu_handler(callback: CallbackQuery, session: AsyncSession):
+async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
     user = await session.get(User, callback.from_user.id)
     balance = user.balance if user else 0.0
     await callback.message.edit_text(
-        f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{balance:.2f} грн`\n\nВыберите раздел:",
+        get_main_menu_text(balance),
         reply_markup=get_main_menu_kb(callback.from_user.id),
         parse_mode="Markdown"
     )
     await callback.answer()
 
 # ==========================================
+# ПРОФИЛЬ И КУПЛЕННЫЕ КЛЮЧИ
+# ==========================================
+@router.callback_query(F.data == "profile")
+async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    user = await session.get(User, user_id)
+    balance = user.balance if user else 0.0
+
+    total_res = await session.execute(select(func.count(Purchase.id)).where(Purchase.user_id == user_id))
+    total_purchases = total_res.scalar() or 0
+
+    text_msg = (
+        f"👤 **Профиль**\n\n"
+        f"💰 Баланс: `{balance:.2f} грн`\n"
+        f"🛍 Всего покупок: `{total_purchases}`\n\n"
+        f"Выберите категорию, чтобы посмотреть свои купленные ключи:"
+    )
+
+    buttons = []
+    for idx, d in enumerate(DURATIONS):
+        cnt_res = await session.execute(
+            select(func.count(Purchase.id)).where(Purchase.user_id == user_id, Purchase.duration == d)
+        )
+        cnt = cnt_res.scalar() or 0
+        buttons.append([InlineKeyboardButton(text=f"🔑 {d} ({cnt})", callback_data=f"profile_dur_{idx}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("profile_dur_"))
+async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
+    try:
+        idx = int(callback.data.split("_")[2])
+        duration = DURATIONS[idx]
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректная категория!", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    res = await session.execute(
+        select(Purchase)
+        .where(Purchase.user_id == user_id, Purchase.duration == duration)
+        .order_by(Purchase.purchased_at.desc())
+        .limit(25)
+    )
+    purchases = res.scalars().all()
+
+    if not purchases:
+        text_msg = f"🔑 **Ключи — {duration}**\n\nУ вас пока нет купленных ключей в этой категории."
+    else:
+        lines = [f"🔑 **Ключи — {duration}** (последние {len(purchases)}):\n"]
+        for p in purchases:
+            date_str = p.purchased_at.strftime("%d.%m.%Y %H:%M")
+            lines.append(
+                f"📦 {escape_md(p.product_name)}\n"
+                f"🔐 `{p.key_issued}`\n"
+                f"🕒 {date_str}\n"
+            )
+        text_msg = "\n".join(lines)
+
+    buttons = [
+        [InlineKeyboardButton(text="🔙 Назад в профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+# ==========================================
 # КАТАЛОГ И ПОКУПКИ
 # ==========================================
 @router.callback_query(F.data == "shop")
-async def show_platforms(callback: CallbackQuery, session: AsyncSession):
+async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
     result = await session.execute(select(Platform))
     platforms = result.scalars().all()
 
@@ -254,13 +368,13 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession):
     softwares = result.scalars().all()
 
     if not softwares:
-        text_msg = f"🛒 **Kranin Shop — {platform.name if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
+        text_msg = f"🛒 **Kranin Shop — {escape_md(platform.name) if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к платформам", callback_data="shop")]])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         await callback.answer()
         return
 
-    text_msg = f"🛒 **Kranin Shop — {platform.name}**\n\n⚡️ Выберите нужный софт:"
+    text_msg = f"🛒 **Kranin Shop — {escape_md(platform.name)}**\n\n⚡️ Выберите нужный софт:"
     buttons = []
     for sw in softwares:
         buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"software_{sw.id}")])
@@ -283,13 +397,16 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
     products = result.scalars().all()
 
     if not products:
-        text_msg = f"🛒 **{software.name}**\n\n❌ Тарифы для этого софта пока отсутствуют."
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад к софту", callback_data=f"platform_{software.platform_id}")]])
+        text_msg = f"🛒 **{escape_md(software.name)}**\n\n❌ Тарифы для этого софта пока отсутствуют."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к софту", callback_data=f"platform_{software.platform_id}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ])
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
         await callback.answer()
         return
 
-    text_msg = f"🛒 **{software.name}**\n\n📌 Выберите тариф:"
+    text_msg = f"🛒 **{escape_md(software.name)}**\n\n📌 Выберите тариф:"
     buttons = []
     for p in products:
         keys_res = await session.execute(select(LicenseKey).filter_by(product_id=p.id, is_sold=False))
@@ -299,6 +416,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession):
         buttons.append([InlineKeyboardButton(text=f"{status} {p.duration} — {p.price:.2f} грн", callback_data=f"buy_product_{p.id}")])
 
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"platform_{software.platform_id}")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -357,19 +475,25 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         user_id=user.id,
         product_name=f"{sw_name} ({product.duration})",
         key_issued=license_key.key_string,
+        duration=product.duration,
     )
     session.add(purchase)
     await session.commit()
 
     success_text = (
         f"✅ **Покупка успешно завершена!**\n\n"
-        f"📦 Товар: `{sw_name} — {product.duration}`\n"
+        f"📦 Товар: {escape_md(sw_name)} — {escape_md(product.duration)}\n"
         f"💳 Списано: `{product.price:.2f} грн`\n"
         f"🔑 Ваш ключ:\n`{license_key.key_string}`\n\n"
-        f"📌 Нажмите на ключ, чтобы скопировать."
+        f"📌 Нажмите на ключ, чтобы скопировать.\n"
+        f"💾 Ключ также сохранён в разделе «👤 Профиль» — не потеряется."
     )
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Мои ключи", callback_data="profile")],
+        [InlineKeyboardButton(text="🛒 Продолжить покупки", callback_data=f"platform_{software.platform_id}" if software else "shop")],
+        [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
+    ])
     await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
@@ -377,7 +501,8 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
 # РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ
 # ==========================================
 @router.callback_query(F.data == "ref_program")
-async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
+    await state.clear()
     user_id = callback.from_user.id
     user = await session.get(User, user_id)
     balance = user.balance if user else 0.0
@@ -419,6 +544,7 @@ async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, s
     await callback.message.edit_text(
         f"📤 **Вывод средств**\n\nВаш доступный баланс: `{balance:.2f} грн`\n"
         f"Введите сумму вывода (минимум 500 грн):",
+        reply_markup=cancel_kb("ref_program"),
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -426,32 +552,32 @@ async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, s
 @router.message(WithdrawalStates.waiting_for_amount)
 async def process_withdrawal_amount(message: Message, state: FSMContext, session: AsyncSession):
     if not message.text:
-        await message.answer("❌ Отправьте сумму текстом (числом), например: 500")
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 500", reply_markup=cancel_kb("ref_program"))
         return
     try:
         amount = float(message.text.strip().replace(",", "."))
     except ValueError:
-        await message.answer("❌ Введите корректную сумму числом!")
+        await message.answer("❌ Введите корректную сумму числом!", reply_markup=cancel_kb("ref_program"))
         return
 
     user = await session.get(User, message.from_user.id)
     balance = user.balance if user else 0.0
 
     if amount < 500:
-        await message.answer("❌ Минимальная сумма вывода — 500 грн. Введите сумму повторно:")
+        await message.answer("❌ Минимальная сумма вывода — 500 грн. Введите сумму повторно:", reply_markup=cancel_kb("ref_program"))
         return
     if amount > balance:
-        await message.answer(f"❌ У вас недостаточно средств! Доступно: `{balance:.2f} грн`. Введите сумму:", parse_mode="Markdown")
+        await message.answer(f"❌ У вас недостаточно средств! Доступно: `{balance:.2f} грн`. Введите сумму:", reply_markup=cancel_kb("ref_program"), parse_mode="Markdown")
         return
 
     await state.update_data(amount=amount)
     await state.set_state(WithdrawalStates.waiting_for_card)
-    await message.answer("💳 Введите номер банковской карты для получения выплаты:")
+    await message.answer("💳 Введите номер банковской карты для получения выплаты:", reply_markup=cancel_kb("ref_program"))
 
 @router.message(WithdrawalStates.waiting_for_card)
 async def process_withdrawal_card(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
     if not message.text:
-        await message.answer("❌ Отправьте номер карты текстом.")
+        await message.answer("❌ Отправьте номер карты текстом.", reply_markup=cancel_kb("ref_program"))
         return
 
     card = message.text.strip()
@@ -479,8 +605,9 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
     await message.answer(
         f"✅ **Заявка на вывод создана!**\n\n"
         f"💰 Сумма: `{amount:.2f} грн`\n"
-        f"💳 Карта: `{card}`\n\n"
+        f"💳 Карта: `{escape_md(card)}`\n\n"
         f"⏳ Ожидайте обработки администратором.",
+        reply_markup=get_main_menu_kb(user_id),
         parse_mode="Markdown"
     )
 
@@ -498,9 +625,9 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
                 chat_id=admin_id,
                 text=(
                     f"📤 **Заявка на вывод средств #{req.id}**\n\n"
-                    f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
+                    f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
                     f"💰 Сумма: `{amount:.2f} грн`\n"
-                    f"💳 Карта: `{card}`"
+                    f"💳 Карта: `{escape_md(card)}`"
                 ),
                 reply_markup=admin_kb,
                 parse_mode="Markdown"
@@ -516,7 +643,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         )
         await message.answer(
             "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
-            f"Свяжитесь с поддержкой и укажите номер заявки: `#{req.id}`",
+            f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME} и укажите номер заявки: `#{req.id}`",
             parse_mode="Markdown"
         )
 
@@ -533,11 +660,11 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
     await session.commit()
 
     current_text = callback.message.text or ""
-    await callback.message.edit_text(text=current_text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None)
+    await callback.message.edit_text(text=current_text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None, parse_mode="Markdown")
     try:
         await bot.send_message(
             req.user_id,
-            f"🎉 **Ваша заявка на вывод `{req.amount:.2f} грн` успешно обработана!**\nСредства отправлены на карту `{req.card}`.",
+            f"🎉 **Ваша заявка на вывод `{req.amount:.2f} грн` успешно обработана!**\nСредства отправлены на карту `{escape_md(req.card)}`.",
             parse_mode="Markdown"
         )
     except Exception:
@@ -561,7 +688,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
     await session.commit()
 
     current_text = callback.message.text or ""
-    await callback.message.edit_text(text=current_text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None)
+    await callback.message.edit_text(text=current_text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None, parse_mode="Markdown")
     try:
         await bot.send_message(
             req.user_id,
@@ -580,6 +707,7 @@ async def start_deposit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(DepositStates.waiting_for_amount)
     await callback.message.edit_text(
         "💳 **Пополнение баланса**\n\nВведите сумму пополнения в гривнах числом:",
+        reply_markup=cancel_kb("main_menu"),
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -587,14 +715,14 @@ async def start_deposit(callback: CallbackQuery, state: FSMContext):
 @router.message(DepositStates.waiting_for_amount)
 async def process_deposit_amount(message: Message, state: FSMContext):
     if not message.text:
-        await message.answer("❌ Отправьте сумму текстом (числом), например: 300")
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 300", reply_markup=cancel_kb("main_menu"))
         return
     try:
         amount = float(message.text.strip().replace(",", "."))
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите корректную сумму числом!")
+        await message.answer("❌ Введите корректную сумму числом!", reply_markup=cancel_kb("main_menu"))
         return
 
     selected_card = random.choice(CARDS)
@@ -607,7 +735,7 @@ async def process_deposit_amount(message: Message, state: FSMContext):
         f"Реквизиты:\n`{selected_card}`\n\n"
         f"📌 Переведите указанную сумму и **отправьте сюда фото или файл чека**."
     )
-    await message.answer(text_msg, parse_mode="Markdown")
+    await message.answer(text_msg, reply_markup=cancel_kb("main_menu"), parse_mode="Markdown")
 
 @router.message(DepositStates.waiting_for_receipt, F.photo | F.document)
 async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
@@ -620,7 +748,11 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
     await session.commit()
 
     await state.clear()
-    await message.answer("⏳ **Заявка отправлена!** Ожидайте подтверждения администратора.", parse_mode="Markdown")
+    await message.answer(
+        "⏳ **Заявка отправлена!** Ожидайте подтверждения администратора.",
+        reply_markup=get_main_menu_kb(user_id),
+        parse_mode="Markdown"
+    )
 
     admin_kb = InlineKeyboardMarkup(
         inline_keyboard=[[
@@ -631,7 +763,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
 
     caption_text = (
         f"📥 **Заявка на пополнение #{req.id}**\n\n"
-        f"👤 Пользователь: `{user_id}` (@{message.from_user.username or 'без_юзернейма'})\n"
+        f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
         f"💰 Сумма: `{amount:.2f} грн`"
     )
 
@@ -667,15 +799,18 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         )
         await message.answer(
             "⚠️ Заявка сохранена, но не удалось уведомить администратора автоматически. "
-            "Свяжитесь с поддержкой и укажите этот номер заявки: "
-            f"`#{req.id}`",
+            f"Свяжитесь с поддержкой: @{SUPPORT_USERNAME} и укажите номер заявки: `#{req.id}`",
             parse_mode="Markdown"
         )
 
 # Фолбэк: пользователь в состоянии ожидания чека, но прислал не фото/файл (например текст)
 @router.message(DepositStates.waiting_for_receipt)
 async def process_receipt_wrong_type(message: Message):
-    await message.answer("📌 Пожалуйста, отправьте **фото или файл** чека об оплате.", parse_mode="Markdown")
+    await message.answer(
+        "📌 Пожалуйста, отправьте **фото или файл** чека об оплате.",
+        reply_markup=cancel_kb("main_menu"),
+        parse_mode="Markdown"
+    )
 
 @router.callback_query(F.data.startswith("approve_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
@@ -693,10 +828,10 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
     await session.commit()
 
     if callback.message.caption is not None:
-        new_caption = (callback.message.caption or "") + "\n\n✅ **ПОДТВЕРЖДЕНО**"
+        new_caption = (callback.message.caption or "") + "\n\n✅ ПОДТВЕРЖДЕНО"
         await callback.message.edit_caption(caption=new_caption, reply_markup=None)
     else:
-        new_text = (callback.message.text or "") + "\n\n✅ **ПОДТВЕРЖДЕНО**"
+        new_text = (callback.message.text or "") + "\n\n✅ ПОДТВЕРЖДЕНО"
         await callback.message.edit_text(text=new_text, reply_markup=None)
 
     try:
@@ -718,10 +853,10 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     await session.commit()
 
     if callback.message.caption is not None:
-        new_caption = (callback.message.caption or "") + "\n\n❌ **ОТКЛОНЕНО**"
+        new_caption = (callback.message.caption or "") + "\n\n❌ ОТКЛОНЕНО"
         await callback.message.edit_caption(caption=new_caption, reply_markup=None)
     else:
-        new_text = (callback.message.text or "") + "\n\n❌ **ОТКЛОНЕНО**"
+        new_text = (callback.message.text or "") + "\n\n❌ ОТКЛОНЕНО"
         await callback.message.edit_text(text=new_text, reply_markup=None)
 
     try:
@@ -734,7 +869,8 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
 # ПАНЕЛЬ АДМИНИСТРАТОРА
 # ==========================================
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
-async def admin_menu(callback: CallbackQuery):
+async def admin_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     text_msg = "🛠 **Панель администратора**\n\nВыберите действие:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -767,7 +903,7 @@ async def add_keys_select_product(callback: CallbackQuery, session: AsyncSession
         sw_name = sw.name if sw else "Софт"
         buttons.append([InlineKeyboardButton(text=f"🔑 {sw_name} ({p.duration}) — {p.price:.2f} грн", callback_data=f"key_prod_sel_{p.id}")])
 
-    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
     await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
@@ -786,11 +922,11 @@ async def start_key_upload(callback: CallbackQuery, state: FSMContext, session: 
     await state.set_state(AdminStates.waiting_for_keys)
 
     text_msg = (
-        f"📥 **Загрузка ключей для:** `{sw_name} — {product.duration}`\n\n"
+        f"📥 **Загрузка ключей для:** `{escape_md(sw_name)} — {escape_md(product.duration)}`\n\n"
         f"Отправьте ключи **текстовым сообщением** (каждый с новой строки) "
         f"или прикрепите **.txt файл** с ключами:"
     )
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 К выбору тарифа", callback_data="admin_add_keys_select")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
@@ -840,7 +976,11 @@ async def save_keys(message: Message, state: FSMContext, session: AsyncSession, 
         if duplicates > 0:
             result_msg += f"\n⚠️ Пропущено дубликатов: `{duplicates}`"
 
-        await message.answer(result_msg, parse_mode="Markdown")
+        await message.answer(
+            result_msg,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
 
     except Exception as e:
         await session.rollback()
@@ -855,7 +995,7 @@ async def add_sw_start(callback: CallbackQuery, state: FSMContext):
         inline_keyboard=[
             [InlineKeyboardButton(text="🤖 Android", callback_data="sw_platform_1")],
             [InlineKeyboardButton(text="🍏 iOS", callback_data="sw_platform_2")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
         ]
     )
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -868,7 +1008,7 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_software_name)
 
     text_msg = "➕ **Добавление софта (Шаг 2/2)**\n\nВведите название софта (например: `Flexnote`):"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_add_sw")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
@@ -894,7 +1034,8 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
         await state.clear()
 
         await message.answer(
-            f"✅ Софт `{name}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`",
+            f"✅ Софт `{escape_md(name)}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
             parse_mode="Markdown"
         )
     except Exception as e:
@@ -906,14 +1047,17 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
 async def add_prod_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_sw_id)
     text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**:"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.message(AdminStates.waiting_for_sw_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_sw_id(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
-        await message.answer("❌ ID должен быть числом. Попробуйте снова.")
+        await message.answer(
+            "❌ ID должен быть числом. Попробуйте снова.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
+        )
         return
 
     await state.update_data(software_id=int(message.text))
@@ -925,7 +1069,7 @@ async def process_sw_id(message: Message, state: FSMContext):
             [InlineKeyboardButton(text="⏳ 1 день", callback_data="duration_1 день")],
             [InlineKeyboardButton(text="⏳ 7 дней", callback_data="duration_7 дней")],
             [InlineKeyboardButton(text="⏳ 30 дней", callback_data="duration_30 дней")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
         ]
     )
     await message.answer(text_msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -937,7 +1081,8 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_price)
 
     text_msg = f"➕ **Создание тарифа (Шаг 3/3)**\n\nВыбран срок: `{duration}`\n\nОтправьте **цену в грн** (число):"
-    await callback.message.edit_text(text_msg, parse_mode="Markdown")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.message(AdminStates.waiting_for_price, F.from_user.id.in_(ADMIN_IDS))
@@ -969,6 +1114,7 @@ async def process_price_and_save(message: Message, state: FSMContext, session: A
         f"• ID товара: `{new_product.id}`\n"
         f"• Срок: `{duration}`\n"
         f"• Цена: `{price:.2f} грн`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
         parse_mode="Markdown"
     )
 
@@ -980,6 +1126,7 @@ async def photo_without_state(message: Message):
     await message.answer(
         "⚠️ Я получил ваш файл, но заявка на пополнение не активирована.\n\n"
         "Сначала перейдите в **«💳 Пополнить баланс»**, введите сумму и только после этого отправляйте чек!",
+        reply_markup=cancel_kb("main_menu", "🏠 Главное меню"),
         parse_mode="Markdown"
     )
 
@@ -1022,6 +1169,13 @@ async def main():
                 await conn.execute(text("ALTER TABLE withdrawal_requests ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';"))
             except Exception as e:
                 logger.info(f"Миграция timestamptz пропущена/уже выполнена: {e}")
+
+        # Добавляем колонку duration в purchases, если её ещё нет (для старых БД, sqlite и postgres)
+        try:
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN duration VARCHAR(50) DEFAULT ''"))
+            logger.info("Колонка purchases.duration добавлена.")
+        except Exception as e:
+            logger.info(f"Колонка purchases.duration уже существует/миграция пропущена: {e}")
 
     async with async_session_maker() as session:
         result = await session.execute(select(Platform))
