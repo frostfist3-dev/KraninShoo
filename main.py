@@ -177,7 +177,6 @@ class DbSessionMiddleware(BaseMiddleware):
 class AdminStates(StatesGroup):
     waiting_for_software_platform = State()
     waiting_for_software_name = State()
-    waiting_for_sw_id = State()
     waiting_for_duration = State()
     waiting_for_price = State()
     waiting_for_keys = State()
@@ -1265,36 +1264,51 @@ async def save_software(message: Message, state: FSMContext, session: AsyncSessi
         logger.error(f"Ошибка при сохранении софта: {e}")
         await message.answer("⚠️ Не удалось сохранить софт. Ошибка БД.")
 
+# --- СОЗДАНИЕ ТАРИФА (ВЫБОР СОФТА КНОПКАМИ ВМЕСТО ID) ---
 @router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
-async def add_prod_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_for_sw_id)
-    text_msg = "➕ **Создание тарифа (Шаг 1/3)**\n\nВведите **ID софта**:"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
+async def add_prod_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    await state.clear()
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
 
-@router.message(AdminStates.waiting_for_sw_id, F.from_user.id.in_(ADMIN_IDS))
-async def process_sw_id(message: Message, state: FSMContext):
-    if not message.text or not message.text.isdigit():
-        await message.answer(
-            "❌ ID должен быть числом. Попробуйте снова.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
-        )
+    if not softwares:
+        await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
         return
 
-    await state.update_data(software_id=int(message.text))
+    buttons = []
+    for sw in softwares:
+        buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name} [ID: {sw.id}]", callback_data=f"prod_sw_sel_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "➕ **Создание тарифа (Шаг 1/3)**\n\nВыберите софт, для которого хотите создать тариф:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("prod_sw_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def process_prod_software_selection(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    software_id = int(callback.data.split("_")[3])
+    software = await session.get(Software, software_id)
+    if not software:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    await state.update_data(software_id=software_id)
     await state.set_state(AdminStates.waiting_for_duration)
 
-    text_msg = "➕ **Создание тарифа (Шаг 2/3)**\n\nВыберите длительность:"
+    text_msg = f"➕ **Создание тарифа (Шаг 2/3)**\n\nВыбран софт: `{escape_md(software.name)}`\n\nВыберите длительность:"
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏳ 1 день", callback_data="duration_1 день")],
             [InlineKeyboardButton(text="⏳ 7 дней", callback_data="duration_7 дней")],
             [InlineKeyboardButton(text="⏳ 30 дней", callback_data="duration_30 дней")],
-            [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+            [InlineKeyboardButton(text="🔙 К выбору софта", callback_data="admin_add_prod")],
         ]
     )
-    await message.answer(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("duration_"), F.from_user.id.in_(ADMIN_IDS))
 async def process_duration(callback: CallbackQuery, state: FSMContext):
