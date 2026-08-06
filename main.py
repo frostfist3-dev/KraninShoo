@@ -199,6 +199,11 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
             )
             session.add(user)
             await session.commit()
+        else:
+            # Обновляем username, если он изменился
+            if user.username != message.from_user.username:
+                user.username = message.from_user.username
+                await session.commit()
 
         await message.answer(
             f"👋 Главное меню Kranin Shop\n\n💰 Ваш баланс: `{user.balance:.2f} грн`\n\nВыберите раздел:",
@@ -910,6 +915,7 @@ async def handle_ping(request):
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
+    app.router.add_head("/", handle_ping)  # Добавлено для корректной обработки HEAD запросов от Render
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
@@ -948,6 +954,8 @@ async def main():
     dp.include_router(router)
 
     await start_web_server()
+    
+    # Решение TelegramConflictError: принудительный сброс зависших апдейтов и вебхуков
     await bot.delete_webhook(drop_pending_updates=True)
 
     logger.info("Бот и веб-заглушка запущены!")
