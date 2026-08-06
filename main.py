@@ -2277,4 +2277,3 @@ RENDER_STUB_HTML = (
     "<style>"
     "body{font-family:sans-serif;background:#0f172a;color:#e2e8f0;"
     "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
-    "
