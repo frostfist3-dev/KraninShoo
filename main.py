@@ -3,6 +3,8 @@ import logging
 import math
 import os
 import random
+import re
+import time
 from datetime import datetime, timezone
 
 from aiohttp import web
@@ -28,10 +30,11 @@ from sqlalchemy import (
     func,
     select,
     text,
+    update,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
 # ==========================================
 # ЛОГИРОВАНИЕ И КОНФИГУРАЦИЯ БД
@@ -115,11 +118,14 @@ else:
         connect_args=connect_args
     )
 
-CARDS = [
+# Реквизиты можно переопределить переменной окружения PAYMENT_CARDS
+# (несколько значений через « ; »), чтобы менять карты без правки кода.
+_DEFAULT_CARDS = [
     "4441 1111 5555 7352 (Моно)",
     "4323 3473 8685 7285 (А-Банк)",
     "5232 4410 4407 1160 (Альянс)",
 ]
+CARDS = [c.strip() for c in os.getenv("PAYMENT_CARDS", "").split(";") if c.strip()] or _DEFAULT_CARDS
 
 PERMANENT_DURATION = "Навсегда"
 DURATIONS = ["1 день", "7 дней", "30 дней", PERMANENT_DURATION]
@@ -140,6 +146,10 @@ router = Router()
 # зависание бота). Теперь любая ошибка перехватывается централизованно:
 # мы логируем её и гарантированно отвечаем пользователю, чтобы кнопка
 # разблокировалась, а чат не зависал в ожидании ответа.
+_recent_errors: dict[str, float] = {}
+ERROR_ALERT_COOLDOWN = 60.0
+
+
 @router.errors()
 async def global_error_handler(event: ErrorEvent, bot: Bot) -> bool:
     logger.exception(
@@ -170,16 +180,24 @@ async def global_error_handler(event: ErrorEvent, bot: Bot) -> bool:
         logger.exception("Ошибка внутри самого глобального обработчика ошибок")
 
     # НОВОЕ: уведомляем админов о непредвиденных ошибках, чтобы их не пришлось
-    # искать вручную в логах Render
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🐞 Ошибка в боте: `{escape_md(str(event.exception))[:500]}`",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
+    # искать вручную в логах Render. Одинаковые ошибки не чаще раза в минуту —
+    # иначе при поломке в горячем хендлере админам прилетает лавина копий.
+    err_key = f"{type(event.exception).__name__}:{str(event.exception)[:200]}"
+    now = time.monotonic()
+    if now - _recent_errors.get(err_key, -1e9) >= ERROR_ALERT_COOLDOWN:
+        _recent_errors[err_key] = now
+        if len(_recent_errors) > 200:
+            for k in [k for k, ts in _recent_errors.items() if now - ts > ERROR_ALERT_COOLDOWN]:
+                _recent_errors.pop(k, None)
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🐞 Ошибка в боте: `{escape_md(str(event.exception))[:500]}`",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
     return True
 
@@ -193,6 +211,66 @@ def escape_md(value) -> str:
     return value
 
 
+def md_url(url: str) -> str:
+    # Скобки в URL ломают Markdown-ссылку [текст](url) и роняют отправку сообщения
+    return (url or "").strip().replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+
+
+def luhn_ok(digits: str) -> bool:
+    # Контрольная сумма номера банковской карты (алгоритм Луна)
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+async def lock_row(session: AsyncSession, model, row_id):
+    # Блокирует строку (SELECT ... FOR UPDATE) и перечитывает её актуальное
+    # состояние. Нужна, чтобы двойное нажатие кнопки админом / игроком не
+    # обработало одну и ту же заявку или приз дважды.
+    res = await session.execute(
+        select(model).where(model.id == row_id).with_for_update().execution_options(populate_existing=True)
+    )
+    return res.scalar_one_or_none()
+
+
+async def append_status(callback: CallbackQuery, suffix: str) -> None:
+    # Дописывает статус к сообщению с заявкой (текст или подпись к фото).
+    # parse_mode не используется: исходный текст уже без разметки, и юзернейм
+    # с «_» раньше ломал Markdown и обрывал обработку заявки после commit.
+    msg = callback.message
+    try:
+        if msg.caption is not None:
+            await msg.edit_caption(caption=(msg.caption or "") + suffix, reply_markup=None)
+        else:
+            await msg.edit_text(text=(msg.text or "") + suffix, reply_markup=None)
+    except TelegramBadRequest as e:
+        logger.warning(f"Не удалось обновить сообщение заявки: {e}")
+
+
+async def notify_admins(bot: Bot, text_msg: str, reply_markup=None, parse_mode: str | None = "Markdown") -> None:
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text_msg, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+
+
+_background_tasks: set = set()
+
+
+def spawn_background(coro) -> None:
+    # Держим ссылку на задачу, иначе её может собрать GC до завершения
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
 async def safe_edit_text(
     callback: CallbackQuery, bot: Bot, text_msg: str, keyboard: InlineKeyboardMarkup, parse_mode: str = "Markdown"
 ) -> None:
@@ -203,12 +281,19 @@ async def safe_edit_text(
     # быть первым шагом сразу после экрана с фото.
     try:
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode=parse_mode)
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return
         try:
             await callback.message.delete()
         except Exception:
             pass
-        await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=parse_mode)
+        try:
+            await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=parse_mode)
+        except TelegramBadRequest:
+            # последняя страховка: битая Markdown-разметка не должна лишать
+            # пользователя сообщения (например, с купленным ключом)
+            await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=None)
 
 
 def user_display(message_or_callback) -> str:
@@ -349,6 +434,12 @@ class User(Base):
     is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
     language: Mapped[str] = mapped_column(String(10), default="uk")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    @validates("balance")
+    def _round_balance(self, key, value):
+        # Баланс — Float, поэтому после серии += / -= накапливается «грязь»
+        # вида 49.99999999. Округляем до копеек при каждой записи.
+        return round(float(value), 2) if value is not None else value
 
 class Platform(Base):
     __tablename__ = "platforms"
@@ -523,6 +614,34 @@ class DbSessionMiddleware(BaseMiddleware):
                         await actual_event.answer(msg_text, show_alert=True)
                     return
             return await handler(event, data)
+
+class ThrottleMiddleware(BaseMiddleware):
+    # Защита от «дребезга» и флуда кнопками: повторное нажатие от того же
+    # пользователя быстрее interval секунд молча гасится (callback.answer()
+    # всё равно вызывается, чтобы кнопка не «висела»). Работает вместе с
+    # блокировками строк в БД — это первый, дешёвый рубеж.
+    def __init__(self, interval: float = 0.4):
+        super().__init__()
+        self.interval = interval
+        self._last: dict[int, float] = {}
+
+    async def __call__(self, handler, event: CallbackQuery, data):
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            now = time.monotonic()
+            last = self._last.get(user.id, 0.0)
+            if now - last < self.interval:
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
+                return
+            self._last[user.id] = now
+            if len(self._last) > 5000:
+                cutoff = now - 60
+                self._last = {uid: ts for uid, ts in self._last.items() if ts > cutoff}
+        return await handler(event, data)
+
 
 class AdminStates(StatesGroup):
     waiting_for_software_platform = State()
@@ -785,7 +904,7 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     # ФИКС: используем блокировку строки промокода, чтобы два одновременных
     # использования не смогли оба пройти проверку uses_left > 0.
     res = await session.execute(
-        select(PromoCode).filter_by(code=code_text).with_for_update()
+        select(PromoCode).filter_by(code=code_text).with_for_update().execution_options(populate_existing=True)
     )
     promo = res.scalars().first()
 
@@ -804,7 +923,7 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
         await state.clear()
         return
 
-    user_res = await session.execute(select(User).where(User.id == message.from_user.id).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == message.from_user.id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
     if not user:
         await state.clear()
@@ -1383,7 +1502,11 @@ async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot
         await callback.answer("❌ Софт не найден!", show_alert=True)
         return
 
-    result = await session.execute(select(Product).filter_by(software_id=software_id))
+    # ФИКС: без ORDER BY Postgres отдаёт тарифы в произвольном порядке (после
+    # UPDATE строки «прыгали» в списке) — сортируем по цене, затем по id.
+    result = await session.execute(
+        select(Product).filter_by(software_id=software_id).order_by(Product.price.asc(), Product.id.asc())
+    )
     products = result.scalars().all()
 
     description_block = f"{escape_md(software.description)}\n\n" if software.description else ""
@@ -1399,10 +1522,17 @@ async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot
         return
 
     text_msg = f"🛡 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}📌 Выберите продукт:"
+    # Остатки всех тарифов одним запросом вместо N+1
+    stock_res = await session.execute(
+        select(LicenseKey.product_id, func.count(LicenseKey.id))
+        .where(LicenseKey.product_id.in_([p.id for p in products]), LicenseKey.is_sold == False)
+        .group_by(LicenseKey.product_id)
+    )
+    stock_map = {pid: cnt for pid, cnt in stock_res.all()}
+
     buttons = []
     for p in products:
-        keys_res = await session.execute(select(func.count(LicenseKey.id)).filter_by(product_id=p.id, is_sold=False))
-        available_keys = keys_res.scalar() or 0
+        available_keys = stock_map.get(p.id, 0)
 
         if available_keys > 0:
             status_text = f"🟢 {available_keys} шт."
@@ -1503,7 +1633,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     # race condition при двойном/параллельном нажатии на "Купить" — иначе баланс
     # мог уйти в минус, т.к. обе транзакции проходили проверку balance до commit().
     user_res = await session.execute(
-        select(User).where(User.id == user_id).with_for_update()
+        select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
     )
     user = user_res.scalar_one_or_none()
 
@@ -1517,7 +1647,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         select(LicenseKey)
         .filter_by(product_id=product.id, is_sold=False)
         .limit(1)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True).execution_options(populate_existing=True)
     )
     license_key = key_res.scalars().first()
 
@@ -1537,23 +1667,19 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     )
     remaining_after_sale = remaining_res.scalar() or 0
 
+    # ФИКС: уведомление рефереру раньше уходило ДО commit — при откате покупки
+    # он получал сообщение о бонусе, которого на самом деле не было.
+    referral_notice = None
     if user.referred_by:
         referrer_res = await session.execute(
-            select(User).where(User.id == user.referred_by).with_for_update()
+            select(User).where(User.id == user.referred_by).with_for_update().execution_options(populate_existing=True)
         )
         referrer = referrer_res.scalar_one_or_none()
         if referrer:
             ref_bonus = round(product.price * 0.05, 2)
             referrer.balance += ref_bonus
             log_balance_change(session, referrer.id, ref_bonus, "referral_bonus", referrer.balance, related_id=user.id)
-            try:
-                await callback.bot.send_message(
-                    referrer.id,
-                    f"🎉 **Реферальный бонус!**\nВаш реферал совершил покупку. Вам начислено `{ref_bonus:.2f} грн` на баланс!",
-                    parse_mode="Markdown"
-                )
-            except Exception as e:
-                logger.error(f"Не удалось отправить уведомление рефереру {referrer.id}: {e}")
+            referral_notice = (referrer.id, ref_bonus)
 
     sw_name = software.name if software else "Товар"
     purchase = Purchase(
@@ -1566,6 +1692,43 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     )
     session.add(purchase)
     await session.commit()
+
+    success_text = (
+        f"✅ **Покупка успешно завершена!**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
+        f"💳 **Списано с баланса:** `{product.price:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 **Ваш лицензионный ключ:**\n`{escape_md(license_key.key_string)}`\n\n"
+        + (f"📁 **Файлы:** [Открыть]({md_url(software.files_link)})\n\n" if software and software.files_link else "")
+        + f"📌 *Нажмите на ключ, чтобы скопировать.*\n"
+        f"💾 *Ключ надёжно сохранён в разделе «👤 Мой профиль».*\n\n"
+        f"🎰 **Оставьте отзыв о товаре и крутите колесо фортуны с топовыми призами!**\n"
+        f"⭐ Это займёт минуту, а взамен — шанс выиграть ключ или деньги на баланс."
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Оставить отзыв и крутить колесо 🎰", callback_data="leave_review")],
+        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
+        [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
+        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    # ФИКС: покупатель получает ключ сразу, а не после рассылки уведомлений
+    # всем админам; если edit_text не проходит (фото-сообщение, битая разметка) —
+    # safe_edit_text отправит новое сообщение, чтобы ключ не потерялся.
+    await safe_edit_text(callback, callback.bot, success_text, keyboard)
+    await callback.answer()
+
+    if referral_notice:
+        try:
+            await callback.bot.send_message(
+                referral_notice[0],
+                f"🎉 **Реферальный бонус!**\nВаш реферал совершил покупку. Вам начислено `{referral_notice[1]:.2f} грн` на баланс!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление рефереру {referral_notice[0]}: {e}")
 
     # НОВОЕ: уведомление админам о каждой покупке ключа — с данными о
     # покупателе, товаре, сумме и оставшемся на складе количестве.
@@ -1607,30 +1770,6 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
                 )
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление о низком остатке админу {admin_id}: {e}")
-
-    success_text = (
-        f"✅ **Покупка успешно завершена!**\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
-        f"💳 **Списано с баланса:** `{product.price:.2f} грн`\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 **Ваш лицензионный ключ:**\n`{escape_md(license_key.key_string)}`\n\n"
-        + (f"📁 **Файлы:** [Открыть]({software.files_link})\n\n" if software and software.files_link else "")
-        + f"📌 *Нажмите на ключ, чтобы скопировать.*\n"
-        f"💾 *Ключ надёжно сохранён в разделе «👤 Мой профиль».*\n\n"
-        f"🎰 **Оставьте отзыв о товаре и крутите колесо фортуны с топовыми призами!**\n"
-        f"⭐ Это займёт минуту, а взамен — шанс выиграть ключ или деньги на баланс."
-    )
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Оставить отзыв и крутить колесо 🎰", callback_data="leave_review")],
-        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
-        [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
-        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ])
-    await callback.message.edit_text(success_text, reply_markup=keyboard, parse_mode="Markdown")
-    await callback.answer()
 
 # ==========================================
 # 🎰 КОЛЕСО ФОРТУНЫ ПОСЛЕ ПОКУПКИ
@@ -1727,7 +1866,7 @@ async def spin_wheel_review_handler(callback: CallbackQuery, session: AsyncSessi
             await callback.answer()
             return
 
-    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
 
     result_text = ""
@@ -1795,7 +1934,9 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
     software_id = int(parts[3])
     user_id = callback.from_user.id
 
-    spin = await session.get(WheelSpin, spin_id)
+    # ФИКС: блокируем спин — двойной тап по призу выдавал два ключа (или два
+    # начисления) за один выигрыш, т.к. обе задачи видели result == "key_pending".
+    spin = await lock_row(session, WheelSpin, spin_id)
     if not spin or spin.user_id != user_id:
         await callback.answer("❌ Этот приз вам не принадлежит.", show_alert=True)
         return
@@ -1819,7 +1960,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
             LicenseKey.is_sold == False,
         )
         .limit(1)
-        .with_for_update(skip_locked=True)
+        .with_for_update(skip_locked=True).execution_options(populate_existing=True)
     )
     license_key = key_res.scalars().first()
 
@@ -1837,7 +1978,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
 
         if not available_softwares:
             # Совсем ничего не осталось — заменяем приз на баланс
-            user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+            user_res = await session.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
             user = user_res.scalar_one_or_none()
             if user:
                 user.balance += WHEEL_BALANCE_PRIZE
@@ -1885,7 +2026,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
         f"🎉 **Готово!** 🎉\n\n"
         f"📦 `{escape_md(software.name)}` — **{WHEEL_KEY_DURATION}**\n"
         f"🔑 `{escape_md(license_key.key_string)}`\n\n"
-        + (f"📁 **Файлы:** [Открыть]({software.files_link})\n\n" if software.files_link else "")
+        + (f"📁 **Файлы:** [Открыть]({md_url(software.files_link)})\n\n" if software.files_link else "")
         + f"💾 Ключ уже сохранён в разделе «👤 Мой профиль».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
@@ -1994,15 +2135,16 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         await message.answer("❌ Отправьте номер карты текстом.", reply_markup=cancel_kb("ref_program"))
         return
 
-    card = message.text.strip()
-    # Простая валидация номера карты: 13-19 цифр, допускаются пробелы
-    digits_only = card.replace(" ", "")
-    if not digits_only.isdigit() or not (13 <= len(digits_only) <= 19):
+    # Валидация номера карты: 13-19 цифр (пробелы/дефисы допускаются) + контрольная
+    # сумма Луна — отсекает опечатки, из-за которых выплата ушла бы «в никуда».
+    digits_only = re.sub(r"[\s-]", "", message.text)
+    if not digits_only.isdigit() or not (13 <= len(digits_only) <= 19) or not luhn_ok(digits_only):
         await message.answer(
-            "❌ Некорректный номер карты. Введите номер карты (13-19 цифр):",
+            "❌ Некорректный номер карты. Проверьте номер и введите его ещё раз (13-19 цифр):",
             reply_markup=cancel_kb("ref_program")
         )
         return
+    card = " ".join(digits_only[i:i + 4] for i in range(0, len(digits_only), 4))
 
     data = await state.get_data()
     amount = data.get("amount")
@@ -2015,7 +2157,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
 
     # ФИКС: блокируем строку пользователя, чтобы исключить одновременное создание
     # нескольких заявок на вывод, суммарно превышающих реальный баланс.
-    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
     if not user or user.balance < amount:
         await message.answer("❌ Недостаточно средств на балансе.")
@@ -2067,7 +2209,9 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
 @router.callback_query(F.data.startswith("approve_wdr_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     req_id = int(callback.data.split("_")[2])
-    req = await session.get(WithdrawalRequest, req_id)
+    # ФИКС: блокируем заявку на время обработки — иначе двойной тап по кнопке
+    # (или два админа сразу) проводили одну заявку дважды.
+    req = await lock_row(session, WithdrawalRequest, req_id)
 
     if not req or req.status != "pending":
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
@@ -2076,8 +2220,6 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
     req.status = "approved"
     await session.commit()
 
-    current_text = callback.message.text or ""
-    await callback.message.edit_text(text=current_text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None, parse_mode="Markdown")
     try:
         await bot.send_message(
             req.user_id,
@@ -2086,12 +2228,14 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
         )
     except Exception:
         pass
+    await append_status(callback, "\n\n✅ ВЫПЛАЧЕНО")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("reject_wdr_"), F.from_user.id.in_(ADMIN_IDS))
 async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     req_id = int(callback.data.split("_")[2])
-    req = await session.get(WithdrawalRequest, req_id)
+    # ФИКС: без блокировки заявки двойной тап «Отклонить» возвращал деньги дважды
+    req = await lock_row(session, WithdrawalRequest, req_id)
 
     if not req or req.status != "pending":
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
@@ -2100,7 +2244,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
     req.status = "rejected"
 
     # ФИКС: блокировка строки пользователя при возврате средств
-    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
     if user:
         user.balance += req.amount
@@ -2108,8 +2252,6 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
 
     await session.commit()
 
-    current_text = callback.message.text or ""
-    await callback.message.edit_text(text=current_text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None, parse_mode="Markdown")
     try:
         await bot.send_message(
             req.user_id,
@@ -2118,6 +2260,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
         )
     except Exception:
         pass
+    await append_status(callback, "\n\n❌ ОТКЛОНЕНО (средства возвращены)")
     await callback.answer()
 
 # ==========================================
@@ -2188,8 +2331,15 @@ async def process_deposit_amount(message: Message, state: FSMContext):
 @router.message(DepositStates.waiting_for_receipt, F.photo | F.document)
 async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
     data = await state.get_data()
-    amount = data.get("amount", 0.0)
+    amount = data.get("amount")
     user_id = message.from_user.id
+
+    # ФИКС: если состояние потерялось (перезапуск процесса), раньше создавалась
+    # заявка на 0.00 грн, которую админ мог случайно «подтвердить».
+    if not isinstance(amount, (int, float)) or amount <= 0:
+        await state.clear()
+        await message.answer("⚠️ Сессия пополнения устарела. Начните заново через «💳 Пополнить баланс».")
+        return
 
     # Повторная проверка лимита на случай, если пользователь успел открыть
     # несколько параллельных заявок до отправки чека (TOCTOU-защита)
@@ -2267,7 +2417,9 @@ async def process_receipt_wrong_type(message: Message):
 @router.callback_query(F.data.startswith("approve_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     req_id = int(callback.data.split("_")[2])
-    req = await session.get(DepositRequest, req_id)
+    # ФИКС: двойной тап «Подтвердить» зачислял пополнение дважды —
+    # теперь заявка блокируется, и второй обработчик увидит статус «approved».
+    req = await lock_row(session, DepositRequest, req_id)
 
     if not req or req.status != "pending":
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
@@ -2276,28 +2428,24 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
     req.status = "approved"
 
     # ФИКС: блокировка строки пользователя при зачислении депозита
-    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
     if user:
         user.balance += req.amount
         log_balance_change(session, user.id, req.amount, "deposit_approved", user.balance, related_id=req.id)
     await session.commit()
 
-    if callback.message.caption is not None:
-        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
-    else:
-        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
-
     try:
         await bot.send_message(req.user_id, f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**", parse_mode="Markdown")
     except Exception:
         pass
+    await append_status(callback, "\n\n✅ ПОДТВЕРЖДЕНО")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("reject_dep_"), F.from_user.id.in_(ADMIN_IDS))
 async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     req_id = int(callback.data.split("_")[2])
-    req = await session.get(DepositRequest, req_id)
+    req = await lock_row(session, DepositRequest, req_id)
 
     if not req or req.status != "pending":
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
@@ -2306,15 +2454,11 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
     req.status = "rejected"
     await session.commit()
 
-    if callback.message.caption is not None:
-        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
-    else:
-        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
-
     try:
         await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
     except Exception:
         pass
+    await append_status(callback, "\n\n❌ ОТКЛОНЕНО")
     await callback.answer()
 
 # ==========================================
@@ -2978,33 +3122,17 @@ async def admin_broadcast_prepare(message: Message, state: FSMContext, session: 
     )
 
 
-@router.callback_query(F.data == "broadcast_confirm", F.from_user.id.in_(ADMIN_IDS))
-async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot):
-    data = await state.get_data()
-    chat_id = data.get("broadcast_chat_id")
-    message_id = data.get("broadcast_message_id")
-    audience = data.get("broadcast_audience", "all")
-    if not chat_id or not message_id:
-        await state.clear()
-        await callback.answer("❌ Черновик устарел. Создайте рассылку заново.", show_alert=True)
-        return
-    user_ids = await get_broadcast_user_ids(session, audience)
-    await state.clear()
-    await callback.message.edit_text(
-        f"⏳ **Рассылка запущена**\n\n🎯 {BROADCAST_AUDIENCES.get(audience, audience)}\n"
-        f"👥 Получателей: `{len(user_ids)}`\n\nДоставка выполняется…", parse_mode="Markdown"
-    )
-    await callback.answer()
-
+async def _run_broadcast(bot: Bot, status_msg: Message, chat_id: int, message_id: int, audience: str, user_ids: list[int]) -> None:
+    # Рассылка идёт в фоне: раньше хендлер висел всё время доставки и держал
+    # открытую транзакцию БД (соединение из пула) на минуты.
+    total = len(user_ids)
+    audience_label = BROADCAST_AUDIENCES.get(audience, audience)
     success = 0
-    failed = 0
     for index, uid in enumerate(user_ids, start=1):
-        delivered = False
         for attempt in range(3):
             try:
                 await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=message_id)
                 success += 1
-                delivered = True
                 break
             except TelegramRetryAfter as e:
                 if attempt >= 2:
@@ -3015,28 +3143,47 @@ async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext, se
             except Exception as e:
                 logger.warning(f"Broadcast failed uid={uid}: {e}")
                 break
-        if not delivered:
-            failed += 1
         await asyncio.sleep(0.06)
         if index % 100 == 0:
             try:
-                await callback.message.edit_text(
-                    f"📢 **Рассылка выполняется**\n\n📨 Обработано: `{index}/{len(user_ids)}`\n"
+                await status_msg.edit_text(
+                    f"📢 **Рассылка выполняется**\n\n📨 Обработано: `{index}/{total}`\n"
                     f"✅ Доставлено: `{success}`\n❌ Не доставлено: `{index - success}`", parse_mode="Markdown"
                 )
             except Exception:
                 pass
     try:
-        await callback.message.edit_text(
+        await status_msg.edit_text(
             "✅ **РАССЫЛКА ЗАВЕРШЕНА**\n━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 {BROADCAST_AUDIENCES.get(audience, audience)}\n"
-            f"👥 Всего: `{len(user_ids)}`\n"
+            f"🎯 {audience_label}\n"
+            f"👥 Всего: `{total}`\n"
             f"✅ Доставлено: `{success}`\n"
-            f"❌ Не доставлено: `{len(user_ids) - success}`",
+            f"❌ Не доставлено: `{total - success}`",
             reply_markup=admin_back_kb(), parse_mode="Markdown"
         )
     except Exception:
         pass
+
+
+@router.callback_query(F.data == "broadcast_confirm", F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    chat_id = data.get("broadcast_chat_id")
+    message_id = data.get("broadcast_message_id")
+    audience = data.get("broadcast_audience", "all")
+    # ФИКС: состояние сбрасываем СРАЗУ — двойной тап «Запустить» раньше мог
+    # запустить две одинаковые рассылки подряд (второй клик успевал прочитать черновик).
+    await state.clear()
+    if not chat_id or not message_id:
+        await callback.answer("❌ Черновик устарел. Создайте рассылку заново.", show_alert=True)
+        return
+    user_ids = await get_broadcast_user_ids(session, audience)
+    await callback.message.edit_text(
+        f"⏳ **Рассылка запущена**\n\n🎯 {BROADCAST_AUDIENCES.get(audience, audience)}\n"
+        f"👥 Получателей: `{len(user_ids)}`\n\nДоставка выполняется…", parse_mode="Markdown"
+    )
+    await callback.answer()
+    spawn_background(_run_broadcast(bot, callback.message, chat_id, message_id, audience, user_ids))
 
 
 # --- УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕМ ---
@@ -3238,7 +3385,7 @@ async def admin_change_balance_finish(message: Message, state: FSMContext, sessi
     # ФИКС: реализована заявленная в тексте логика +/- для относительного изменения баланса.
     # Раньше в любом случае происходила полная перезапись (user.balance = val),
     # что не соответствовало подсказке "+100 / -50".
-    user_res = await session.execute(select(User).where(User.id == uid).with_for_update())
+    user_res = await session.execute(select(User).where(User.id == uid).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
     if not user:
         await message.answer("❌ Пользователь не найден.")
@@ -3654,6 +3801,21 @@ async def admin_add_prod_finish(message: Message, state: FSMContext, session: As
     )
 
 # --- УДАЛЕНИЕ СОФТА И ТАРИФОВ ---
+async def detach_product_references(session: AsyncSession, product_ids: list[int]) -> None:
+    # ФИКС: purchases.product_id и reviews.product_id — внешние ключи на products.id.
+    # Удаление тарифа, по которому уже были покупки/отзывы, падало с
+    # ForeignKeyViolationError. История не должна пропадать (в Purchase уже лежат
+    # product_name / duration / price_paid на момент покупки), поэтому просто
+    # обнуляем ссылку на удаляемый тариф — обе колонки nullable.
+    if not product_ids:
+        return
+    await session.execute(
+        update(Purchase).where(Purchase.product_id.in_(product_ids)).values(product_id=None)
+    )
+    await session.execute(
+        update(Review).where(Review.product_id.in_(product_ids)).values(product_id=None)
+    )
+
 @router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
     res = await session.execute(select(Software))
@@ -3701,6 +3863,9 @@ async def admin_delete_software(callback: CallbackQuery, session: AsyncSession):
         return
     
     sw_name = sw.name
+    # ФИКС: тарифы софта удаляются каскадом — сначала отвязываем от них покупки/отзывы
+    prod_ids = (await session.execute(select(Product.id).where(Product.software_id == sw_id))).scalars().all()
+    await detach_product_references(session, list(prod_ids))
     await session.delete(sw)
     await session.commit()
 
@@ -3762,11 +3927,12 @@ async def admin_delete_product(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("❌ Тариф не найден!", show_alert=True)
         return
 
+    await detach_product_references(session, [prod_id])
     await session.delete(prod)
     await session.commit()
 
     await callback.message.edit_text(
-        "✅ Тариф и все связанные с ним ключи успешно удалены.",
+        "✅ Тариф и все связанные с ним ключи успешно удалены. История покупок и отзывы сохранены.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
         parse_mode="Markdown"
     )
@@ -4016,16 +4182,23 @@ async def process_keys_upload(message: Message, state: FSMContext, session: Asyn
         sw_name = sw.name if sw else "Товар"
 
         for sub in subs:
-            try:
-                await bot.send_message(
-                    sub.user_id,
-                    f"🔔 **Пополнение товара!**\n\n"
-                    f"Товар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                logger.info(f"Не удалось уведомить пользователя {sub.user_id} о пополнении.")
+            for attempt in range(2):
+                try:
+                    await bot.send_message(
+                        sub.user_id,
+                        f"🔔 **Пополнение товара!**\n\n"
+                        f"Товар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
+                        parse_mode="Markdown",
+                    )
+                    break
+                except TelegramRetryAfter as e:
+                    # лимиты Telegram при большом числе подписчиков — ждём и пробуем ещё раз
+                    await asyncio.sleep(min(float(e.retry_after), 15.0))
+                except Exception:
+                    logger.info(f"Не удалось уведомить пользователя {sub.user_id} о пополнении.")
+                    break
             await session.delete(sub)
+            await asyncio.sleep(0.05)
         await session.commit()
 
     await message.answer(
@@ -4302,6 +4475,22 @@ async def run_migrations() -> None:
     except Exception as e:
         logger.warning(f"Миграция reviews.status не выполнена: {e}")
 
+    # НОВОЕ: индексы под самые частые запросы (остаток ключей по тарифу, история
+    # покупок пользователя, подписки на пополнение). create_all не добавляет
+    # индексы к уже существующим таблицам, поэтому создаём вручную, идемпотентно.
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS ix_license_keys_product_sold ON license_keys(product_id, is_sold)",
+        "CREATE INDEX IF NOT EXISTS ix_purchases_user_purchased ON purchases(user_id, purchased_at DESC)",
+        "CREATE INDEX IF NOT EXISTS ix_purchases_product ON purchases(product_id)",
+        "CREATE INDEX IF NOT EXISTS ix_restock_product ON restock_subscriptions(product_id)",
+        "CREATE INDEX IF NOT EXISTS ix_deposit_user_status ON deposit_requests(user_id, status)",
+    ):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(idx_sql))
+        except Exception as e:
+            logger.warning(f"Создание индекса не выполнено ({idx_sql[:60]}...): {e}")
+
     for table_name in ("platforms", "softwares", "products"):
         try:
             async with engine.begin() as conn:
@@ -4330,6 +4519,7 @@ async def main() -> None:
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.update.middleware(DbSessionMiddleware(session_pool=async_session_maker))
+    dp.callback_query.outer_middleware(ThrottleMiddleware(interval=0.4))
     dp.include_router(router)
 
     # HTTP-заглушка нужна Render Free, чтобы не убивать процесс из-за
