@@ -24,6 +24,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     delete,
+    exists,
     func,
     select,
     text,
@@ -120,7 +121,8 @@ CARDS = [
     "5232 4410 4407 1160 (Альянс)",
 ]
 
-DURATIONS = ["1 день", "7 дней", "30 дней"]
+PERMANENT_DURATION = "Навсегда"
+DURATIONS = ["1 день", "7 дней", "30 дней", PERMANENT_DURATION]
 
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 router = Router()
@@ -234,6 +236,19 @@ def parse_positive_amount(raw_text: str, max_amount: float = MAX_AMOUNT) -> floa
         return None
     # Округляем до копеек, чтобы не плодить "грязные" значения из-за float
     return round(value, 2)
+
+
+def normalize_duration(value: str) -> str:
+    """Нормализует срок тарифа, сохраняя старые произвольные значения."""
+    value = (value or "").strip()
+    aliases = {
+        "навсегда": PERMANENT_DURATION,
+        "навечно": PERMANENT_DURATION,
+        "бессрочно": PERMANENT_DURATION,
+        "forever": PERMANENT_DURATION,
+        "permanent": PERMANENT_DURATION,
+    }
+    return aliases.get(value.casefold(), value)
 
 
 def log_balance_change(
@@ -377,9 +392,12 @@ class Purchase(Base):
     __tablename__ = "purchases"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    # Точный тариф и цена на момент покупки — нужны для истории, статистики и отзывов.
+    product_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("products.id"), nullable=True)
     product_name: Mapped[str] = mapped_column(String(100))
     key_issued: Mapped[str] = mapped_column(String(255))
     duration: Mapped[str] = mapped_column(String(50), default="")
+    price_paid: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
     purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 # НОВОЕ: колесо фортуны после покупки. Отдельная таблица (а не колонка в
@@ -453,12 +471,12 @@ class Review(Base):
     __tablename__ = "reviews"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    # Отзыв привязан к конкретному тарифу/покупке. Старые записи могут иметь NULL.
+    product_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("products.id"), nullable=True)
+    purchase_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("purchases.id"), nullable=True)
     rating: Mapped[int] = mapped_column(Integer)
     text: Mapped[str] = mapped_column(String(500))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    # НОВОЕ: модерация отзывов. "pending" — только что отправлен, ждёт решения
-    # администратора; "approved" — одобрен и виден в разделе "⭐ Отзывы";
-    # "hidden" — скрыт администратором (не виден пользователям, но не удалён).
     status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
 
 class RestockSubscription(Base):
@@ -517,6 +535,7 @@ class AdminStates(StatesGroup):
     waiting_for_promo_code = State()
     waiting_for_promo_amount = State()
     waiting_for_promo_uses = State()
+    waiting_for_broadcast_audience = State()
     waiting_for_broadcast_text = State()
     waiting_for_user_id = State()
     waiting_for_user_balance_change = State()
@@ -531,6 +550,7 @@ class WithdrawalStates(StatesGroup):
 
 class UserStates(StatesGroup):
     waiting_for_promo_input = State()
+    waiting_for_review_product = State()
     waiting_for_review_rating = State()
     waiting_for_review_text = State()
 
@@ -561,6 +581,73 @@ def get_main_menu_text(balance: float, lang: str = "uk") -> str:
 
 def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=target)]])
+
+
+def admin_back_kb(target: str = "admin_panel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data=target)]])
+
+
+async def get_product_label_map(session: AsyncSession) -> dict[int, str]:
+    result = await session.execute(
+        select(Product.id, Software.name, Product.duration)
+        .join(Software, Product.software_id == Software.id)
+        .order_by(Software.name.asc(), Product.id.asc())
+    )
+    return {pid: f"{sw_name} • {duration}" for pid, sw_name, duration in result.all()}
+
+
+async def resolve_user_purchased_product(session: AsyncSession, user_id: int, product_id: int):
+    product = await session.get(Product, product_id)
+    if not product:
+        return None
+    result = await session.execute(
+        select(Purchase)
+        .where(Purchase.user_id == user_id, Purchase.product_id == product_id)
+        .order_by(Purchase.purchased_at.desc())
+        .limit(1)
+    )
+    purchase = result.scalars().first()
+    if purchase:
+        return purchase
+
+    software = await session.get(Software, product.software_id)
+    if not software:
+        return None
+    legacy_name = f"{software.name} ({product.duration})"
+    result = await session.execute(
+        select(Purchase)
+        .where(
+            Purchase.user_id == user_id,
+            Purchase.product_id.is_(None),
+            Purchase.duration == product.duration,
+            Purchase.product_name == legacy_name,
+        )
+        .order_by(Purchase.purchased_at.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def get_broadcast_user_ids(session: AsyncSession, audience: str) -> list[int]:
+    if audience == "buyers":
+        result = await session.execute(select(Purchase.user_id).distinct())
+        return list(result.scalars().all())
+    if audience == "nonbuyers":
+        result = await session.execute(select(User.id).where(~exists().where(Purchase.user_id == User.id)))
+        return list(result.scalars().all())
+    if audience == "balance":
+        result = await session.execute(select(User.id).where(User.balance > 0))
+        return list(result.scalars().all())
+    result = await session.execute(select(User.id))
+    return list(result.scalars().all())
+
+
+BROADCAST_AUDIENCES = {
+    "all": "👥 Все пользователи",
+    "buyers": "🛒 Только покупатели",
+    "nonbuyers": "🌱 Без покупок",
+    "balance": "💰 Пользователи с балансом",
+}
 
 
 @router.message(CommandStart())
@@ -748,289 +835,451 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     )
 
 # ==========================================
-# ОТЗЫВЫ (С ВЫБОРОМ ОЦЕНКИ КНОПКАМИ ⭐)
+# ⭐ НОРМАЛЬНАЯ СИСТЕМА ОТЗЫВОВ
 # ==========================================
-# ФИКС ГЛАВНОГО БАГА "ОТЗЫВЫ НЕ ПРИХОДЯТ": раньше раздел "⭐ Отзывы" был
-# статичной заглушкой — он просто показывал ссылку на внешний канал и
-# кнопку "Оставить отзыв", а сами отзывы, которые пользователи реально
-# отправляли (таблица Review), нигде в боте не отображались. Они уходили
-# только личным сообщением админу и "терялись" для остальных пользователей.
-# Теперь раздел показывает настоящие отзывы из БД: рейтинг, текст, дату,
-# с пагинацией и средней оценкой сверху.
+# Отзыв можно оставить только по реально купленному тарифу.
+# Один пользователь может оставить один отзыв на один тариф.
+
+
+def review_stars(rating: int) -> str:
+    rating = max(1, min(5, int(rating)))
+    return "⭐" * rating + "☆" * (5 - rating)
+
+
 @router.callback_query(F.data == "show_reviews")
 @router.callback_query(F.data.startswith("reviews_page_"))
 async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession):
     page = 0
     if callback.data.startswith("reviews_page_"):
-        page = int(callback.data.split("_")[2])
-
-    # НОВОЕ: модерация — пользователям показываем только отзывы со статусом
-    # "approved". Отзывы "pending" (ждут решения админа) и "hidden" (скрытые
-    # админом) в этот раздел не попадают.
-    stats_res = await session.execute(
-        select(func.count(Review.id), func.avg(Review.rating)).where(Review.status == "approved")
+        try:
+            page = int(callback.data.split("_")[2])
+        except (ValueError, IndexError):
+            page = 0
+    total_reviews = await session.scalar(select(func.count(Review.id)).where(Review.status == "approved")) or 0
+    avg_rating = await session.scalar(select(func.avg(Review.rating)).where(Review.status == "approved")) or 0
+    breakdown_res = await session.execute(
+        select(Review.rating, func.count(Review.id)).where(Review.status == "approved").group_by(Review.rating)
     )
-    total_reviews, avg_rating = stats_res.one()
-    total_reviews = total_reviews or 0
-    avg_rating = float(avg_rating) if avg_rating else 0.0
-
-    per_page = 3
+    breakdown = {int(r): int(c) for r, c in breakdown_res.all()}
+    per_page = 4
     total_pages = max(1, math.ceil(total_reviews / per_page))
     page = max(0, min(page, total_pages - 1))
-    offset = page * per_page
 
-    res = await session.execute(
-        select(Review)
+    result = await session.execute(
+        select(Review, Software.name, Product.duration, User.username)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .join(User, Review.user_id == User.id, isouter=True)
         .where(Review.status == "approved")
         .order_by(Review.created_at.desc())
-        .offset(offset)
-        .limit(per_page)
+        .offset(page * per_page).limit(per_page)
     )
-    reviews = res.scalars().all()
+    rows = result.all()
 
-    header = "🌟 **Отзывы наших клиентов**\n━━━━━━━━━━━━━━━━━━━\n"
+    text_msg = "⭐ **Отзывы клиентов**\n━━━━━━━━━━━━━━━━━━━\n"
     if total_reviews:
-        stars_avg = "⭐" * round(avg_rating)
-        header += f"{stars_avg}  **{avg_rating:.1f}/5**  ·  {total_reviews} отзывов\n━━━━━━━━━━━━━━━━━━━\n\n"
+        text_msg += f"🏆 Средняя оценка: **{float(avg_rating):.1f}/5** · всего `{total_reviews}`\n"
+        text_msg += (
+            f"5⭐ `{breakdown.get(5, 0)}` · 4⭐ `{breakdown.get(4, 0)}` · "
+            f"3⭐ `{breakdown.get(3, 0)}` · 2⭐ `{breakdown.get(2, 0)}` · 1⭐ `{breakdown.get(1, 0)}`\n"
+        )
     else:
-        header += "\n"
-
-    if not reviews:
-        body = "Пока отзывов нет — станьте первым! 👇"
+        text_msg += "Пока нет опубликованных отзывов.\n"
+    text_msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+    if not rows:
+        text_msg += "Здесь пока пусто — оставьте первый отзыв о покупке."
     else:
         blocks = []
-        for r in reviews:
-            date_str = r.created_at.strftime("%d.%m.%Y")
+        for review, sw_name, duration, username in rows:
+            author = f"@{username}" if username else "Покупатель"
+            product_label = f"{sw_name} • {duration}" if sw_name else "Товар"
             blocks.append(
-                f"{'⭐' * r.rating}{'☆' * (5 - r.rating)}\n"
-                f"_{escape_md(r.text)}_\n"
-                f"🕒 {date_str}"
+                f"{review_stars(review.rating)}  **{escape_md(author)}**\n"
+                f"📦 `{escape_md(product_label)}` · ✅ покупка подтверждена\n"
+                f"_{escape_md(review.text)}_\n"
+                f"🕒 {review.created_at.strftime('%d.%m.%Y')}"
             )
-        body = "\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n".join(blocks)
-
-    text_msg = header + body
+        text_msg += "\n\n──────────────\n\n".join(blocks)
 
     buttons = []
-    nav_row = []
+    nav = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"reviews_page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"reviews_page_{page - 1}"))
     if total_pages > 1:
-        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"reviews_page_{page + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-
-    buttons.append([InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)])
-    buttons.append([InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="leave_review")])
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
-
-    await callback.message.edit_text(
-        text_msg,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="Markdown"
-    )
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"reviews_page_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
+        [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="leave_review")],
+        [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
+        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
+
 
 @router.callback_query(F.data == "leave_review")
 async def leave_review_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
-    user_id = callback.from_user.id
-    purchases_res = await session.execute(select(Purchase).where(Purchase.user_id == user_id))
-    if not purchases_res.scalars().first():
-        await callback.answer("❌ Вы можете оставлять отзывы только после совершения покупок в боте!", show_alert=True)
+    product_map = await get_product_label_map(session)
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == callback.from_user.id).order_by(Purchase.purchased_at.desc())
+    )
+    purchases = result.scalars().all()
+    seen = set()
+    available = []
+    for purchase in purchases:
+        product_id = purchase.product_id
+        if not product_id:
+            for pid, label in product_map.items():
+                sw_name, duration = label.rsplit(" • ", 1)
+                if purchase.product_name == f"{sw_name} ({duration})" and purchase.duration == duration:
+                    product_id = pid
+                    break
+        if not product_id or product_id in seen:
+            continue
+        seen.add(product_id)
+        exists_review = await session.scalar(
+            select(func.count(Review.id)).where(Review.user_id == callback.from_user.id, Review.product_id == product_id)
+        ) or 0
+        if not exists_review:
+            available.append((product_id, product_map.get(product_id, purchase.product_name)))
+
+    if not available:
+        await callback.answer("✅ По всем вашим покупкам отзыв уже оставлен.", show_alert=True)
         return
-
-    await state.set_state(UserStates.waiting_for_review_rating)
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐⭐⭐⭐⭐ (5/5)", callback_data="review_stars_5")],
-        [InlineKeyboardButton(text="⭐⭐⭐⭐ (4/5)", callback_data="review_stars_4")],
-        [InlineKeyboardButton(text="⭐⭐⭐ (3/5)", callback_data="review_stars_3")],
-        [InlineKeyboardButton(text="⭐⭐ (2/5)", callback_data="review_stars_2")],
-        [InlineKeyboardButton(text="⭐ (1/5)", callback_data="review_stars_1")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")]
-    ])
-
+    await state.set_state(UserStates.waiting_for_review_product)
+    buttons = [[InlineKeyboardButton(text=f"📦 {label}", callback_data=f"review_product_{pid}")] for pid, label in available[:20]]
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")])
     await callback.message.edit_text(
-        "⭐ **Оставить отзыв**\n\nПожалуйста, выберите вашу оценку от 1 до 5 звезд:",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
+        "✍️ **Новый отзыв**\n\nВыберите товар, который вы покупали:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("review_product_"))
+async def process_review_product(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    try:
+        product_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный товар.", show_alert=True)
+        return
+    purchase = await resolve_user_purchased_product(session, callback.from_user.id, product_id)
+    if not purchase:
+        await callback.answer("❌ Этот товар не найден среди ваших покупок.", show_alert=True)
+        return
+    already = await session.scalar(
+        select(func.count(Review.id)).where(Review.user_id == callback.from_user.id, Review.product_id == product_id)
+    ) or 0
+    if already:
+        await callback.answer("✅ Отзыв по этому товару уже существует.", show_alert=True)
+        await state.clear()
+        return
+    label = (await get_product_label_map(session)).get(product_id, "Товар")
+    await state.update_data(product_id=product_id, purchase_id=purchase.id)
+    await state.set_state(UserStates.waiting_for_review_rating)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐⭐⭐⭐⭐ 5/5", callback_data="review_stars_5")],
+        [InlineKeyboardButton(text="⭐⭐⭐⭐ 4/5", callback_data="review_stars_4")],
+        [InlineKeyboardButton(text="⭐⭐⭐ 3/5", callback_data="review_stars_3")],
+        [InlineKeyboardButton(text="⭐⭐ 2/5", callback_data="review_stars_2")],
+        [InlineKeyboardButton(text="⭐ 1/5", callback_data="review_stars_1")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")],
+    ])
+    await callback.message.edit_text(
+        f"✍️ **Отзыв о товаре**\n\n📦 `{escape_md(label)}`\n\nВыберите оценку:",
+        reply_markup=keyboard, parse_mode="Markdown"
+    )
+    await callback.answer()
+
 
 @router.callback_query(F.data.startswith("review_stars_"))
 async def process_review_rating(callback: CallbackQuery, state: FSMContext):
-    rating = int(callback.data.split("_")[2])
+    try:
+        rating = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректная оценка.", show_alert=True)
+        return
+    if not 1 <= rating <= 5:
+        await callback.answer("❌ Оценка должна быть от 1 до 5.", show_alert=True)
+        return
+    data = await state.get_data()
+    if not data.get("product_id"):
+        await state.clear()
+        await callback.answer("❌ Сессия отзыва устарела. Начните заново.", show_alert=True)
+        return
     await state.update_data(rating=rating)
     await state.set_state(UserStates.waiting_for_review_text)
-
-    stars_str = "⭐" * rating
     await callback.message.edit_text(
-        f"✍️ **Ваша оценка:** {stars_str} ({rating}/5)\n\n"
-        f"Напишите ваш отзыв текстом в ответ на это сообщение:",
-        reply_markup=cancel_kb("show_reviews"),
-        parse_mode="Markdown"
+        f"📝 **Ваша оценка: {review_stars(rating)}**\n\nНапишите отзыв одним сообщением.\nМинимум 5, максимум {MAX_REVIEW_LENGTH} символов.",
+        reply_markup=cancel_kb("show_reviews"), parse_mode="Markdown"
     )
     await callback.answer()
 
+
 @router.message(UserStates.waiting_for_review_text)
 async def save_review_handler(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
-    if not message.text:
+    if not message.text or not message.text.strip():
         await message.answer("❌ Отправьте текст отзыва.", reply_markup=cancel_kb("show_reviews"))
         return
-
     text_val = message.text.strip()
-
-    # ФИКС: колонка Review.text — String(500); без этой проверки текст
-    # длиннее лимита падал бы с необработанным DataError на Postgres.
-    if len(text_val) > MAX_REVIEW_LENGTH:
-        await message.answer(
-            f"❌ Отзыв слишком длинный ({len(text_val)} символов). "
-            f"Максимум — {MAX_REVIEW_LENGTH} символов. Сократите текст:",
-            reply_markup=cancel_kb("show_reviews")
-        )
+    if len(text_val) < 5:
+        await message.answer("❌ Отзыв слишком короткий — минимум 5 символов.")
         return
-
+    if len(text_val) > MAX_REVIEW_LENGTH:
+        await message.answer(f"❌ Максимум {MAX_REVIEW_LENGTH} символов.")
+        return
     data = await state.get_data()
-    rating = data.get("rating", 5)
-
-    # НОВОЕ: отзыв больше не публикуется мгновенно — сохраняется со статусом
-    # "pending" и ждёт решения администратора (см. модерацию ниже).
-    review = Review(user_id=message.from_user.id, rating=rating, text=text_val, status="pending")
+    product_id = data.get("product_id")
+    if not product_id:
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните отзыв заново.")
+        return
+    purchase = await resolve_user_purchased_product(session, message.from_user.id, int(product_id))
+    if not purchase:
+        await state.clear()
+        await message.answer("❌ Не удалось подтвердить покупку этого товара.")
+        return
+    existing = await session.scalar(
+        select(func.count(Review.id)).where(Review.user_id == message.from_user.id, Review.product_id == int(product_id))
+    ) or 0
+    if existing:
+        await state.clear()
+        await message.answer("✅ Отзыв по этому товару уже существует.")
+        return
+    review = Review(
+        user_id=message.from_user.id,
+        product_id=int(product_id),
+        purchase_id=purchase.id,
+        rating=int(data.get("rating", 5)),
+        text=text_val,
+        status="pending",
+    )
     session.add(review)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await state.clear()
+        await message.answer("✅ Такой отзыв уже был создан.")
+        return
     await state.clear()
 
-    user = await session.get(User, message.from_user.id)
-    lang = user.language if user and user.language in LANGUAGES else "uk"
-
+    product_label = (await get_product_label_map(session)).get(int(product_id), "Товар")
     admin_msg = (
         f"⭐ **Новый отзыв на модерации**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 ID отзыва: `{review.id}`\n"
-        f"👤 Пользователь: `{message.from_user.id}` ({user_display(message)})\n"
-        f"⭐ Оценка: {'⭐' * rating} ({rating}/5)\n"
-        f"💬 Текст отзыва:\n_{escape_md(text_val)}_\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 Опубликовать этот отзыв в разделе «⭐ Отзывы»?"
+        f"🆔 Отзыв: `{review.id}`\n"
+        f"👤 `{message.from_user.id}` ({user_display(message)})\n"
+        f"📦 `{escape_md(product_label)}`\n"
+        f"⭐ {review_stars(review.rating)}\n"
+        f"💬 {escape_md(text_val)}"
     )
-
-    # НОВОЕ: вместо мгновенной публикации — модерация. Админ решает, показать
-    # отзыв всем пользователям («✅ Одобрить») или скрыть его («❌ Скрыть»).
-    admin_review_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_review_{review.id}"),
-            InlineKeyboardButton(text="❌ Скрыть", callback_data=f"admin_hide_review_{review.id}"),
-        ],
-        [InlineKeyboardButton(text="🗑 Удалить отзыв", callback_data=f"admin_del_review_confirm_{review.id}")],
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"admin_approve_review_{review.id}"),
+         InlineKeyboardButton(text="🙈 Скрыть", callback_data=f"admin_hide_review_{review.id}")],
+        [InlineKeyboardButton(text="🔎 Открыть", callback_data=f"admin_review_view_{review.id}"),
+         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_del_review_confirm_{review.id}")],
     ])
-
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(chat_id=admin_id, text=admin_msg, reply_markup=admin_review_kb, parse_mode="Markdown")
-            logger.info(f"Уведомление об отзыве #{review.id} отправлено админу {admin_id}.")
+            await bot.send_message(admin_id, admin_msg, reply_markup=admin_kb, parse_mode="Markdown")
         except Exception as e:
-            logger.error(f"Не удалось отправить отзыв администратору {admin_id}: {e}")
-    if not ADMIN_IDS:
-        logger.warning(f"Отзыв #{review.id} сохранён, но ADMIN_IDS пуст — уведомлять некого.")
-
+            logger.error(f"Не удалось уведомить админа о новом отзыве: {e}")
     await message.answer(
-        "✅ **Спасибо за ваш отзыв!** Он отправлен на модерацию и появится в "
-        "разделе «⭐ Отзывы» после проверки администратором.\n\n"
-        "🎰 А ещё за отзыв полагается прокрутка колеса фортуны — попытайте удачу прямо сейчас!",
+        "✅ **Отзыв принят!**\n\nОн отправлен на модерацию и после проверки появится в разделе отзывов.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎰 Крутить колесо фортуны!", callback_data=f"wheelreview_{review.id}")],
+            [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+            [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-        ]),
-        parse_mode="Markdown"
+        ]), parse_mode="Markdown"
     )
 
+
+@router.callback_query(F.data == "my_reviews")
+async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(
+        select(Review, Software.name, Product.duration)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .where(Review.user_id == callback.from_user.id)
+        .order_by(Review.created_at.desc()).limit(20)
+    )
+    rows = result.all()
+    if not rows:
+        text_msg = "📋 **Мои отзывы**\n\nВы ещё не оставляли отзывов."
+    else:
+        labels = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}
+        blocks = []
+        for review, sw_name, duration in rows:
+            product_label = f"{sw_name} • {duration}" if sw_name else "Товар"
+            blocks.append(
+                f"{review_stars(review.rating)} · `{escape_md(product_label)}`\n"
+                f"_{escape_md(review.text)}_\n"
+                f"{labels.get(review.status, review.status)} · {review.created_at.strftime('%d.%m.%Y')}"
+            )
+        text_msg = "📋 **Мои отзывы**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Новый отзыв", callback_data="leave_review")],
+        [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
 # ==========================================
-# ПРОФИЛЬ И КУПЛЕННЫЕ КЛЮЧИ
+# 👤 ПРОФИЛЬ И ЛИЧНЫЙ КАБИНЕТ
 # ==========================================
 @router.callback_query(F.data == "profile")
 async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
     await state.clear()
     user_id = callback.from_user.id
     user = await session.get(User, user_id)
-    balance = user.balance if user else 0.0
-
-    total_res = await session.execute(select(func.count(Purchase.id)).where(Purchase.user_id == user_id))
-    total_purchases = total_res.scalar() or 0
-
+    if not user:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+        return
+    total_purchases = await session.scalar(select(func.count(Purchase.id)).where(Purchase.user_id == user_id)) or 0
+    total_spent = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(Purchase.user_id == user_id)) or 0
+    referrals = await session.scalar(select(func.count(User.id)).where(User.referred_by == user_id)) or 0
+    referral_bonus = await session.scalar(select(func.coalesce(func.sum(BalanceLog.amount), 0)).where(
+        BalanceLog.user_id == user_id, BalanceLog.reason == "referral_bonus"
+    )) or 0
+    review_count = await session.scalar(select(func.count(Review.id)).where(Review.user_id == user_id)) or 0
+    username = f"@{escape_md(user.username)}" if user.username else "не указан"
+    lang_name = "🇺🇦 Українська" if user.language == "uk" else "🇷🇺 Русский"
     text_msg = (
-        f"👤 **Личный кабинет**\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 **ID аккаунта:** `{user_id}`\n"
-        f"💰 **Баланс:** `{balance:.2f} грн`\n"
-        f"🛍 **Всего покупок:** `{total_purchases}`\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔑 **Ваши купленные ключи по категориям:**"
+        "👤 **ЛИЧНЫЙ КАБИНЕТ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"👤 Username: {username}\n"
+        f"🌐 Язык: {lang_name}\n"
+        f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y')}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Баланс: **`{user.balance:.2f} грн`**\n"
+        f"🛒 Покупок: `{total_purchases}`\n"
+        f"💸 Потрачено: `{float(total_spent):.2f} грн`\n"
+        f"🤝 Рефералов: `{referrals}`\n"
+        f"🎁 Реферальных бонусов: `{float(referral_bonus):.2f} грн`\n"
+        f"⭐ Отзывов: `{review_count}`"
     )
-
-    # ФИКС: раньше список категорий брался только из фиксированного DURATIONS,
-    # и покупки с произвольным сроком (заданным вручную админом) не попадали
-    # ни в одну кнопку. Теперь берём реальные различающиеся сроки из покупок пользователя.
-    distinct_res = await session.execute(
-        select(Purchase.duration)
-        .where(Purchase.user_id == user_id)
-        .distinct()
-    )
-    user_durations = [d for d in distinct_res.scalars().all() if d]
-    # Сохраняем порядок из DURATIONS, добавляя нестандартные сроки в конец
-    ordered_durations = [d for d in DURATIONS if d in user_durations]
-    ordered_durations += [d for d in user_durations if d not in DURATIONS]
-
-    buttons = []
-    if not ordered_durations:
-        text_msg += "\n\n_У вас пока нет покупок._"
-    for d in ordered_durations:
-        cnt_res = await session.execute(
-            select(func.count(Purchase.id)).where(Purchase.user_id == user_id, Purchase.duration == d)
-        )
-        cnt = cnt_res.scalar() or 0
-        # используем сам текст длительности как идентификатор (безопасно, т.к. он из БД пользователя)
-        safe_token = d.replace(" ", "_")
-        buttons.append([InlineKeyboardButton(text=f"📂 Срок: {d} (куплено: {cnt})", callback_data=f"profile_durv_{safe_token}")])
-
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="profile_keys")],
+        [InlineKeyboardButton(text="📜 История покупок", callback_data="profile_purchase_history")],
+        [InlineKeyboardButton(text="💳 История баланса", callback_data="profile_balance_history")],
+        [InlineKeyboardButton(text="⭐ Мои отзывы", callback_data="my_reviews")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
-@router.callback_query(F.data.startswith("profile_durv_"))
-async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
-    safe_token = callback.data[len("profile_durv_"):]
-    duration = safe_token.replace("_", " ")
 
+@router.callback_query(F.data == "profile_keys")
+async def profile_keys_menu(callback: CallbackQuery, session: AsyncSession):
     user_id = callback.from_user.id
-    res = await session.execute(
-        select(Purchase)
-        .where(Purchase.user_id == user_id, Purchase.duration == duration)
-        .order_by(Purchase.purchased_at.desc())
-        .limit(20)
-    )
-    purchases = res.scalars().all()
-
-    if not purchases:
-        text_msg = f"🔑 **Ключи ({escape_md(duration)})**\n\nУ вас пока нет купленных ключей в этой категории."
+    result = await session.execute(select(Purchase.duration).where(Purchase.user_id == user_id).distinct())
+    durations = [d for d in result.scalars().all() if d]
+    ordered = [d for d in DURATIONS if d in durations]
+    ordered += [d for d in durations if d not in ordered]
+    if not ordered:
+        text_msg = "🔑 **Мои ключи**\n\nПокупок пока нет."
+        buttons = [[InlineKeyboardButton(text="🛒 Каталог", callback_data="shop")]]
     else:
-        lines = [f"🔑 **Ключи ({escape_md(duration)})** — последние покупки:\n"]
-        for p in purchases:
-            date_str = p.purchased_at.strftime("%d.%m.%Y %H:%M")
-            lines.append(
-                f"📦 *{escape_md(p.product_name)}*\n"
-                f"🔐 `{escape_md(p.key_issued)}`\n"
-                f"🕒 _{date_str}_\n"
-                f"──────────────"
-            )
-        text_msg = "\n".join(lines)
-
-    buttons = [
-        [InlineKeyboardButton(text="🔙 Назад в профиль", callback_data="profile")],
+        text_msg = "🔑 **Мои ключи**\n━━━━━━━━━━━━━━━━━━━\nВыберите срок:"
+        buttons = []
+        for duration in ordered:
+            count = await session.scalar(select(func.count(Purchase.id)).where(
+                Purchase.user_id == user_id, Purchase.duration == duration
+            )) or 0
+            buttons.append([InlineKeyboardButton(
+                text=f"📂 {duration} · {count} шт.", callback_data=f"profile_durv_{duration.replace(' ', '_')}"
+            )])
+    buttons += [
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ]
     await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("profile_durv_"))
+async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
+    duration = callback.data[len("profile_durv_"):].replace("_", " ")
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == callback.from_user.id, Purchase.duration == duration)
+        .order_by(Purchase.purchased_at.desc()).limit(30)
+    )
+    purchases = result.scalars().all()
+    if not purchases:
+        text_msg = "🔑 Записей не найдено."
+    else:
+        blocks = [
+            f"📦 **{escape_md(p.product_name)}**\n🔐 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            for p in purchases
+        ]
+        text_msg = f"🔑 **Мои ключи — {escape_md(duration)}**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К категориям", callback_data="profile_keys")],
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_purchase_history")
+async def profile_purchase_history(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == callback.from_user.id)
+        .order_by(Purchase.purchased_at.desc()).limit(20)
+    )
+    purchases = result.scalars().all()
+    if not purchases:
+        text_msg = "📜 **История покупок**\n\nПокупок пока нет."
+    else:
+        blocks = [
+            f"🛒 **{escape_md(p.product_name)}**\n💰 `{p.price_paid:.2f} грн`\n🔑 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            for p in purchases
+        ]
+        text_msg = "📜 **История покупок**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_balance_history")
+async def profile_balance_history(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(
+        select(BalanceLog).where(BalanceLog.user_id == callback.from_user.id)
+        .order_by(BalanceLog.created_at.desc()).limit(20)
+    )
+    logs = result.scalars().all()
+    labels = {
+        "purchase": "🛒 Покупка", "deposit_approved": "📥 Пополнение", "withdrawal_request": "📤 Вывод",
+        "withdrawal_rejected_refund": "↩️ Возврат", "referral_bonus": "🤝 Реферальный бонус",
+        "promo_code": "🎟 Промокод", "wheel_bonus": "🎰 Приз", "admin_adjust": "🛠 Корректировка",
+    }
+    if not logs:
+        text_msg = "💳 **История баланса**\n\nОпераций пока нет."
+    else:
+        blocks = []
+        for log in logs:
+            sign = "+" if log.amount >= 0 else ""
+            blocks.append(
+                f"{labels.get(log.reason, log.reason)}\n"
+                f"💵 `{sign}{log.amount:.2f} грн` → `{log.balance_after:.2f} грн`\n"
+                f"🕒 {log.created_at.strftime('%d.%m.%Y %H:%M')}"
+            )
+        text_msg = "💳 **История баланса**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
 
 # ==========================================
 # КАТАЛОГ И ПОКУПКИ С УВЕДОМЛЕНИЯМИ (RESTOCK)
@@ -1309,9 +1558,11 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     sw_name = software.name if software else "Товар"
     purchase = Purchase(
         user_id=user.id,
+        product_id=product.id,
         product_name=f"{sw_name} ({product.duration})",
         key_issued=license_key.key_string,
         duration=product.duration,
+        price_paid=product.price,
     )
     session.add(purchase)
     await session.commit()
@@ -1620,9 +1871,11 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
     license_key.is_sold = True
     bonus_purchase = Purchase(
         user_id=user_id,
+        product_id=license_key.product_id,
         product_name=f"🎁 Приз колеса фортуны: {software.name}",
         key_issued=license_key.key_string,
         duration=WHEEL_KEY_DURATION,
+        price_paid=0.0,
     )
     session.add(bonus_purchase)
     spin.result = "key"
@@ -2067,36 +2320,127 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
 # ==========================================
 # ПАНЕЛЬ АДМИНИСТРАТОРА И РАСШИРЕННЫЕ ФУНКЦИИ
 # ==========================================
+async def _admin_dashboard_counts(session: AsyncSession):
+    users = await session.scalar(select(func.count(User.id))) or 0
+    purchases = await session.scalar(select(func.count(Purchase.id))) or 0
+    revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0))) or 0
+    stock = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.is_sold == False)) or 0
+    pending_dep = await session.scalar(select(func.count(DepositRequest.id)).where(DepositRequest.status == "pending")) or 0
+    pending_wdr = await session.scalar(select(func.count(WithdrawalRequest.id)).where(WithdrawalRequest.status == "pending")) or 0
+    pending_reviews = await session.scalar(select(func.count(Review.id)).where(Review.status == "pending")) or 0
+    return users, purchases, float(revenue), stock, pending_dep, pending_wdr, pending_reviews
+
+
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
-async def admin_menu(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "admin_dashboard_refresh", F.from_user.id.in_(ADMIN_IDS))
+async def admin_menu(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
     await state.clear()
+    users, purchases, revenue, stock, pending_dep, pending_wdr, pending_reviews = await _admin_dashboard_counts(session)
     text_msg = (
-        "🛠 **Панель администратора**\n"
+        "🛠 **KRANIN ADMIN • DASHBOARD**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Пользователей: `{users}`\n"
+        f"🛒 Покупок: `{purchases}`\n"
+        f"💰 Оборот: `{revenue:.2f} грн`\n"
+        f"📦 Ключей на складе: `{stock}`\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "Выберите необходимое действие:"
+        f"📥 Пополнения: `{pending_dep}` · 📤 Выводы: `{pending_wdr}`\n"
+        f"⭐ Модерация отзывов: `{pending_reviews}`"
     )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw"),
-             InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
-            [InlineKeyboardButton(text="🖼 Фото/описание софта", callback_data="admin_sw_media_select")],
-            [InlineKeyboardButton(text="🔗 Ссылка на файлы", callback_data="admin_sw_link_select")],
-            [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"),
-             InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
-            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"),
-             InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
-            [InlineKeyboardButton(text="🔋 Пополнение аккаунтов", callback_data="admin_topup_accounts")],
-            [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo"),
-             InlineKeyboardButton(text="📋 Список промокодов", callback_data="admin_promo_list")],
-            [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_start_broadcast")],
-            [InlineKeyboardButton(text="🧾 Неподтвержденные заявки", callback_data="admin_pending_orders")],
-            [InlineKeyboardButton(text="👤 Управление пользователем", callback_data="admin_user_manage")],
-            [InlineKeyboardButton(text="⭐ Управление отзывами", callback_data="admin_reviews_manage")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-        ]
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Товары и склад", callback_data="admin_catalog")],
+        [InlineKeyboardButton(text="💳 Продажи и заявки", callback_data="admin_sales")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="⭐ Отзывы", callback_data="admin_reviews_manage")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_start_broadcast")],
+        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promo_list")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_dashboard_refresh")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
     await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin_catalog", F.from_user.id.in_(ADMIN_IDS))
+async def admin_catalog_menu(callback: CallbackQuery, session: AsyncSession):
+    stock = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.is_sold == False)) or 0
+    softwares = await session.scalar(select(func.count(Software.id))) or 0
+    products = await session.scalar(select(func.count(Product.id))) or 0
+    text_msg = (
+        "📦 **ТОВАРЫ И СКЛАД**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 Софт: `{softwares}` · 🧾 Тарифов: `{products}`\n"
+        f"🔑 В наличии: `{stock}`"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw"), InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
+        [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"), InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
+        [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"), InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
+        [InlineKeyboardButton(text="📊 Склад по тарифам", callback_data="admin_stock")],
+        [InlineKeyboardButton(text="🖼 Фото/описание", callback_data="admin_sw_media_select")],
+        [InlineKeyboardButton(text="🔗 Ссылки на файлы", callback_data="admin_sw_link_select")],
+        [InlineKeyboardButton(text="🔋 Пополнение аккаунтов", callback_data="admin_topup_accounts")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_stock", F.from_user.id.in_(ADMIN_IDS))
+async def admin_stock_handler(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(select(Product, Software).join(Software, Product.software_id == Software.id).order_by(Software.name.asc(), Product.id.asc()))
+    rows = result.all()
+    lines = ["📊 **СКЛАД ПО ТАРИФАМ**\n━━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    if not rows:
+        lines.append("Тарифов пока нет.")
+    for product, software in rows:
+        available = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == product.id, LicenseKey.is_sold == False)) or 0
+        sold = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == product.id, LicenseKey.is_sold == True)) or 0
+        icon = "🟢" if available else "🔴"
+        lines.append(f"{icon} **{escape_md(software.name)}** • `{escape_md(product.duration)}` → `{available}` шт. · продано `{sold}`")
+        buttons.append([InlineKeyboardButton(text=f"📥 Добавить в «{product.duration}»", callback_data=f"add_keys_prod_{product.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Товары и склад", callback_data="admin_catalog")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_sales", F.from_user.id.in_(ADMIN_IDS))
+async def admin_sales_menu(callback: CallbackQuery, session: AsyncSession):
+    today = datetime.now(timezone.utc).date()
+    total_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0))) or 0
+    today_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(func.date(Purchase.purchased_at) == today)) or 0
+    avg_check = await session.scalar(select(func.coalesce(func.avg(Purchase.price_paid), 0))) or 0
+    purchases = await session.scalar(select(func.count(Purchase.id))) or 0
+    text_msg = (
+        "💳 **ПРОДАЖИ И ФИНАНСЫ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 За всё время: `{float(total_revenue):.2f} грн`\n"
+        f"📅 Сегодня: `{float(today_revenue):.2f} грн`\n"
+        f"🛒 Покупок: `{purchases}`\n"
+        f"🧾 Средний чек: `{float(avg_check):.2f} грн`"
+    )
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 Неподтвержденные заявки", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_users", F.from_user.id.in_(ADMIN_IDS))
+async def admin_users_menu(callback: CallbackQuery, session: AsyncSession):
+    users = await session.scalar(select(func.count(User.id))) or 0
+    banned = await session.scalar(select(func.count(User.id)).where(User.is_banned == True)) or 0
+    buyers = await session.scalar(select(func.count(func.distinct(Purchase.user_id)))) or 0
+    text_msg = (
+        "👥 **ПОЛЬЗОВАТЕЛИ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Всего: `{users}`\n"
+        f"🛒 Покупали: `{buyers}`\n"
+        f"🚫 Заблокированы: `{banned}`"
+    )
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Найти / управлять", callback_data="admin_user_manage")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
 
 # --- НОВОЕ: НЕПОДТВЕРЖДЕННЫЕ ЗАЯВКИ (ПОПОЛНЕНИЯ + ВЫВОДЫ) ---
 # Раньше заявки на пополнение/вывод уходили админу только один раз,
@@ -2199,176 +2543,193 @@ async def noop_handler(callback: CallbackQuery):
     await callback.answer()
 
 
-# --- МОДЕРАЦИЯ И УПРАВЛЕНИЕ ОТЗЫВАМИ ---
+# --- ⭐ ПРОФЕССИОНАЛЬНАЯ МОДЕРАЦИЯ ОТЗЫВОВ ---
+REVIEW_FILTERS = {
+    "pending": ("🕒 На модерации", "pending"),
+    "approved": ("✅ Опубликованные", "approved"),
+    "hidden": ("🙈 Скрытые", "hidden"),
+    "all": ("📋 Все", None),
+}
+
+
 @router.callback_query(F.data == "admin_reviews_manage", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.startswith("admin_rev_filter_"), F.from_user.id.in_(ADMIN_IDS))
 @router.callback_query(F.data.startswith("admin_rev_page_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_reviews_list(callback: CallbackQuery, session: AsyncSession):
+    status = "pending"
     page = 0
-    if callback.data.startswith("admin_rev_page_"):
-        page = int(callback.data.split("_")[3])
-
+    if callback.data.startswith("admin_rev_filter_"):
+        status = callback.data.split("_")[3]
+    elif callback.data.startswith("admin_rev_page_"):
+        parts = callback.data.split("_")
+        if len(parts) > 3 and parts[3].isdigit():
+            status = "pending"
+            page = int(parts[3])
+        else:
+            status = parts[3] if len(parts) > 3 else "pending"
+            page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+    if status not in REVIEW_FILTERS:
+        status = "pending"
+    _, status_value = REVIEW_FILTERS[status]
+    where = [] if status_value is None else [Review.status == status_value]
+    total = await session.scalar(select(func.count(Review.id)).where(*where)) or 0
+    pending = await session.scalar(select(func.count(Review.id)).where(Review.status == "pending")) or 0
+    approved = await session.scalar(select(func.count(Review.id)).where(Review.status == "approved")) or 0
+    hidden = await session.scalar(select(func.count(Review.id)).where(Review.status == "hidden")) or 0
     per_page = 5
-    offset = page * per_page
-
-    total_res = await session.execute(select(func.count(Review.id)))
-    total_reviews = total_res.scalar() or 0
-
-    if total_reviews == 0:
-        await callback.message.edit_text(
-            "⭐ **Управление отзывами**\n\nВ базе данных пока нет отзывов.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-            parse_mode="Markdown"
-        )
-        await callback.answer()
-        return
-
-    # НОВОЕ: сколько отзывов ждут решения администратора — показываем в шапке
-    pending_res = await session.execute(select(func.count(Review.id)).where(Review.status == "pending"))
-    pending_count = pending_res.scalar() or 0
-
-    res = await session.execute(
-        select(Review).order_by(Review.created_at.desc()).offset(offset).limit(per_page)
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, total_pages - 1))
+    result = await session.execute(
+        select(Review, User.username, Software.name, Product.duration)
+        .join(User, Review.user_id == User.id, isouter=True)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .where(*where).order_by(Review.created_at.desc()).offset(page * per_page).limit(per_page)
     )
-    reviews = res.scalars().all()
-
+    rows = result.all()
     text_msg = (
-        f"⭐ **Управление отзывами** (Страница {page + 1})\n"
-        f"Всего отзывов: `{total_reviews}` · На модерации: `{pending_count}`\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
+        "⭐ **ОТЗЫВЫ / МОДЕРАЦИЯ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 `{pending}` · ✅ `{approved}` · 🙈 `{hidden}`\n"
+        f"Раздел: **{REVIEW_FILTERS[status][0]}** · `{page + 1}/{total_pages}`\n━━━━━━━━━━━━━━━━━━━\n"
     )
+    if not rows:
+        text_msg += "Здесь пока нет отзывов."
     buttons = []
-
-    status_labels = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "❌ Скрыт"}
-
-    for r in reviews:
-        user_res = await session.get(User, r.user_id)
-        uname = f"@{user_res.username}" if user_res and user_res.username else f"ID: {r.user_id}"
-        snippet = r.text[:35] + "..." if len(r.text) > 35 else r.text
-        status_label = status_labels.get(r.status, r.status)
-        text_msg += f"🔹 **ID {r.id}** | {uname} | {'⭐' * r.rating} | {status_label}\n_{escape_md(snippet)}_\n──────────────\n"
-
-        # НОВОЕ: прямо из списка можно одобрить/скрыть отзыв, не открывая его отдельно
-        toggle_row = []
-        if r.status != "approved":
-            toggle_row.append(InlineKeyboardButton(text=f"✅ #{r.id}", callback_data=f"admin_approve_review_{r.id}"))
-        if r.status != "hidden":
-            toggle_row.append(InlineKeyboardButton(text=f"❌ #{r.id}", callback_data=f"admin_hide_review_{r.id}"))
-        toggle_row.append(InlineKeyboardButton(text=f"🗑 #{r.id}", callback_data=f"admin_del_review_confirm_{r.id}"))
-        buttons.append(toggle_row)
-
-    nav_buttons = []
+    for review, username, sw_name, duration in rows:
+        author = f"@{username}" if username else f"ID {review.user_id}"
+        label = f"{sw_name} • {duration}" if sw_name else "Старый отзыв"
+        status_icon = {"pending": "🕒", "approved": "✅", "hidden": "🙈"}.get(review.status, "❔")
+        snippet = review.text[:45] + "…" if len(review.text) > 45 else review.text
+        text_msg += (
+            f"{status_icon} **#{review.id}** · {escape_md(author)} · {review_stars(review.rating)}\n"
+            f"📦 `{escape_md(label)}`\n_{escape_md(snippet)}_\n──────────────\n"
+        )
+        buttons.append([InlineKeyboardButton(text=f"🔎 Открыть #{review.id}", callback_data=f"admin_review_view_{review.id}")])
+    buttons.insert(0, [
+        InlineKeyboardButton(text="🕒", callback_data="admin_rev_filter_pending"),
+        InlineKeyboardButton(text="✅", callback_data="admin_rev_filter_approved"),
+        InlineKeyboardButton(text="🙈", callback_data="admin_rev_filter_hidden"),
+        InlineKeyboardButton(text="📋", callback_data="admin_rev_filter_all"),
+    ])
+    nav = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_rev_page_{page - 1}"))
-    if offset + per_page < total_reviews:
-        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"admin_rev_page_{page + 1}"))
-
-    if nav_buttons:
-        buttons.append(nav_buttons)
-
-    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
-
-    await callback.message.edit_text(
-        text_msg,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="Markdown"
-    )
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_rev_page_{status}_{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_rev_page_{status}_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons += [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_rev_filter_{status}")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
-# НОВОЕ: модерация отзывов — одобрение и скрытие вместо мгновенной публикации
+
+@router.callback_query(F.data.startswith("admin_review_view_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_review_view(callback: CallbackQuery, session: AsyncSession):
+    try:
+        review_id = int(callback.data.split("_")[3])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный ID отзыва.", show_alert=True)
+        return
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
+        return
+    user = await session.get(User, review.user_id)
+    product = await session.get(Product, review.product_id) if review.product_id else None
+    software = await session.get(Software, product.software_id) if product else None
+    author = f"@{user.username}" if user and user.username else f"ID {review.user_id}"
+    label = f"{software.name} • {product.duration}" if software and product else "Старый отзыв без товара"
+    status_label = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}.get(review.status, review.status)
+    text_msg = (
+        f"⭐ **Отзыв #{review.id}**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Автор: `{escape_md(author)}`\n"
+        f"🆔 Telegram ID: `{review.user_id}`\n"
+        f"📦 `{escape_md(label)}`\n"
+        f"⭐ {review_stars(review.rating)}\n"
+        f"📌 Статус: **{status_label}**\n"
+        f"🕒 `{review.created_at.strftime('%d.%m.%Y %H:%M')}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"💬 **Текст:**\n_{escape_md(review.text)}_"
+    )
+    buttons = []
+    if review.status != "approved":
+        buttons.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"admin_approve_review_{review.id}")])
+    if review.status != "hidden":
+        buttons.append([InlineKeyboardButton(text="🙈 Скрыть", callback_data=f"admin_hide_review_{review.id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_del_review_confirm_{review.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 К отзывам", callback_data="admin_reviews_manage")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("admin_approve_review_"), F.from_user.id.in_(ADMIN_IDS))
-async def admin_approve_review(callback: CallbackQuery, session: AsyncSession):
+async def admin_approve_review(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     review_id = int(callback.data.split("_")[3])
     review = await session.get(Review, review_id)
     if not review:
-        await callback.answer("❌ Отзыв не найден или уже был удален!", show_alert=True)
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
         return
-
+    if review.status == "approved":
+        await callback.answer("✅ Уже опубликован.", show_alert=True)
+        return
     review.status = "approved"
     await session.commit()
-    await callback.answer("✅ Отзыв одобрен и опубликован!", show_alert=True)
+    try:
+        await bot.send_message(review.user_id, "✅ Ваш отзыв прошёл модерацию и опубликован в разделе «⭐ Отзывы»!")
+    except Exception:
+        pass
+    await callback.answer("✅ Отзыв опубликован.", show_alert=True)
+    await admin_review_view(callback, session)
 
-    if callback.message.text and "отзыв на модерации" in callback.message.text.lower():
-        await callback.message.edit_text(
-            callback.message.text + "\n\n✅ **ОДОБРЕНО — отзыв опубликован**",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Скрыть", callback_data=f"admin_hide_review_{review.id}")],
-                [InlineKeyboardButton(text="🗑 Удалить отзыв", callback_data=f"admin_del_review_confirm_{review.id}")],
-            ]),
-            parse_mode="Markdown"
-        )
-    else:
-        await admin_reviews_list(callback, session)
 
 @router.callback_query(F.data.startswith("admin_hide_review_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_hide_review(callback: CallbackQuery, session: AsyncSession):
     review_id = int(callback.data.split("_")[3])
     review = await session.get(Review, review_id)
     if not review:
-        await callback.answer("❌ Отзыв не найден или уже был удален!", show_alert=True)
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
         return
-
     review.status = "hidden"
     await session.commit()
-    await callback.answer("❌ Отзыв скрыт от пользователей.", show_alert=True)
+    await callback.answer("🙈 Отзыв скрыт.", show_alert=True)
+    await admin_review_view(callback, session)
 
-    if callback.message.text and "отзыв на модерации" in callback.message.text.lower():
-        await callback.message.edit_text(
-            callback.message.text + "\n\n❌ **СКРЫТО — отзыв не будет опубликован**",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_review_{review.id}")],
-                [InlineKeyboardButton(text="🗑 Удалить отзыв", callback_data=f"admin_del_review_confirm_{review.id}")],
-            ]),
-            parse_mode="Markdown"
-        )
-    else:
-        await admin_reviews_list(callback, session)
 
-# НОВОЕ: подтверждение перед удалением отзыва (раньше удалялся сразу без подтверждения)
 @router.callback_query(F.data.startswith("admin_del_review_confirm_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_delete_review_confirm(callback: CallbackQuery, session: AsyncSession):
     review_id = int(callback.data.split("_")[4])
     review = await session.get(Review, review_id)
     if not review:
-        await callback.answer("❌ Отзыв не найден или уже был удален!", show_alert=True)
+        await callback.answer("❌ Отзыв уже удалён.", show_alert=True)
         return
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, удалить отзыв", callback_data=f"admin_del_review_{review_id}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reviews_manage")]
-    ])
+    await callback.message.edit_text(
+        f"⚠️ **Удаление отзыва #{review.id}**\n\nБез возможности восстановления.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"admin_del_review_{review.id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_review_view_{review.id}")],
+        ]), parse_mode="Markdown"
+    )
     await callback.answer()
-    if callback.message.text and "отзыв на модерации" in callback.message.text.lower():
-        # Отзыв прислан прямо в личку админу — редактируем это же сообщение
-        await callback.message.edit_reply_markup(reply_markup=keyboard)
-    else:
-        await callback.message.edit_text(
-            f"⚠️ Удалить отзыв #{review_id} безвозвратно?",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+
 
 @router.callback_query(F.data.startswith("admin_del_review_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_delete_review(callback: CallbackQuery, session: AsyncSession):
     review_id = int(callback.data.split("_")[3])
     review = await session.get(Review, review_id)
-
     if not review:
-        await callback.answer("❌ Отзыв не найден или уже был удален!", show_alert=True)
+        await callback.answer("❌ Отзыв уже удалён.", show_alert=True)
         return
-
+    await session.execute(delete(WheelSpin).where(WheelSpin.review_id == review.id))
     await session.delete(review)
     await session.commit()
+    await callback.answer("🗑 Отзыв удалён.", show_alert=True)
+    await admin_reviews_list(callback, session)
 
-    await callback.answer("✅ Отзыв успешно удален!", show_alert=True)
-
-    if callback.message.text and "отзыв на модерации" in callback.message.text.lower():
-        await callback.message.edit_text(
-            callback.message.text + "\n\n🗑 **ОТЗЫВ УДАЛЕН АДМИНИСТРАТОРОМ**",
-            reply_markup=None,
-            parse_mode="Markdown"
-        )
-    else:
-        await admin_reviews_list(callback, session)
 
 # --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
 @router.callback_query(F.data == "admin_create_promo", F.from_user.id.in_(ADMIN_IDS))
@@ -2552,58 +2913,131 @@ async def do_delete_promo(callback: CallbackQuery, session: AsyncSession):
     await callback.answer("✅ Промокод удален!", show_alert=True)
     await admin_promo_list_handler(callback, session)
 
-# --- РАССЫЛКА СООБЩЕНИЙ ---
+# --- 📢 ПРОДВИНУТАЯ РАССЫЛКА ---
 @router.callback_query(F.data == "admin_start_broadcast", F.from_user.id.in_(ADMIN_IDS))
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_broadcast_audience)
+    await callback.message.edit_text(
+        "📢 **Новая рассылка**\n\nВыберите аудиторию:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Все", callback_data="broadcast_audience_all")],
+            [InlineKeyboardButton(text="🛒 Только покупатели", callback_data="broadcast_audience_buyers")],
+            [InlineKeyboardButton(text="🌱 Без покупок", callback_data="broadcast_audience_nonbuyers")],
+            [InlineKeyboardButton(text="💰 С балансом", callback_data="broadcast_audience_balance")],
+            [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+        ]), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("broadcast_audience_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_choose_audience(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    audience = callback.data.replace("broadcast_audience_", "", 1)
+    if audience not in BROADCAST_AUDIENCES:
+        await callback.answer("❌ Неизвестная аудитория.", show_alert=True)
+        return
+    count = len(await get_broadcast_user_ids(session, audience))
+    await state.update_data(broadcast_audience=audience)
     await state.set_state(AdminStates.waiting_for_broadcast_text)
     await callback.message.edit_text(
-        "📢 **Рассылка сообщений**\n\nОтправьте текст или сообщение для рассылки всем пользователям бота:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        f"📢 **Аудитория:** {BROADCAST_AUDIENCES[audience]}\n"
+        f"👥 Получателей: `{count}`\n\n"
+        "Отправьте любое сообщение: текст, фото, видео или документ.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]]),
         parse_mode="Markdown"
     )
     await callback.answer()
 
+
 @router.message(AdminStates.waiting_for_broadcast_text, F.from_user.id.in_(ADMIN_IDS))
-async def admin_broadcast_execute(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+async def admin_broadcast_prepare(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    audience = data.get("broadcast_audience", "all")
+    if audience not in BROADCAST_AUDIENCES:
+        audience = "all"
+    count = len(await get_broadcast_user_ids(session, audience))
+    if count == 0:
+        await state.clear()
+        await message.answer("⚠️ В этой аудитории нет пользователей.", reply_markup=admin_back_kb())
+        return
+    await state.update_data(broadcast_chat_id=message.chat.id, broadcast_message_id=message.message_id, broadcast_count=count)
+    try:
+        await message.send_copy(chat_id=message.chat.id)
+    except Exception:
+        pass
+    await message.answer(
+        "📢 **Предпросмотр выше**\n\n"
+        f"🎯 {BROADCAST_AUDIENCES[audience]}\n"
+        f"👥 Получателей: `{count}`\n\n"
+        "Запустить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton(text="🔄 Выбрать аудиторию", callback_data="admin_start_broadcast")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+        ]), parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "broadcast_confirm", F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    chat_id = data.get("broadcast_chat_id")
+    message_id = data.get("broadcast_message_id")
+    audience = data.get("broadcast_audience", "all")
+    if not chat_id or not message_id:
+        await state.clear()
+        await callback.answer("❌ Черновик устарел. Создайте рассылку заново.", show_alert=True)
+        return
+    user_ids = await get_broadcast_user_ids(session, audience)
     await state.clear()
-    users_res = await session.execute(select(User.id))
-    user_ids = users_res.scalars().all()
+    await callback.message.edit_text(
+        f"⏳ **Рассылка запущена**\n\n🎯 {BROADCAST_AUDIENCES.get(audience, audience)}\n"
+        f"👥 Получателей: `{len(user_ids)}`\n\nДоставка выполняется…", parse_mode="Markdown"
+    )
+    await callback.answer()
 
     success = 0
-    blocked = 0
-    await message.answer(f"⏳ Рассылка началась по {len(user_ids)} пользователям...")
-
-    for uid in user_ids:
-        # ФИКС: раньше при повторном флуд-лимите на 2-й попытке цикл просто
-        # заканчивался без break — пользователь не попадал ни в success,
-        # ни в blocked, и итоговая статистика не билась с реальным числом
-        # получателей. Теперь ограничиваем число ретраев и всегда считаем
-        # исход (успех или "не доставлено").
-        max_attempts = 3
-        for attempt in range(max_attempts):
+    failed = 0
+    for index, uid in enumerate(user_ids, start=1):
+        delivered = False
+        for attempt in range(3):
             try:
-                await message.send_copy(chat_id=uid)
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=message_id)
                 success += 1
-                await asyncio.sleep(0.05)
+                delivered = True
                 break
             except TelegramRetryAfter as e:
-                if attempt == max_attempts - 1:
-                    blocked += 1
+                if attempt >= 2:
                     break
-                await asyncio.sleep(e.retry_after)
-                continue
+                await asyncio.sleep(min(float(e.retry_after), 30.0))
             except TelegramForbiddenError:
-                blocked += 1
                 break
+            except Exception as e:
+                logger.warning(f"Broadcast failed uid={uid}: {e}")
+                break
+        if not delivered:
+            failed += 1
+        await asyncio.sleep(0.06)
+        if index % 100 == 0:
+            try:
+                await callback.message.edit_text(
+                    f"📢 **Рассылка выполняется**\n\n📨 Обработано: `{index}/{len(user_ids)}`\n"
+                    f"✅ Доставлено: `{success}`\n❌ Не доставлено: `{index - success}`", parse_mode="Markdown"
+                )
             except Exception:
-                blocked += 1
-                break
+                pass
+    try:
+        await callback.message.edit_text(
+            "✅ **РАССЫЛКА ЗАВЕРШЕНА**\n━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 {BROADCAST_AUDIENCES.get(audience, audience)}\n"
+            f"👥 Всего: `{len(user_ids)}`\n"
+            f"✅ Доставлено: `{success}`\n"
+            f"❌ Не доставлено: `{len(user_ids) - success}`",
+            reply_markup=admin_back_kb(), parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
-    await message.answer(
-        f"✅ **Рассылка завершена!**\n\n• Успешно доставлено: `{success}`\n• Не доставлено: `{blocked}`",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-        parse_mode="Markdown"
-    )
 
 # --- УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕМ ---
 @router.callback_query(F.data == "admin_user_manage", F.from_user.id.in_(ADMIN_IDS))
@@ -3130,7 +3564,7 @@ async def admin_add_prod_duration(callback: CallbackQuery, state: FSMContext):
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
 
     await callback.message.edit_text(
-        "➕ **Создание тарифа (2/3)**\n\nВыберите или введите длительность тарифа (например: `1 день`, `7 дней`, `30 дней`):",
+        "➕ **Создание тарифа (2/3)**\n\nВыберите или введите длительность тарифа (например: `1 день`, `7 дней`, `30 дней` или `Навсегда`):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="Markdown"
     )
@@ -3138,7 +3572,7 @@ async def admin_add_prod_duration(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("prod_dur_sel_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_add_prod_duration_callback(callback: CallbackQuery, state: FSMContext):
-    duration = callback.data.replace("prod_dur_sel_", "")
+    duration = normalize_duration(callback.data.replace("prod_dur_sel_", ""))
     await state.update_data(duration=duration)
     await state.set_state(AdminStates.waiting_for_price)
 
@@ -3154,7 +3588,7 @@ async def admin_add_prod_duration_text(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("❌ Введите текстовое значение для срока.")
         return
-    duration = message.text.strip()
+    duration = normalize_duration(message.text)
     if len(duration) > MAX_DURATION_LENGTH:
         await message.answer(
             f"❌ Слишком длинный текст ({len(duration)} символов). Максимум — {MAX_DURATION_LENGTH}. Введите другой:"
@@ -3173,11 +3607,41 @@ async def admin_add_prod_finish(message: Message, state: FSMContext, session: As
 
     data = await state.get_data()
     sw_id = data.get("software_id")
-    duration = data.get("duration")
+    duration = normalize_duration(data.get("duration", ""))
+
+    existing = await session.execute(
+        select(Product).where(
+            Product.software_id == sw_id,
+            Product.duration == duration,
+        )
+    )
+    existing_product = existing.scalars().first()
+    if existing_product:
+        await state.clear()
+        await message.answer(
+            f"❌ У этого софта уже существует тариф `{escape_md(duration)}` "
+            f"с ценой `{existing_product.price:.2f} грн`.\n\n"
+            "Чтобы не создать два одинаковых тарифа, изменение существующей "
+            "цены нужно делать в базе/отдельной функции редактирования.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]
+            ),
+            parse_mode="Markdown",
+        )
+        return
 
     product = Product(software_id=sw_id, duration=duration, price=price)
     session.add(product)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await state.clear()
+        await message.answer(
+            "⚠️ Не удалось создать тариф: конфликт данных. Попробуйте ещё раз.",
+            reply_markup=cancel_kb("admin_panel"),
+        )
+        return
     await state.clear()
 
     sw = await session.get(Software, sw_id)
@@ -3431,78 +3895,150 @@ async def admin_add_keys_start(callback: CallbackQuery, state: FSMContext):
 @router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
 async def process_keys_upload(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
     if not message.text:
-        await message.answer("❌ Отправьте ключи текстом.")
+        await message.answer("❌ Отправьте ключи обычным текстом, каждый с новой строки.")
         return
 
     data = await state.get_data()
     prod_id = data.get("product_id")
 
-    # Убираем дубликаты внутри самого списка, сохраняя порядок
-    raw_keys = [k.strip() for k in message.text.strip().split("\n") if k.strip()]
+    if not isinstance(prod_id, int):
+        await state.clear()
+        await message.answer(
+            "❌ Сессия загрузки ключей потеряна. Откройте админ-панель и начните загрузку заново.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")]]
+            ),
+        )
+        return
+
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await state.clear()
+        await message.answer(
+            "❌ Выбранный тариф больше не существует.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")]]
+            ),
+        )
+        return
+
+    # Telegram ограничивает размер текстового сообщения, поэтому разумно
+    # ограничиваем число ключей в одной отправке и не позволяем случайно
+    # засунуть в БД мусор на десятки тысяч строк.
+    MAX_KEYS_PER_UPLOAD = 500
+
+    raw_keys = []
+    for line in message.text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        key = line.strip().lstrip("\ufeff")
+        if key:
+            raw_keys.append(key)
+
+    if not raw_keys:
+        await message.answer("❌ Не найдено ни одного непустого ключа. Пришлите ключи построчно.")
+        return
+
+    if len(raw_keys) > MAX_KEYS_PER_UPLOAD:
+        await message.answer(
+            f"❌ За одну загрузку можно добавить максимум {MAX_KEYS_PER_UPLOAD} ключей.\n"
+            f"Сейчас получено: {len(raw_keys)}.\n\n"
+            "Разделите список на несколько сообщений."
+        )
+        return
+
+    # Убираем дубликаты внутри самого сообщения, сохраняя порядок.
     seen = set()
     keys = []
-    for k in raw_keys:
-        if k not in seen:
-            seen.add(k)
-            keys.append(k)
+    for key in raw_keys:
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
 
-    # ФИКС: раньше при ошибке на одном ключе вызывался session.rollback(),
-    # который откатывал ВСЮ транзакцию целиком (включая уже "успешно" добавленные
-    # в этом же цикле ключи), но added_count при этом не корректировался —
-    # в итоге бот мог отчитаться о добавлении ключей, которых нет в базе.
-    # Теперь сначала находим уже существующие ключи одним запросом,
-    # затем одной транзакцией добавляем только новые.
-    dup_in_db = set()
-    if keys:
-        existing_res = await session.execute(
-            select(LicenseKey.key_string).where(LicenseKey.key_string.in_(keys))
+    # Не принимаем слишком длинные ключи, чтобы гарантированно попасть в VARCHAR(255).
+    too_long = [key for key in keys if len(key) > 255]
+    if too_long:
+        await message.answer(
+            f"❌ Найдено {len(too_long)} ключ(ей) длиннее 255 символов.\n"
+            "Сократите их и отправьте список заново. База не изменена."
         )
-        dup_in_db = set(existing_res.scalars().all())
+        return
 
-    new_keys = [k for k in keys if k not in dup_in_db]
+    existing_res = await session.execute(
+        select(LicenseKey.key_string).where(LicenseKey.key_string.in_(keys))
+    )
+    dup_in_db = set(existing_res.scalars().all())
+
+    new_keys = [key for key in keys if key not in dup_in_db]
     skipped_count = len(raw_keys) - len(new_keys)
 
     added_count = 0
     if new_keys:
-        session.add_all([LicenseKey(product_id=prod_id, key_string=k) for k in new_keys])
+        session.add_all(
+            [LicenseKey(product_id=prod_id, key_string=key) for key in new_keys]
+        )
         try:
             await session.commit()
             added_count = len(new_keys)
         except IntegrityError:
             await session.rollback()
-            await message.answer("⚠️ Не удалось сохранить ключи из-за конфликта данных. Попробуйте отправить их заново.")
+            await message.answer(
+                "⚠️ Не удалось сохранить ключи из-за конфликта данных.\n"
+                "Ничего из этой загрузки не добавлено. Проверьте список и повторите."
+            )
             return
-    else:
-        await session.rollback()
+
+    # Критически важно: после успешной обработки сбрасываем FSM,
+    # иначе следующее сообщение админа снова попадёт сюда как «ключ».
+    await state.clear()
+
+    result_text = (
+        f"✅ **Загрузка завершена**\n"
+        f"📦 Тариф: `{escape_md(prod.duration)}`\n"
+        f"➕ Добавлено: `{added_count}`\n"
+    )
+    if skipped_count > 0:
+        result_text += f"♻️ Пропущено дубликатов: `{skipped_count}`\n"
+
+    # Даём администратору точную сводку по остатку.
+    available_now = await session.scalar(
+        select(func.count(LicenseKey.id)).where(
+            LicenseKey.product_id == prod_id,
+            LicenseKey.is_sold == False,
+        )
+    ) or 0
+    result_text += f"📊 Сейчас в наличии: `{available_now}`"
 
     if added_count > 0:
-        subs_res = await session.execute(select(RestockSubscription).where(RestockSubscription.product_id == prod_id))
+        subs_res = await session.execute(
+            select(RestockSubscription).where(RestockSubscription.product_id == prod_id)
+        )
         subs = subs_res.scalars().all()
-        prod = await session.get(Product, prod_id)
-        sw = await session.get(Software, prod.software_id) if prod else None
+        sw = await session.get(Software, prod.software_id)
         sw_name = sw.name if sw else "Товар"
 
         for sub in subs:
             try:
                 await bot.send_message(
                     sub.user_id,
-                    f"🔔 **Пополнение товара!**\n\nТовар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
-                    parse_mode="Markdown"
+                    f"🔔 **Пополнение товара!**\n\n"
+                    f"Товар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
+                    parse_mode="Markdown",
                 )
             except Exception:
-                pass
+                logger.info(f"Не удалось уведомить пользователя {sub.user_id} о пополнении.")
             await session.delete(sub)
         await session.commit()
 
-    result_text = f"✅ Успешно добавлено `{added_count}` ключей!"
-    if skipped_count > 0:
-        result_text += f"\n⚠️ Пропущено дубликатов: `{skipped_count}`"
-
     await message.answer(
         result_text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
-        parse_mode="Markdown"
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="📦 Склад", callback_data="admin_stock"),
+                InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel"),
+            ]]
+        ),
+        parse_mode="Markdown",
     )
+
 
 # ==========================================
 # ЗАГЛУШКА ДЛЯ "ПОТЕРЯННЫХ" СООБЩЕНИЙ
@@ -3699,6 +4235,47 @@ async def run_migrations() -> None:
         logger.info("Миграция: wheel_spins.review_id добавлен, purchase_id стал nullable.")
     except Exception as e:
         logger.warning(f"Миграция wheel_spins.review_id не выполнена: {e}")
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"))
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS price_paid DOUBLE PRECISION NOT NULL DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"))
+            await conn.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS purchase_id INTEGER REFERENCES purchases(id)"))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS reviews_user_product_uniq "
+                "ON reviews(user_id, product_id) WHERE product_id IS NOT NULL"
+            ))
+        logger.info("Миграция: product_id/price_paid и review links добавлены.")
+    except Exception as e:
+        logger.warning(f"Миграция purchase/review metadata не выполнена: {e}")
+
+    # Backfill старых покупок: по историческому имени и сроку восстанавливаем
+    # product_id и цену, чтобы профиль и статистика работали и для старых продаж.
+    try:
+        async with async_session_maker() as session:
+            products_res = await session.execute(
+                select(Product.id, Product.price, Product.duration, Software.name)
+                .join(Software, Product.software_id == Software.id)
+            )
+            product_map = {
+                (name, duration): (pid, float(price))
+                for pid, price, duration, name in products_res.all()
+            }
+            purchases_res = await session.execute(select(Purchase).where(Purchase.product_id.is_(None)))
+            changed = 0
+            for purchase in purchases_res.scalars().all():
+                for (name, duration), (product_id, price) in product_map.items():
+                    if purchase.product_name == f"{name} ({duration})" and purchase.duration == duration:
+                        purchase.product_id = product_id
+                        purchase.price_paid = price
+                        changed += 1
+                        break
+            if changed:
+                await session.commit()
+                logger.info(f"Backfill purchases: восстановлено {changed} исторических покупок.")
+    except Exception as e:
+        logger.warning(f"Backfill исторических покупок не выполнен: {e}")
 
     try:
         async with engine.begin() as conn:
