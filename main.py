@@ -573,19 +573,28 @@ class PromoCode(Base):
     __tablename__ = "promo_codes"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(50), unique=True)
-    amount: Mapped[float] = mapped_column(Float)
+    # Старое поле сохраняем для совместимости: в режиме balance это сумма бонуса
+    # на баланс. Для discount можно оставить 0.
+    amount: Mapped[float] = mapped_column(Float, default=0.0)
     uses_left: Mapped[int] = mapped_column(Integer, default=1)
+    # balance — старый тип промокода (начисление на баланс),
+    # discount — скидка на покупку.
+    promo_type: Mapped[str] = mapped_column(String(20), default="balance", server_default="balance")
+    discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # NULL = действует на все товары, иначе только на конкретный тариф.
+    product_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("products.id"), nullable=True)
 
 
 class PromoCodeUsage(Base):
-    # НОВОЕ: фиксирует, что конкретный пользователь уже активировал конкретный
-    # промокод — не даёт одному человеку в одиночку выесть весь uses_left,
-    # повторно присылая один и тот же код.
+    # Фиксирует, что конкретный пользователь уже использовал конкретный промокод.
     __tablename__ = "promo_code_usages"
     __table_args__ = (UniqueConstraint("promo_id", "user_id", name="uq_promo_user_once"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     promo_id: Mapped[int] = mapped_column(ForeignKey("promo_codes.id"))
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    # Для скидочных промокодов сохраняем фактическую скидку и итоговую цену.
+    discount_amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class Review(Base):
@@ -681,8 +690,11 @@ class AdminStates(StatesGroup):
     waiting_for_keys = State()
     waiting_for_software_media = State()
     waiting_for_software_files_link = State()
+    waiting_for_promo_type = State()
     waiting_for_promo_code = State()
     waiting_for_promo_amount = State()
+    waiting_for_promo_percent = State()
+    waiting_for_promo_product = State()
     waiting_for_promo_uses = State()
     waiting_for_broadcast_audience = State()
     waiting_for_broadcast_text = State()
@@ -868,7 +880,12 @@ async def process_reg_language(callback: CallbackQuery, session: AsyncSession, s
 
 @router.callback_query(F.data == "main_menu")
 async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
+    # Не теряем уже применённую скидку при переходе через главное меню.
+    state_data = await state.get_data()
+    active_discount_promo_id = state_data.get("active_discount_promo_id")
     await state.clear()
+    if active_discount_promo_id:
+        await state.update_data(active_discount_promo_id=active_discount_promo_id)
     user = await session.get(User, callback.from_user.id)
     balance = user.balance if user else 0.0
     lang = user.language if user and user.language in LANGUAGES else "uk"
@@ -894,7 +911,11 @@ async def change_lang_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data.in_({"lang_uk", "lang_ru"}))
 async def set_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    state_data = await state.get_data()
+    active_discount_promo_id = state_data.get("active_discount_promo_id")
     await state.clear()
+    if active_discount_promo_id:
+        await state.update_data(active_discount_promo_id=active_discount_promo_id)
     lang_code = "uk" if callback.data == "lang_uk" else "ru"
     user = await session.get(User, callback.from_user.id)
     if user:
@@ -929,6 +950,7 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     if not message.text:
         await message.answer("❌ Отправьте промокод текстом.", reply_markup=cancel_kb("main_menu"))
         return
+
     code_text = normalize_promo_code(message.text)
     if not code_text:
         await message.answer(
@@ -938,54 +960,94 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
         )
         return
 
-    # ФИКС: используем блокировку строки промокода, чтобы два одновременных
-    # использования не смогли оба пройти проверку uses_left > 0.
-    res = await session.execute(
-        select(PromoCode).filter_by(code=code_text).with_for_update().execution_options(populate_existing=True)
+    promo = await session.scalar(
+        select(PromoCode)
+        .where(func.upper(PromoCode.code) == code_text)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
-    promo = res.scalars().first()
 
     if not promo or promo.uses_left <= 0:
-        await message.answer("❌ Промокод не найден или срок его активаций исчерпан!", reply_markup=cancel_kb("main_menu"))
+        await message.answer("❌ Промокод не найден или его лимит активаций исчерпан!", reply_markup=cancel_kb("main_menu"))
         await state.clear()
         return
 
-    # ФИКС: не даём одному пользователю активировать один и тот же промокод
-    # повторно — раньше это позволяло в одиночку выесть весь uses_left.
-    already_used_res = await session.execute(
-        select(PromoCodeUsage).filter_by(promo_id=promo.id, user_id=message.from_user.id)
+    # Один пользователь может применить конкретный промокод только один раз.
+    already_used = await session.scalar(
+        select(exists().where(
+            PromoCodeUsage.promo_id == promo.id,
+            PromoCodeUsage.user_id == message.from_user.id
+        ))
     )
-    if already_used_res.scalars().first():
-        await message.answer("❌ Вы уже активировали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
+    if already_used:
+        await message.answer("❌ Вы уже использовали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
         await state.clear()
         return
 
-    user_res = await session.execute(select(User).where(User.id == message.from_user.id).with_for_update().execution_options(populate_existing=True))
+    if promo.promo_type == "discount":
+        percent = float(promo.discount_percent or 0)
+        if percent <= 0 or percent > 100:
+            await message.answer("❌ У этого промокода некорректная скидка. Обратитесь к администратору.")
+            await state.clear()
+            return
+
+        await state.update_data(active_discount_promo_id=promo.id)
+
+        if promo.product_id is None:
+            target_text = "на любой товар"
+        else:
+            product = await session.get(Product, promo.product_id)
+            if not product:
+                await message.answer("❌ Товар, к которому привязан промокод, больше не существует.", reply_markup=cancel_kb("main_menu"))
+                await state.update_data(active_discount_promo_id=None)
+                await state.clear()
+                return
+            software = await session.get(Software, product.software_id)
+            target_text = f"на {software.name if software else 'товар'} • {product.duration}"
+
+        await state.clear()
+        await state.update_data(active_discount_promo_id=promo.id)
+        await message.answer(
+            f"✅ Промокод `{escape_md(promo.code)}` применён!\n\n"
+            f"💸 Скидка: **{percent:.0f}%**\n"
+            f"📦 Действует: **{escape_md(target_text)}**\n\n"
+            "🛒 Перейдите в каталог и выберите подходящий товар. Скидка будет показана перед оплатой.",
+            reply_markup=get_main_menu_kb(message.from_user.id, "ru"),
+            parse_mode="Markdown"
+        )
+        return
+
+    # Старые промокоды-бонусы продолжают работать как раньше.
+    user_res = await session.execute(
+        select(User).where(User.id == message.from_user.id).with_for_update().execution_options(populate_existing=True)
+    )
     user = user_res.scalar_one_or_none()
     if not user:
         await state.clear()
         return
 
-    user.balance += promo.amount
+    user.balance += float(promo.amount)
     promo.uses_left -= 1
-    session.add(PromoCodeUsage(promo_id=promo.id, user_id=user.id))
-    log_balance_change(session, user.id, promo.amount, "promo_code", user.balance, related_id=promo.id)
+    session.add(PromoCodeUsage(
+        promo_id=promo.id,
+        user_id=user.id,
+        discount_amount=0.0,
+        final_price=0.0,
+    ))
+    log_balance_change(session, user.id, float(promo.amount), "promo_code", user.balance, related_id=promo.id)
 
     try:
         await session.commit()
     except IntegrityError:
-        # Подстраховка на случай гонки: уникальный constraint поймал
-        # повторную активацию, которую не успела отсечь проверка выше
         await session.rollback()
-        await message.answer("❌ Вы уже активировали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
+        await message.answer("❌ Вы уже использовали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
         await state.clear()
         return
 
+    lang = user.language if user.language in LANGUAGES else "ru"
     await state.clear()
-
-    lang = user.language if user and user.language in LANGUAGES else "uk"
     await message.answer(
-        f"🎉 **Промокод успешно активирован!**\nВам начислено `{promo.amount:.2f} грн` на баланс.",
+        f"🎉 **Промокод успешно активирован!**\nВам начислено `{float(promo.amount):.2f} грн` на баланс.",
         reply_markup=get_main_menu_kb(message.from_user.id, lang),
         parse_mode="Markdown"
     )
@@ -1607,7 +1669,7 @@ async def notify_restock_handler(callback: CallbackQuery, session: AsyncSession)
 
 # --- НОВОЕ: ШАГ ПОДТВЕРЖДЕНИЯ ПЕРЕД ПОКУПКОЙ ---
 @router.callback_query(F.data.startswith("confirm_buy_"))
-async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
@@ -1622,28 +1684,63 @@ async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSessio
     user = await session.get(User, user_id)
     balance = user.balance if user else 0.0
 
-    # Проверяем, что ключи всё ещё есть в наличии на момент показа подтверждения
     avail_res = await session.execute(
         select(func.count(LicenseKey.id)).filter_by(product_id=product.id, is_sold=False)
     )
     available = avail_res.scalar() or 0
-
     if available <= 0:
         await callback.answer("❌ К сожалению, ключи только что закончились!", show_alert=True)
         return
 
-    if balance < product.price:
-        await callback.answer(f"❌ Недостаточно средств! Требуется {product.price:.2f} грн, у вас {balance:.2f} грн", show_alert=True)
+    final_price = round(float(product.price), 2)
+    discount_amount = 0.0
+    promo = None
+    promo_data = await state.get_data()
+    active_promo_id = promo_data.get("active_discount_promo_id")
+
+    if active_promo_id:
+        promo = await session.get(PromoCode, active_promo_id)
+        if not promo or promo.uses_left <= 0 or promo.promo_type != "discount":
+            await state.update_data(active_discount_promo_id=None)
+            promo = None
+        elif promo.product_id is not None and promo.product_id != product.id:
+            target = await session.get(Product, promo.product_id)
+            target_name = "другой товар"
+            if target:
+                target_sw = await session.get(Software, target.software_id)
+                target_name = f"{target_sw.name if target_sw else 'товар'} • {target.duration}"
+            await callback.answer(f"❌ Эта скидка действует только на: {target_name}", show_alert=True)
+            return
+        else:
+            percent = max(0.0, min(100.0, float(promo.discount_percent or 0.0)))
+            discount_amount = round(float(product.price) * percent / 100.0, 2)
+            final_price = max(0.0, round(float(product.price) - discount_amount, 2))
+
+    if balance < final_price:
+        await callback.answer(
+            f"❌ Недостаточно средств! Требуется {final_price:.2f} грн, у вас {balance:.2f} грн",
+            show_alert=True
+        )
         return
+
+    price_block = f"💰 **Цена:** `{product.price:.2f} грн`"
+    if promo and discount_amount > 0:
+        price_block += (
+            f"\n🎟 **Промокод:** `{escape_md(promo.code)}`"
+            f"\n💸 **Скидка:** `-{discount_amount:.2f} грн` ({float(promo.discount_percent):.0f}%)"
+            f"\n✅ **К оплате:** `{final_price:.2f} грн`"
+        )
+    else:
+        price_block += f"\n✅ **К оплате:** `{final_price:.2f} грн`"
 
     text_msg = (
         f"🧾 **Подтверждение покупки**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📦 **Товар:** `{escape_md(sw_name)}`\n"
         f"⏳ **Срок:** `{escape_md(product.duration)}`\n"
-        f"💰 **Цена:** `{product.price:.2f} грн`\n"
+        f"{price_block}\n"
         f"💳 **Ваш баланс:** `{balance:.2f} грн`\n"
-        f"💳 **Баланс после покупки:** `{(balance - product.price):.2f} грн`\n"
+        f"💳 **Баланс после покупки:** `{(balance - final_price):.2f} грн`\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
         f"Подтвердите покупку — деньги будут списаны и вам сразу выдастся ключ."
     )
@@ -1655,7 +1752,7 @@ async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSessio
     await callback.answer()
 
 @router.callback_query(F.data.startswith("buy_product_"))
-async def process_purchase(callback: CallbackQuery, session: AsyncSession):
+async def process_purchase(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
@@ -1674,9 +1771,46 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
     )
     user = user_res.scalar_one_or_none()
 
-    if not user or user.balance < product.price:
+    # Пересчитываем скидку непосредственно в момент списания, а не доверяем
+    # цене из предыдущего экрана подтверждения.
+    original_price = round(float(product.price), 2)
+    final_price = original_price
+    discount_amount = 0.0
+    promo = None
+
+    state_data = await state.get_data()
+    active_promo_id = state_data.get("active_discount_promo_id")
+    if active_promo_id:
+        promo_res = await session.execute(
+            select(PromoCode).where(PromoCode.id == active_promo_id).with_for_update().execution_options(populate_existing=True)
+        )
+        promo = promo_res.scalar_one_or_none()
+
+        if promo:
+            used_before = await session.scalar(
+                select(exists().where(
+                    PromoCodeUsage.promo_id == promo.id,
+                    PromoCodeUsage.user_id == user.id
+                ))
+            )
+            if promo.promo_type != "discount" or promo.uses_left <= 0:
+                promo = None
+                await state.update_data(active_discount_promo_id=None)
+            elif used_before:
+                await state.update_data(active_discount_promo_id=None)
+                await callback.answer("❌ Этот промокод уже был использован вами.", show_alert=True)
+                return
+            elif promo.product_id is not None and promo.product_id != product.id:
+                await callback.answer("❌ Этот промокод не действует на выбранный товар.", show_alert=True)
+                return
+            else:
+                percent = max(0.0, min(100.0, float(promo.discount_percent or 0.0)))
+                discount_amount = round(original_price * percent / 100.0, 2)
+                final_price = max(0.0, round(original_price - discount_amount, 2))
+
+    if not user or user.balance < final_price:
         await callback.answer(
-            f"❌ Недостаточно средств! Требуется {product.price:.2f} грн", show_alert=True
+            f"❌ Недостаточно средств! Требуется {final_price:.2f} грн", show_alert=True
         )
         return
 
@@ -1692,9 +1826,12 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("❌ Ключи этого номинала закончились!", show_alert=True)
         return
 
-    user.balance -= product.price
+    user.balance -= final_price
     license_key.is_sold = True
-    log_balance_change(session, user.id, -product.price, "purchase", user.balance, related_id=product.id)
+    log_balance_change(session, user.id, -final_price, "purchase", user.balance, related_id=product.id)
+
+    if promo:
+        promo.uses_left -= 1
 
     # НОВОЕ: остаток ключей ПОСЛЕ этой продажи (autoflush применит is_sold=True
     # до выполнения этого SELECT, поэтому только что проданный ключ уже не
@@ -1713,7 +1850,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         )
         referrer = referrer_res.scalar_one_or_none()
         if referrer:
-            ref_bonus = round(product.price * 0.05, 2)
+            ref_bonus = round(final_price * 0.05, 2)
             referrer.balance += ref_bonus
             log_balance_change(session, referrer.id, ref_bonus, "referral_bonus", referrer.balance, related_id=user.id)
             referral_notice = (referrer.id, ref_bonus)
@@ -1725,16 +1862,27 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         product_name=f"{sw_name} ({product.duration})",
         key_issued=license_key.key_string,
         duration=product.duration,
-        price_paid=product.price,
+        price_paid=final_price,
     )
     session.add(purchase)
+
+    if promo:
+        session.add(PromoCodeUsage(
+            promo_id=promo.id,
+            user_id=user.id,
+            discount_amount=discount_amount,
+            final_price=final_price,
+        ))
     await session.commit()
+    await state.update_data(active_discount_promo_id=None)
 
     success_text = (
         f"✅ **Покупка успешно завершена!**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
-        f"💳 **Списано с баланса:** `{product.price:.2f} грн`\n"
+        f"💰 **Обычная цена:** `{original_price:.2f} грн`\n"
+        + (f"🎟 **Скидка:** `-{discount_amount:.2f} грн` ({float(promo.discount_percent):.0f}%)\n" if promo else "")
+        + f"💳 **Списано с баланса:** `{final_price:.2f} грн`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
         f"🔑 **Ваш лицензионный ключ:**\n`{escape_md(license_key.key_string)}`\n\n"
         + (f"📁 **Файлы:** [Открыть]({md_url(software.files_link)})\n\n" if software and software.files_link else "")
@@ -1775,7 +1923,9 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession):
         f"👤 Покупатель: `{user.id}` ({user_display(callback)})\n"
         f"📦 Товар: `{escape_md(sw_name)}`\n"
         f"⏳ Тариф: `{escape_md(product.duration)}`\n"
-        f"💰 Сумма: `{product.price:.2f} грн`\n"
+        f"💰 Сумма: `{final_price:.2f} грн`"
+        + (f" (скидка {float(promo.discount_percent):.0f}%, было {original_price:.2f} грн)" if promo else "")
+        + "\n"
         f"📊 Остаток на складе: `{remaining_after_sale}` шт."
     )
     for admin_id in ADMIN_IDS:
@@ -2915,14 +3065,40 @@ async def admin_delete_review(callback: CallbackQuery, session: AsyncSession):
 # --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
 @router.callback_query(F.data == "admin_create_promo", F.from_user.id.in_(ADMIN_IDS))
 async def admin_create_promo_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_promo_type)
+    await callback.message.edit_text(
+        "🎟 **Создание промокода**\n\nВыберите тип промокода:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💸 Скидка в %", callback_data="promo_type_discount")],
+            [InlineKeyboardButton(text="💰 Бонус на баланс", callback_data="promo_type_balance")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+        ]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "promo_type_discount", F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_type_discount(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(promo_type="discount")
     await state.set_state(AdminStates.waiting_for_promo_code)
     await callback.message.edit_text(
-        "🎟 **Создание промокода (1/3)**\n\n"
-        "Введите код промокода. Разрешены латинские буквы, цифры, `-` и `_`.\n"
-        f"Максимум {MAX_PROMO_CODE_LENGTH} символов, например: `START2026`.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
-        ]),
+        "💸 **Скидочный промокод**\n\n"
+        "Введите код. Разрешены латинские буквы, цифры, `-` и `_`.",
+        reply_markup=cancel_kb("admin_panel"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "promo_type_balance", F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_type_balance(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(promo_type="balance")
+    await state.set_state(AdminStates.waiting_for_promo_code)
+    await callback.message.edit_text(
+        "💰 **Промокод на баланс**\n\n"
+        "Введите код. Разрешены латинские буквы, цифры, `-` и `_`.",
+        reply_markup=cancel_kb("admin_panel"),
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -2937,21 +3113,13 @@ async def admin_promo_code_entered(message: Message, state: FSMContext, session:
     code = normalize_promo_code(message.text)
     if not code:
         await message.answer(
-            f"❌ Некорректный код. Используйте латинские буквы, цифры, `-` и `_`, максимум {MAX_PROMO_CODE_LENGTH} символов.\n"
-            "Пример: `START2026`.",
+            f"❌ Некорректный код. Используйте латинские буквы, цифры, `-` и `_`, максимум {MAX_PROMO_CODE_LENGTH} символов.",
             reply_markup=cancel_kb("admin_panel"),
             parse_mode="Markdown"
         )
         return
 
-    try:
-        existing = await session.scalar(select(PromoCode).where(func.upper(PromoCode.code) == code))
-    except SQLAlchemyError as e:
-        await session.rollback()
-        logger.exception("Ошибка проверки уникальности промокода", exc_info=e)
-        await message.answer("⚠️ База данных временно недоступна. Попробуйте создать промокод ещё раз.")
-        return
-
+    existing = await session.scalar(select(PromoCode).where(func.upper(PromoCode.code) == code))
     if existing:
         await message.answer(
             f"❌ Промокод `{escape_md(code)}` уже существует. Введите другой:",
@@ -2960,14 +3128,94 @@ async def admin_promo_code_entered(message: Message, state: FSMContext, session:
         )
         return
 
-    await state.update_data(code=code)
-    await state.set_state(AdminStates.waiting_for_promo_amount)
+    data = await state.get_data()
+    promo_type = data.get("promo_type", "balance")
+    await state.update_data(code=code, promo_type=promo_type)
+
+    if promo_type == "discount":
+        await state.set_state(AdminStates.waiting_for_promo_percent)
+        await message.answer(
+            "💸 **Шаг 2/4**\n\n"
+            "Введите размер скидки от **1 до 100%**.\n"
+            "Например: `10`, `15`, `25`.",
+            reply_markup=cancel_kb("admin_panel"),
+            parse_mode="Markdown"
+        )
+    else:
+        await state.set_state(AdminStates.waiting_for_promo_amount)
+        await message.answer(
+            "💰 **Шаг 2/3**\n\nВведите сумму бонуса в гривнах. Например: `100` или `25.50`.",
+            reply_markup=cancel_kb("admin_panel"),
+            parse_mode="Markdown"
+        )
+
+
+@router.message(AdminStates.waiting_for_promo_percent, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_percent_entered(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Введите процент числом.")
+        return
+    raw = message.text.strip().replace(",", ".")
+    try:
+        percent = float(raw)
+    except ValueError:
+        percent = -1
+    if not math.isfinite(percent) or percent < 1 or percent > 100:
+        await message.answer("❌ Процент должен быть от 1 до 100.", reply_markup=cancel_kb("admin_panel"))
+        return
+
+    await state.update_data(discount_percent=round(percent, 2))
+    await state.set_state(AdminStates.waiting_for_promo_product)
+
+    result = await session.execute(
+        select(Product, Software).join(Software, Product.software_id == Software.id).order_by(Software.name.asc(), Product.id.asc())
+    )
+    rows = result.all()
+    buttons = [[InlineKeyboardButton(text="🌐 Все товары", callback_data="promo_product_all")]]
+    for product, software in rows[:80]:
+        buttons.append([InlineKeyboardButton(
+            text=f"📦 {software.name} • {product.duration} — {product.price:.2f} грн",
+            callback_data=f"promo_product_{product.id}"
+        )])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
+
     await message.answer(
-        "🎟 **Создание промокода (2/3)**\n\n"
-        "Введите сумму бонуса в гривнах. Например: `100` или `25.50`.",
+        "📦 **Шаг 3/4 — выберите товар**\n\n"
+        "Скидка может действовать на весь каталог или только на один конкретный тариф.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data.startswith("promo_product_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_product_selected(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if callback.data == "promo_product_all":
+        product_id = None
+        target_text = "все товары"
+    else:
+        try:
+            product_id = int(callback.data.split("_")[-1])
+        except (ValueError, IndexError):
+            await callback.answer("❌ Неверный товар.", show_alert=True)
+            return
+        product = await session.get(Product, product_id)
+        if not product:
+            await callback.answer("❌ Товар не найден.", show_alert=True)
+            return
+        software = await session.get(Software, product.software_id)
+        target_text = f"{software.name if software else 'Товар'} • {product.duration}"
+
+    await state.update_data(product_id=product_id, promo_product_text=target_text)
+    await state.set_state(AdminStates.waiting_for_promo_uses)
+    await callback.message.edit_text(
+        f"🎟 **Шаг 4/4**\n\n"
+        f"💸 Скидка: `{float((await state.get_data()).get('discount_percent', 0)):.0f}%`\n"
+        f"📦 Действует: **{escape_md(target_text)}**\n\n"
+        "Введите максимальное количество активаций, например `100`.",
         reply_markup=cancel_kb("admin_panel"),
         parse_mode="Markdown"
     )
+    await callback.answer()
 
 
 @router.message(AdminStates.waiting_for_promo_amount, F.from_user.id.in_(ADMIN_IDS))
@@ -2996,79 +3244,88 @@ async def admin_promo_amount_entered(message: Message, state: FSMContext):
 @router.message(AdminStates.waiting_for_promo_uses, F.from_user.id.in_(ADMIN_IDS))
 async def admin_promo_uses_entered(message: Message, state: FSMContext, session: AsyncSession):
     if not message.text or not message.text.strip().isdigit():
-        await message.answer(
-            "❌ Введите целое положительное число активаций, например `100`.",
-            reply_markup=cancel_kb("admin_panel")
-        )
+        await message.answer("❌ Введите целое положительное число активаций, например `100`.", reply_markup=cancel_kb("admin_panel"))
         return
 
     uses = int(message.text.strip())
     if uses <= 0 or uses > 1_000_000:
-        await message.answer(
-            "❌ Количество активаций должно быть от 1 до 1 000 000.",
-            reply_markup=cancel_kb("admin_panel")
-        )
+        await message.answer("❌ Количество активаций должно быть от 1 до 1 000 000.", reply_markup=cancel_kb("admin_panel"))
         return
 
     data = await state.get_data()
     code = normalize_promo_code(data.get("code"))
-    amount = data.get("amount")
+    promo_type = data.get("promo_type", "balance")
+    amount = data.get("amount", 0.0)
+    discount_percent = data.get("discount_percent")
+    product_id = data.get("product_id")
+    product_text = data.get("promo_product_text", "все товары")
 
-    if not code or amount is None:
+    if not code:
         await state.clear()
-        await message.answer("⚠️ Сессия создания промокода устарела. Откройте создание промокода заново.")
+        await message.answer("⚠️ Сессия создания промокода устарела.", reply_markup=cancel_kb("admin_panel"))
         return
 
     try:
-        # Повторно проверяем код прямо перед INSERT: между шагами другой админ
-        # или другой процесс мог создать такой же код.
         existing = await session.scalar(select(PromoCode).where(func.upper(PromoCode.code) == code))
         if existing:
-            await message.answer(
-                f"❌ Промокод `{escape_md(code)}` уже существует. Создайте другой.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
-                    [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
-                ]),
-                parse_mode="Markdown"
-            )
+            await message.answer(f"❌ Промокод `{escape_md(code)}` уже существует.", reply_markup=cancel_kb("admin_panel"), parse_mode="Markdown")
             await state.clear()
             return
 
-        promo = PromoCode(code=code, amount=float(amount), uses_left=uses)
+        if promo_type == "discount":
+            if discount_percent is None or not (1 <= float(discount_percent) <= 100):
+                await message.answer("❌ Некорректный процент скидки.", reply_markup=cancel_kb("admin_panel"))
+                await state.clear()
+                return
+            promo = PromoCode(
+                code=code,
+                amount=0.0,
+                uses_left=uses,
+                promo_type="discount",
+                discount_percent=float(discount_percent),
+                product_id=product_id,
+            )
+        else:
+            promo = PromoCode(
+                code=code,
+                amount=float(amount),
+                uses_left=uses,
+                promo_type="balance",
+            )
+
         session.add(promo)
         await session.commit()
-
     except IntegrityError:
         await session.rollback()
-        await message.answer(
-            f"❌ Промокод `{escape_md(code)}` уже существует. Создайте другой.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
-                [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
-            ]),
-            parse_mode="Markdown"
-        )
+        await message.answer("❌ Промокод с таким кодом уже существует.", reply_markup=cancel_kb("admin_panel"))
         await state.clear()
         return
     except SQLAlchemyError as e:
         await session.rollback()
         logger.exception("Ошибка создания промокода", exc_info=e)
-        await message.answer(
-            "⚠️ Не удалось сохранить промокод в базе данных. Попробуйте ещё раз.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
-                [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
-            ])
-        )
+        await message.answer("⚠️ Не удалось сохранить промокод в БД.", reply_markup=cancel_kb("admin_panel"))
         await state.clear()
         return
 
     await state.clear()
+    if promo_type == "discount":
+        result_text = (
+            f"✅ **Скидочный промокод создан!**\n\n"
+            f"🎟 Код: `{escape_md(code)}`\n"
+            f"💸 Скидка: **{float(discount_percent):.0f}%**\n"
+            f"📦 Товар: **{escape_md(product_text)}**\n"
+            f"🔢 Активаций: `{uses}`"
+        )
+    else:
+        result_text = (
+            f"✅ **Промокод на баланс создан!**\n\n"
+            f"🎟 Код: `{escape_md(code)}`\n"
+            f"💰 Бонус: `{float(amount):.2f} грн`\n"
+            f"🔢 Активаций: `{uses}`"
+        )
+
     await message.answer(
-        f"✅ Промокод `{escape_md(code)}` успешно создан!\n\n"
-        f"💰 Бонус: `{float(amount):.2f} грн`\n"
-        f"🔢 Активаций: `{uses}`",
+        result_text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎟 Все промокоды", callback_data="admin_promo_list")],
             [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
@@ -3088,12 +3345,11 @@ async def admin_promo_list_handler(callback: CallbackQuery, session: AsyncSessio
     per_page = 8
     offset = page * per_page
 
-    total_res = await session.execute(select(func.count(PromoCode.id)))
-    total_promos = total_res.scalar() or 0
+    total_promos = await session.scalar(select(func.count(PromoCode.id))) or 0
 
     if total_promos == 0:
         await callback.message.edit_text(
-            "📋 **Список промокодов**\n\nПромокодов пока не создано.\n\nНажмите кнопку ниже, чтобы создать первый промокод.",
+            "📋 **Промокоды**\n\nПромокодов пока не создано.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo")],
                 [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
@@ -3103,39 +3359,138 @@ async def admin_promo_list_handler(callback: CallbackQuery, session: AsyncSessio
         await callback.answer()
         return
 
-    res = await session.execute(
-        select(PromoCode).order_by(PromoCode.id.desc()).offset(offset).limit(per_page)
+    usage_count = (
+        select(func.count(PromoCodeUsage.id))
+        .where(PromoCodeUsage.promo_id == PromoCode.id)
+        .correlate(PromoCode)
+        .scalar_subquery()
     )
-    promos = res.scalars().all()
+    result = await session.execute(
+        select(PromoCode, usage_count.label("used_count"), Software.name, Product.duration)
+        .outerjoin(Product, Product.id == PromoCode.product_id)
+        .outerjoin(Software, Software.id == Product.software_id)
+        .order_by(PromoCode.id.desc())
+        .offset(offset)
+        .limit(per_page)
+    )
+    rows = result.all()
 
-    text_msg = f"📋 **Список промокодов** (Страница {page + 1})\nВсего: `{total_promos}`\n━━━━━━━━━━━━━━━━━━━\n"
+    text_msg = f"📋 **Промокоды** — страница {page + 1}\nВсего: `{total_promos}`\n━━━━━━━━━━━━━━━━━━━\n"
     buttons = []
 
-    for p in promos:
+    for p, used_count, sw_name, duration in rows:
+        used_count = int(used_count or 0)
         status_icon = "🟢" if p.uses_left > 0 else "🔴"
-        text_msg += (
-            f"{status_icon} **ID {p.id}** | `{escape_md(p.code)}` | "
-            f"{p.amount:.2f} грн | осталось активаций: `{p.uses_left}`\n"
-        )
-        buttons.append([InlineKeyboardButton(text=f"🗑 Удалить «{p.code}»", callback_data=f"confirm_del_promo_{p.id}")])
+        if p.promo_type == "discount":
+            target = "все товары" if p.product_id is None else f"{sw_name or 'Товар'} • {duration or ''}"
+            text_msg += (
+                f"{status_icon} **{escape_md(p.code)}** — 💸 **{float(p.discount_percent or 0):.0f}%**\n"
+                f"📦 `{escape_md(target)}` · использовано: `{used_count}` · осталось: `{p.uses_left}`\n"
+            )
+        else:
+            distributed = used_count * float(p.amount)
+            text_msg += (
+                f"{status_icon} **{escape_md(p.code)}** — 💰 `{float(p.amount):.2f} грн`\n"
+                f"👥 использовано: `{used_count}` · осталось: `{p.uses_left}` · выдано: `{distributed:.2f} грн`\n"
+            )
+        buttons.append([
+            InlineKeyboardButton(text=f"📊 {p.code}", callback_data=f"admin_promo_stats_{p.id}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"confirm_del_promo_{p.id}"),
+        ])
 
     nav_buttons = []
     if page > 0:
         nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_promo_page_{page - 1}"))
     if offset + per_page < total_promos:
-        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"admin_promo_page_{page + 1}"))
+        nav_buttons.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"admin_promo_page_{page + 1}"))
     if nav_buttons:
         buttons.append(nav_buttons)
 
     buttons.append([InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo")])
     buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
 
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_promo_stats_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_stats_handler(callback: CallbackQuery, session: AsyncSession):
+    try:
+        promo_id = int(callback.data.split("_")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный промокод.", show_alert=True)
+        return
+
+    result = await session.execute(
+        select(PromoCode, Software.name, Product.duration)
+        .outerjoin(Product, Product.id == PromoCode.product_id)
+        .outerjoin(Software, Software.id == Product.software_id)
+        .where(PromoCode.id == promo_id)
+    )
+    row = result.first()
+    if not row:
+        await callback.answer("❌ Промокод не найден.", show_alert=True)
+        return
+    promo, sw_name, duration = row
+
+    total_used = int(await session.scalar(select(func.count(PromoCodeUsage.id)).where(PromoCodeUsage.promo_id == promo.id)) or 0)
+    total_discount = float(await session.scalar(
+        select(func.coalesce(func.sum(PromoCodeUsage.discount_amount), 0)).where(PromoCodeUsage.promo_id == promo.id)
+    ) or 0)
+
+    target_text = "все товары" if promo.product_id is None else f"{sw_name or 'Товар'} • {duration or ''}"
+
+    if promo.promo_type == "discount":
+        lines = [
+            "📊 **Статистика промокода**",
+            f"🎟 Код: `{escape_md(promo.code)}`",
+            f"💸 Скидка: **{float(promo.discount_percent or 0):.0f}%**",
+            f"📦 Действует: **{escape_md(target_text)}**",
+            f"👥 Использовано: `{total_used}`",
+            f"🟢 Осталось: `{promo.uses_left}`",
+            f"💸 Всего скидок выдано: `{total_discount:.2f} грн`",
+            "━━━━━━━━━━━━━━━━━━━",
+        ]
+    else:
+        total_bonus = total_used * float(promo.amount)
+        lines = [
+            "📊 **Статистика промокода**",
+            f"🎟 Код: `{escape_md(promo.code)}`",
+            f"💰 Бонус: `{float(promo.amount):.2f} грн`",
+            f"👥 Использовано: `{total_used}`",
+            f"🟢 Осталось: `{promo.uses_left}`",
+            f"📤 Выдано бонусов: `{total_bonus:.2f} грн`",
+            "━━━━━━━━━━━━━━━━━━━",
+        ]
+
+    recent_res = await session.execute(
+        select(PromoCodeUsage, User.username)
+        .outerjoin(User, User.id == PromoCodeUsage.user_id)
+        .where(PromoCodeUsage.promo_id == promo.id)
+        .order_by(PromoCodeUsage.used_at.desc())
+        .limit(10)
+    )
+    recent = recent_res.all()
+    if recent:
+        lines.append("👥 **Последние активации:**")
+        for usage, username in recent:
+            user_label = f"@{escape_md(username)}" if username else f"ID `{usage.user_id}`"
+            date_label = usage.used_at.strftime("%d.%m.%Y %H:%M") if usage.used_at else "—"
+            extra = f" · скидка `-{usage.discount_amount:.2f} грн`" if promo.promo_type == "discount" and usage.discount_amount is not None else ""
+            lines.append(f"• {user_label} · `{date_label}`{extra}")
+    else:
+        lines.append("👥 Использований пока нет.")
+
     await callback.message.edit_text(
-        text_msg,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Удалить промокод", callback_data=f"confirm_del_promo_{promo.id}")],
+            [InlineKeyboardButton(text="🔙 К списку промокодов", callback_data="admin_promo_list")],
+        ]),
         parse_mode="Markdown"
     )
     await callback.answer()
+
 
 @router.callback_query(F.data.startswith("confirm_del_promo_"), F.from_user.id.in_(ADMIN_IDS))
 async def confirm_delete_promo(callback: CallbackQuery, session: AsyncSession):
@@ -3149,11 +3504,15 @@ async def confirm_delete_promo(callback: CallbackQuery, session: AsyncSession):
         [InlineKeyboardButton(text="✅ Да, удалить промокод", callback_data=f"do_del_promo_{promo_id}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_promo_list")]
     ])
+    if promo.promo_type == "discount":
+        promo_desc = f"скидка {float(promo.discount_percent or 0):.0f}%"
+    else:
+        promo_desc = f"бонус {float(promo.amount):.2f} грн"
+
     await callback.message.edit_text(
         f"⚠️ **Подтверждение удаления**\n\n"
-        f"Удалить промокод `{escape_md(promo.code)}` (`{promo.amount:.2f} грн`, "
-        f"осталось активаций: `{promo.uses_left}`)?\n\n"
-        f"*История уже совершённых активаций сохранится в логах баланса.*",
+        f"Удалить промокод `{escape_md(promo.code)}` ({promo_desc}, осталось активаций: `{promo.uses_left}`)?\n\n"
+        f"*История совершённых активаций сохранится в журнале покупок/баланса.*",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -3935,6 +4294,13 @@ async def detach_product_references(session: AsyncSession, product_ids: list[int
     await session.execute(
         update(Review).where(Review.product_id.in_(product_ids)).values(product_id=None)
     )
+    # Скидочный промокод, привязанный к удаляемому тарифу, нельзя превращать
+    # в глобальный. Отключаем его (uses_left=0) и только потом отвязываем.
+    await session.execute(
+        update(PromoCode)
+        .where(PromoCode.product_id.in_(product_ids))
+        .values(product_id=None, uses_left=0)
+    )
 
 @router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
@@ -4542,6 +4908,34 @@ async def run_migrations() -> None:
         logger.info("Миграция: product_id/price_paid и review links добавлены.")
     except Exception as e:
         logger.warning(f"Миграция purchase/review metadata не выполнена: {e}")
+
+    # Миграция расширенной системы промокодов.
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS promo_type VARCHAR(20) NOT NULL DEFAULT 'balance'"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS discount_percent DOUBLE PRECISION"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE promo_codes ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE promo_code_usages ADD COLUMN IF NOT EXISTS discount_amount DOUBLE PRECISION"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE promo_code_usages ADD COLUMN IF NOT EXISTS final_price DOUBLE PRECISION"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_promo_codes_product ON promo_codes(product_id)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS promo_usages_promo_user_uniq ON promo_code_usages(promo_id, user_id)"
+            ))
+        logger.info("Миграция: скидочные промокоды и привязка к товарам добавлены.")
+    except Exception as e:
+        logger.warning(f"Миграция промокодов не выполнена: {e}")
 
     # Backfill старых покупок: по историческому имени и сроку восстанавливаем
     # product_id и цену, чтобы профиль и статистика работали и для старых продаж.
