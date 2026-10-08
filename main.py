@@ -3093,8 +3093,11 @@ async def admin_promo_list_handler(callback: CallbackQuery, session: AsyncSessio
 
     if total_promos == 0:
         await callback.message.edit_text(
-            "📋 **Список промокодов**\n\nПромокодов пока не создано.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            "📋 **Список промокодов**\n\nПромокодов пока не создано.\n\nНажмите кнопку ниже, чтобы создать первый промокод.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo")],
+                [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+            ]),
             parse_mode="Markdown"
         )
         await callback.answer()
