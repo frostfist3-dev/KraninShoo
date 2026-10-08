@@ -32,7 +32,7 @@ from sqlalchemy import (
     text,
     update,
 )
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 
@@ -102,9 +102,16 @@ PORT = int(os.getenv("PORT", "10000"))
 
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///bot.db"
-    engine = create_async_engine(DATABASE_URL, echo=False)
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+    )
 else:
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
+    DATABASE_URL = (
+        DATABASE_URL
+        .replace("postgres://", "postgresql+asyncpg://")
+        .replace("postgresql://", "postgresql+asyncpg://")
+    )
     if "?" in DATABASE_URL:
         DATABASE_URL = DATABASE_URL.split("?")[0]
 
@@ -112,10 +119,17 @@ else:
     if any(domain in DATABASE_URL for domain in ["oregon-postgres", "frankfurt-postgres", "render.com"]):
         connect_args = {"ssl": "require"}
 
+    # PostgreSQL connections can be closed by the provider while the bot is idle.
+    # pre_ping checks a pooled connection before reusing it, and recycle prevents
+    # very old connections from living in the pool indefinitely.
     engine = create_async_engine(
         DATABASE_URL,
         echo=False,
-        connect_args=connect_args
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_recycle=1200,
+        pool_size=5,
+        max_overflow=10,
     )
 
 # Реквизиты можно переопределить переменной окружения PAYMENT_CARDS
@@ -321,6 +335,22 @@ def parse_positive_amount(raw_text: str, max_amount: float = MAX_AMOUNT) -> floa
         return None
     # Округляем до копеек, чтобы не плодить "грязные" значения из-за float
     return round(value, 2)
+
+
+def normalize_promo_code(value: str) -> str | None:
+    """Нормализует промокод перед сохранением и активацией."""
+    if value is None:
+        return None
+    value = value.strip().upper()
+    if not value:
+        return None
+    if len(value) > MAX_PROMO_CODE_LENGTH:
+        return None
+    # Разрешаем только удобные для Telegram промокоды без пробелов:
+    # латиница, цифры, дефис и подчёркивание.
+    if not re.fullmatch(r"[A-Z0-9_-]+", value):
+        return None
+    return value
 
 
 def normalize_duration(value: str) -> str:
@@ -899,7 +929,14 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
     if not message.text:
         await message.answer("❌ Отправьте промокод текстом.", reply_markup=cancel_kb("main_menu"))
         return
-    code_text = message.text.strip()
+    code_text = normalize_promo_code(message.text)
+    if not code_text:
+        await message.answer(
+            f"❌ Некорректный промокод. Используйте латинские буквы, цифры, `-` и `_`, максимум {MAX_PROMO_CODE_LENGTH} символов.",
+            reply_markup=cancel_kb("main_menu"),
+            parse_mode="Markdown"
+        )
+        return
 
     # ФИКС: используем блокировку строки промокода, чтобы два одновременных
     # использования не смогли оба пройти проверку uses_left > 0.
@@ -2880,32 +2917,44 @@ async def admin_delete_review(callback: CallbackQuery, session: AsyncSession):
 async def admin_create_promo_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_promo_code)
     await callback.message.edit_text(
-        "🎟 **Создание промокода (1/3)**\n\nВведите текстовый код промокода (например: `START2026`):",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        "🎟 **Создание промокода (1/3)**\n\n"
+        "Введите код промокода. Разрешены латинские буквы, цифры, `-` и `_`.\n"
+        f"Максимум {MAX_PROMO_CODE_LENGTH} символов, например: `START2026`.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]
+        ]),
         parse_mode="Markdown"
     )
     await callback.answer()
+
 
 @router.message(AdminStates.waiting_for_promo_code, F.from_user.id.in_(ADMIN_IDS))
 async def admin_promo_code_entered(message: Message, state: FSMContext, session: AsyncSession):
     if not message.text:
         await message.answer("❌ Введите текст промокода.")
         return
-    code = message.text.strip()
 
-    if len(code) > MAX_PROMO_CODE_LENGTH:
+    code = normalize_promo_code(message.text)
+    if not code:
         await message.answer(
-            f"❌ Код слишком длинный ({len(code)} символов). Максимум — {MAX_PROMO_CODE_LENGTH}. Введите другой:",
-            reply_markup=cancel_kb("admin_panel")
+            f"❌ Некорректный код. Используйте латинские буквы, цифры, `-` и `_`, максимум {MAX_PROMO_CODE_LENGTH} символов.\n"
+            "Пример: `START2026`.",
+            reply_markup=cancel_kb("admin_panel"),
+            parse_mode="Markdown"
         )
         return
 
-    # ФИКС: проверяем уникальность кода заранее, чтобы дать админу понятную ошибку,
-    # а не падать с необработанным IntegrityError на последнем шаге.
-    existing = await session.execute(select(PromoCode).filter_by(code=code))
-    if existing.scalars().first():
+    try:
+        existing = await session.scalar(select(PromoCode).where(func.upper(PromoCode.code) == code))
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.exception("Ошибка проверки уникальности промокода", exc_info=e)
+        await message.answer("⚠️ База данных временно недоступна. Попробуйте создать промокод ещё раз.")
+        return
+
+    if existing:
         await message.answer(
-            f"❌ Промокод `{escape_md(code)}` уже существует. Введите другой код:",
+            f"❌ Промокод `{escape_md(code)}` уже существует. Введите другой:",
             reply_markup=cancel_kb("admin_panel"),
             parse_mode="Markdown"
         )
@@ -2913,52 +2962,120 @@ async def admin_promo_code_entered(message: Message, state: FSMContext, session:
 
     await state.update_data(code=code)
     await state.set_state(AdminStates.waiting_for_promo_amount)
-    await message.answer("🎟 **Создание промокода (2/3)**\n\nВведите бонусную сумму в гривнах (число):", reply_markup=cancel_kb("admin_panel"))
+    await message.answer(
+        "🎟 **Создание промокода (2/3)**\n\n"
+        "Введите сумму бонуса в гривнах. Например: `100` или `25.50`.",
+        reply_markup=cancel_kb("admin_panel"),
+        parse_mode="Markdown"
+    )
+
 
 @router.message(AdminStates.waiting_for_promo_amount, F.from_user.id.in_(ADMIN_IDS))
 async def admin_promo_amount_entered(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Введите сумму числом.")
+        return
+
     amount = parse_positive_amount(message.text)
     if amount is None:
-        await message.answer("❌ Введите корректное положительное число для суммы.")
+        await message.answer(
+            f"❌ Некорректная сумма. Введите положительное число не больше {MAX_AMOUNT:.0f} грн.",
+            reply_markup=cancel_kb("admin_panel")
+        )
         return
+
     await state.update_data(amount=amount)
     await state.set_state(AdminStates.waiting_for_promo_uses)
-    await message.answer("🎟 **Создание промокода (3/3)**\n\nВведите максимальное количество активаций (число):", reply_markup=cancel_kb("admin_panel"))
+    await message.answer(
+        "🎟 **Создание промокода (3/3)**\n\n"
+        "Введите максимальное количество активаций, например `100`.",
+        reply_markup=cancel_kb("admin_panel")
+    )
+
 
 @router.message(AdminStates.waiting_for_promo_uses, F.from_user.id.in_(ADMIN_IDS))
 async def admin_promo_uses_entered(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text or not message.text.strip().lstrip("-").isdigit():
-        await message.answer("❌ Введите целое число для активаций.")
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer(
+            "❌ Введите целое положительное число активаций, например `100`.",
+            reply_markup=cancel_kb("admin_panel")
+        )
         return
+
     uses = int(message.text.strip())
-    if uses <= 0:
-        await message.answer("❌ Количество активаций должно быть больше нуля.")
+    if uses <= 0 or uses > 1_000_000:
+        await message.answer(
+            "❌ Количество активаций должно быть от 1 до 1 000 000.",
+            reply_markup=cancel_kb("admin_panel")
+        )
         return
 
     data = await state.get_data()
-    code = data.get("code")
+    code = normalize_promo_code(data.get("code"))
     amount = data.get("amount")
 
+    if not code or amount is None:
+        await state.clear()
+        await message.answer("⚠️ Сессия создания промокода устарела. Откройте создание промокода заново.")
+        return
+
     try:
-        promo = PromoCode(code=code, amount=amount, uses_left=uses)
+        # Повторно проверяем код прямо перед INSERT: между шагами другой админ
+        # или другой процесс мог создать такой же код.
+        existing = await session.scalar(select(PromoCode).where(func.upper(PromoCode.code) == code))
+        if existing:
+            await message.answer(
+                f"❌ Промокод `{escape_md(code)}` уже существует. Создайте другой.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
+                    [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+                ]),
+                parse_mode="Markdown"
+            )
+            await state.clear()
+            return
+
+        promo = PromoCode(code=code, amount=float(amount), uses_left=uses)
         session.add(promo)
         await session.commit()
+
     except IntegrityError:
         await session.rollback()
         await message.answer(
-            f"❌ Промокод `{escape_md(code)}` уже существует (создан параллельно). Начните заново.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            f"❌ Промокод `{escape_md(code)}` уже существует. Создайте другой.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
+                [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+            ]),
             parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+    except SQLAlchemyError as e:
+        await session.rollback()
+        logger.exception("Ошибка создания промокода", exc_info=e)
+        await message.answer(
+            "⚠️ Не удалось сохранить промокод в базе данных. Попробуйте ещё раз.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎟 Создать заново", callback_data="admin_create_promo")],
+                [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+            ])
         )
         await state.clear()
         return
 
     await state.clear()
     await message.answer(
-        f"✅ Промокод `{escape_md(code)}` на `{amount:.2f} грн` (активаций: `{uses}`) успешно создан!",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        f"✅ Промокод `{escape_md(code)}` успешно создан!\n\n"
+        f"💰 Бонус: `{float(amount):.2f} грн`\n"
+        f"🔢 Активаций: `{uses}`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎟 Все промокоды", callback_data="admin_promo_list")],
+            [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")],
+        ]),
         parse_mode="Markdown"
     )
+
 
 # --- СПИСОК И УДАЛЕНИЕ ПРОМОКОДОВ ---
 @router.callback_query(F.data == "admin_promo_list", F.from_user.id.in_(ADMIN_IDS))
@@ -4532,6 +4649,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
+        await engine.dispose()
 
 
 if __name__ == "__main__":
