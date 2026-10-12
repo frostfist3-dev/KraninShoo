@@ -761,13 +761,16 @@ async def get_product_label_map(session: AsyncSession) -> dict[int, str]:
 
 
 async def get_software_back_callback(session: AsyncSession, software: "Software | None") -> str:
-    """Правильный маршрут назад для обычной платформы и игры без выбора ОС."""
+    """Возврат из тарифов: к выбору ОС для игры или сразу в общий каталог."""
     if not software:
         return "shop"
     platform = await session.get(Platform, software.platform_id)
-    if platform and platform.name == NO_OS_PLATFORM_NAME:
-        return "shop"
-    return f"platform_{software.platform_id}"
+    platform_name = (platform.name if platform else "").strip().casefold()
+    if "android" in platform_name or "ios" in platform_name:
+        # Возвращаем к выбранной игре, а не в список всех игр одной ОС.
+        return f"game_{software.id}"
+    # Для игр с пропуском ОС и прочих специальных товаров выбор ОС не нужен.
+    return "shop"
 
 
 async def resolve_user_purchased_product(session: AsyncSession, user_id: int, product_id: int):
@@ -1517,51 +1520,51 @@ async def profile_balance_history(callback: CallbackQuery, session: AsyncSession
 # ==========================================
 @router.callback_query(F.data == "shop")
 async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
-    # Игры без ОС показываются прямо в каталоге, остальные — через платформы.
+    """Главный каталог: сначала показываем игры, а ОС — после выбора игры."""
     await state.clear()
-    result = await session.execute(select(Platform).order_by(Platform.id.asc()))
-    platforms = result.scalars().all()
-    no_os_platform = next((p for p in platforms if p.name == NO_OS_PLATFORM_NAME), None)
+    result = await session.execute(
+        select(Software, Platform.name)
+        .join(Platform, Software.platform_id == Platform.id)
+        .order_by(Software.name.asc(), Software.id.asc())
+    )
+    rows = result.all()
+
+    # Объединяем записи с одинаковым названием. Например, PUBG MOBILE,
+    # добавленный администратором отдельно для Android и iOS, показывается
+    # в каталоге одной игрой, а платформы выбираются следующим шагом.
+    grouped: dict[str, Software] = {}
+    for software, _platform_name in rows:
+        key = (software.name or "").strip().casefold()
+        if key and key not in grouped:
+            grouped[key] = software
 
     text_msg = (
         "🛍 **МАГАЗИН ЛИЦЕНЗИЙ**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "🎮 Выберите игру или раздел каталога:"
+        "🎮 Сначала выберите игру:"
     )
     buttons = []
-    if no_os_platform:
-        games_res = await session.execute(
-            select(Software).where(Software.platform_id == no_os_platform.id)
-            .order_by(Software.name.asc(), Software.id.asc())
-        )
-        no_os_games = games_res.scalars().all()
-        if no_os_games:
-            buttons.append([InlineKeyboardButton(text="🎮 Игры без выбора ОС", callback_data="noop")])
-            for game in no_os_games:
-                buttons.append([InlineKeyboardButton(text=f"🎮 {game.name}", callback_data=f"software_{game.id}")])
+    for software in sorted(grouped.values(), key=lambda item: ((item.name or "").casefold(), item.id)):
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🎮 {software.name}",
+                callback_data=f"game_{software.id}",
+            )
+        ])
 
-    visible_platforms = [p for p in platforms if p.name != NO_OS_PLATFORM_NAME]
-    if visible_platforms and any(p.name == NO_OS_PLATFORM_NAME for p in platforms) and buttons:
-        buttons.append([InlineKeyboardButton(text="📱 Игры по платформам", callback_data="noop")])
-
-    for platform in visible_platforms:
-        if platform.name == NO_OS_PLATFORM_NAME:
-            continue
-        lower_name = platform.name.lower()
-        if "android" in lower_name:
-            icon = "🤖"
-        elif "ios" in lower_name:
-            icon = "🍏"
-        elif "аккаунт" in lower_name:
-            icon = "🎮"
-        else:
-            icon = "📦"
-        buttons.append([InlineKeyboardButton(text=f"{icon} {platform.name}", callback_data=f"platform_{platform.id}")])
-
+    if not buttons:
+        text_msg += "\n\nПока игры не добавлены."
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
-    await callback.message.edit_text(
-        text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown"
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            await callback.message.answer(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     await callback.answer()
 
 @router.callback_query(F.data.startswith("platform_"))
@@ -1589,6 +1592,86 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession, bot: Bo
 
     await safe_edit_text(callback, bot, text_msg, keyboard)
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^game_[0-9]+$"))
+async def show_game_platforms(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    """После выбора игры показываем её доступные ОС; для NO_OS сразу открываем игру."""
+    try:
+        software_id = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректная игра.", show_alert=True)
+        return
+
+    selected = await session.get(Software, software_id)
+    if not selected:
+        await callback.answer("❌ Игра не найдена.", show_alert=True)
+        return
+
+    variants_result = await session.execute(
+        select(Software, Platform)
+        .join(Platform, Software.platform_id == Platform.id)
+        .where(func.lower(func.trim(Software.name)) == selected.name.strip().lower())
+        .order_by(Software.id.asc())
+    )
+    variants = variants_result.all()
+
+    os_variants = []
+    seen_platforms = set()
+    for software, platform in variants:
+        platform_name = (platform.name or "").strip().casefold()
+        if "android" in platform_name:
+            os_key = "android"
+        elif "ios" in platform_name:
+            os_key = "ios"
+        else:
+            continue
+        # Если администратор случайно добавил одинаковое название для одной
+        # ОС несколько раз, не дублируем одинаковую кнопку выбора.
+        if os_key in seen_platforms:
+            continue
+        seen_platforms.add(os_key)
+        os_variants.append((software, os_key))
+
+    if not os_variants:
+        # Для служебной категории __NO_OS__ (и специальных товаров, не
+        # относящихся к Android/iOS) вопрос об ОС полностью пропускается.
+        await _show_products_for_software_id(callback, session, bot, selected.id)
+        return
+
+    buttons = []
+    for software, os_key in os_variants:
+        if os_key == "android":
+            label = "🤖 Android"
+        else:
+            label = "🍏 iOS"
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"software_{software.id}")
+        ])
+    buttons.append([InlineKeyboardButton(text="🔙 К списку игр", callback_data="shop")])
+
+    text_msg = (
+        f"🎮 **{escape_md(selected.name)}**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "📱 Теперь выберите операционную систему:"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
+            await bot.send_message(
+                callback.message.chat.id,
+                text_msg,
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+    await callback.answer()
+
 
 async def _render_software_screen(
     callback: CallbackQuery, bot: Bot, software: "Software", text_msg: str, keyboard: InlineKeyboardMarkup
@@ -1627,7 +1710,17 @@ async def _render_software_screen(
 
 @router.callback_query(F.data.startswith("software_"))
 async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot):
-    software_id = int(callback.data.split("_")[1])
+    try:
+        software_id = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный товар.", show_alert=True)
+        return
+    await _show_products_for_software_id(callback, session, bot, software_id)
+
+
+async def _show_products_for_software_id(
+    callback: CallbackQuery, session: AsyncSession, bot: Bot, software_id: int
+):
     software = await session.get(Software, software_id)
     if not software:
         await callback.answer("❌ Софт не найден!", show_alert=True)
@@ -4055,16 +4148,24 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext, ses
 # --- ФОТО / ОПИСАНИЕ СОФТА ---
 @router.callback_query(F.data == "admin_sw_media_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_sw_media_select(callback: CallbackQuery, session: AsyncSession):
-    res = await session.execute(select(Software))
-    softwares = res.scalars().all()
-    if not softwares:
+    res = await session.execute(
+        select(Software, Platform.name)
+        .join(Platform, Software.platform_id == Platform.id)
+        .order_by(Software.name.asc(), Software.id.asc())
+    )
+    software_rows = res.all()
+    if not software_rows:
         await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
         return
 
     buttons = []
-    for sw in softwares:
+    for sw, platform_name in software_rows:
         mark = "🖼" if sw.photo_file_id else "🛡"
-        buttons.append([InlineKeyboardButton(text=f"{mark} {sw.name}", callback_data=f"sw_media_sel_{sw.id}")])
+        platform_label = "без ОС" if platform_name == NO_OS_PLATFORM_NAME else platform_name
+        buttons.append([InlineKeyboardButton(
+            text=f"{mark} {sw.name} · {platform_label}",
+            callback_data=f"sw_media_sel_{sw.id}"
+        )])
     buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
 
     await callback.message.edit_text(
@@ -4239,15 +4340,23 @@ async def admin_topup_accounts_select(callback: CallbackQuery, session: AsyncSes
 
 @router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
 async def admin_add_prod_select_sw(callback: CallbackQuery, session: AsyncSession):
-    res = await session.execute(select(Software))
-    softwares = res.scalars().all()
-    if not softwares:
+    res = await session.execute(
+        select(Software, Platform.name)
+        .join(Platform, Software.platform_id == Platform.id)
+        .order_by(Software.name.asc(), Software.id.asc())
+    )
+    software_rows = res.all()
+    if not software_rows:
         await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
         return
 
     buttons = []
-    for sw in softwares:
-        buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"prod_sw_sel_{sw.id}")])
+    for sw, platform_name in software_rows:
+        platform_label = "без ОС" if platform_name == NO_OS_PLATFORM_NAME else platform_name
+        buttons.append([InlineKeyboardButton(
+            text=f"🛡 {sw.name} · {platform_label}",
+            callback_data=f"prod_sw_sel_{sw.id}"
+        )])
     buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
 
     await callback.message.edit_text(
