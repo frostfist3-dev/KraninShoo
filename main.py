@@ -1534,10 +1534,17 @@ async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: 
             select(Software).where(Software.platform_id == no_os_platform.id)
             .order_by(Software.name.asc(), Software.id.asc())
         )
-        for game in games_res.scalars().all():
-            buttons.append([InlineKeyboardButton(text=f"🎮 {game.name}", callback_data=f"software_{game.id}")])
+        no_os_games = games_res.scalars().all()
+        if no_os_games:
+            buttons.append([InlineKeyboardButton(text="🎮 Игры без выбора ОС", callback_data="noop")])
+            for game in no_os_games:
+                buttons.append([InlineKeyboardButton(text=f"🎮 {game.name}", callback_data=f"software_{game.id}")])
 
-    for platform in platforms:
+    visible_platforms = [p for p in platforms if p.name != NO_OS_PLATFORM_NAME]
+    if visible_platforms and any(p.name == NO_OS_PLATFORM_NAME for p in platforms) and buttons:
+        buttons.append([InlineKeyboardButton(text="📱 Игры по платформам", callback_data="noop")])
+
+    for platform in visible_platforms:
         if platform.name == NO_OS_PLATFORM_NAME:
             continue
         lower_name = platform.name.lower()
@@ -2729,7 +2736,7 @@ async def admin_catalog_menu(callback: CallbackQuery, session: AsyncSession):
         f"🔑 В наличии: `{stock}`"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw"), InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
+        [InlineKeyboardButton(text="➕ Добавить игру", callback_data="admin_add_sw"), InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
         [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"), InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
         [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"), InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
         [InlineKeyboardButton(text="📊 Склад по тарифам", callback_data="admin_stock")],
@@ -3964,8 +3971,12 @@ async def save_software_name(message: Message, state: FSMContext):
     ]
     await message.answer(
         f"🎮 Игра: **{escape_md(name)}**\n\n"
-        "➕ **Добавление игры (шаг 2/2)**\n"
-        "Выберите ОС. При пропуске игра появится сразу в каталоге, и покупателю не нужно будет выбирать Android/iOS.",
+        "➕ **Добавление игры — шаг 2 из 2**\n"
+        "Куда добавить игру?\n"
+        "• Android — в раздел Android;\n"
+        "• iOS — в раздел iOS;\n"
+        "• Пропустить ОС — игра появится отдельной кнопкой прямо в общем каталоге. "
+        "У покупателя вопрос про ОС не появится.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
         parse_mode="Markdown",
     )
@@ -3993,6 +4004,19 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext, ses
         return
 
     platform = await session.scalar(select(Platform).where(Platform.name == platform_name))
+    # Для варианта «Пропустить» создаём служебную платформу прямо здесь,
+    # если seed_platforms ещё не успел её добавить в существующую БД.
+    if platform is None and choice == "skip":
+        platform = Platform(name=NO_OS_PLATFORM_NAME)
+        session.add(platform)
+        try:
+            await session.flush()
+        except IntegrityError:
+            # Параллельное добавление могло создать её между SELECT и INSERT.
+            await session.rollback()
+            platform = await session.scalar(
+                select(Platform).where(Platform.name == NO_OS_PLATFORM_NAME)
+            )
     if not platform:
         await callback.answer("❌ Раздел не найден. Перезапустите бота и попробуйте снова.", show_alert=True)
         logger.error("Не найдена платформа %r при добавлении игры %r", platform_name, name)
@@ -4006,7 +4030,10 @@ async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext, ses
         await state.clear()
 
         if choice == "skip":
-            placement = "✅ ОС пропущена — игра будет показана прямо в каталоге без выбора ОС."
+            placement = (
+                "⏭ ОС пропущена. Игра размещена прямо в общем каталоге; "
+                "покупателям не нужно выбирать Android/iOS."
+            )
         else:
             placement = f"📱 Платформа: **{escape_md(platform.name)}**"
 
