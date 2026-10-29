@@ -1,21 +1,42 @@
+"""KRANIN SHOP — production-ready Telegram-магазин цифровых товаров.
+
+Версия 3.0: безопасные денежные операции, устойчивые FSM-сессии,
+пагинация длинных списков, расширенная диагностика и обновлённый UI.
+"""
+
 import asyncio
+import csv
+import io
 import logging
 import math
 import os
 import random
 import re
+import secrets
 import time
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from urllib.parse import urlparse
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from aiogram.types import (
+    BotCommand,
+    BufferedInputFile,
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -45,13 +66,49 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT")
-REVIEWS_CHANNEL_URL = os.getenv("REVIEWS_CHANNEL_URL", "https://t.me/KRANIN_REVIEWS")
+APP_VERSION = "3.0.0"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT").strip().lstrip("@")
+REVIEWS_CHANNEL_URL = os.getenv("REVIEWS_CHANNEL_URL", "https://t.me/KRANIN_REVIEWS").strip()
+WELCOME_PHOTO_FILE_ID = os.getenv("WELCOME_PHOTO_FILE_ID", "").strip() or None
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
+
+def env_int(name: str, default: int, minimum: int = 0, maximum: int = 1_000_000) -> int:
+    """Читает целую настройку без падения всего процесса из-за опечатки."""
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        logger.warning("Некорректное %s; используется значение %s", name, default)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning("%s вне диапазона %s…%s; используется %s", name, minimum, maximum, default)
+        return default
+    return value
+
+
+def env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 1_000_000.0) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        logger.warning("Некорректное %s; используется значение %s", name, default)
+        return default
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        logger.warning("%s вне допустимого диапазона; используется %s", name, default)
+        return default
+    return value
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on", "y"}
+
 
 raw_admin_ids = os.getenv("ADMIN_IDS", "8479717148")
-ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()]
+ADMIN_IDS = sorted({int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()})
 # НОВОЕ: диагностика — os.getenv возвращает дефолт ТОЛЬКО если переменная
 # окружения полностью не задана. Если ADMIN_IDS на Render задан, но пустой
 # или содержит нечисловой мусор (пробелы, лишние запятые и т.п.), список
@@ -69,18 +126,17 @@ if not ADMIN_IDS:
 
 # Разумные пределы для финансовых сумм, чтобы отсечь inf/nan/переполнения
 MAX_AMOUNT = 1_000_000.0
-MIN_WITHDRAWAL = 500.0
-MIN_DEPOSIT = float(os.getenv("MIN_DEPOSIT", "20"))
+MIN_WITHDRAWAL = env_float("MIN_WITHDRAWAL", 500.0, 1.0, MAX_AMOUNT)
+MIN_DEPOSIT = env_float("MIN_DEPOSIT", 20.0, 1.0, MAX_AMOUNT)
+REFERRAL_PERCENT = env_float("REFERRAL_PERCENT", 5.0, 0.0, 100.0)
+DROP_PENDING_UPDATES = env_bool("DROP_PENDING_UPDATES", False)
 
 # Сколько заявок на пополнение в статусе "pending" может одновременно
-# висеть у одного пользователя, прежде чем он сможет создать новую
-MAX_PENDING_DEPOSITS = int(os.getenv("MAX_PENDING_DEPOSITS", "3"))
-
-# НОВОЕ: порог остатка ключей, при пересечении которого админам приходит
-# уведомление "товар заканчивается". Срабатывает ровно один раз при
-# достижении этого количества (а не на каждой продаже ниже порога),
-# плюс отдельное уведомление при полном обнулении остатка.
-LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "3"))
+# висеть у одного пользователя, прежде чем он сможет создать новую.
+MAX_PENDING_DEPOSITS = env_int("MAX_PENDING_DEPOSITS", 3, 1, 20)
+LOW_STOCK_THRESHOLD = env_int("LOW_STOCK_THRESHOLD", 3, 0, 100_000)
+CATALOG_PAGE_SIZE = env_int("CATALOG_PAGE_SIZE", 8, 4, 12)
+HISTORY_PAGE_SIZE = env_int("HISTORY_PAGE_SIZE", 5, 3, 8)
 
 # НОВОЕ: колесо фортуны после покупки — вероятности и призы
 WHEEL_KEY_CHANCE = 0.05       # 5% — ключ на 1 день любого софта
@@ -98,7 +154,7 @@ MAX_DURATION_LENGTH = 50
 
 # Порт для HTTP-заглушки: Render Free Web Service требует, чтобы процесс
 # слушал $PORT, иначе деплой считается "упавшим" и уходит в бесконечный рестарт
-PORT = int(os.getenv("PORT", "10000"))
+PORT = env_int("PORT", 10000, 1, 65535)
 
 if not DATABASE_URL:
     DATABASE_URL = "sqlite+aiosqlite:///bot.db"
@@ -143,6 +199,10 @@ CARDS = [c.strip() for c in os.getenv("PAYMENT_CARDS", "").split(";") if c.strip
 
 PERMANENT_DURATION = "Навсегда"
 DURATIONS = ["1 день", "7 дней", "30 дней", PERMANENT_DURATION]
+DURATION_SORT_ORDER = {duration: index for index, duration in enumerate(DURATIONS)}
+TELEGRAM_TEXT_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_MAX_BUTTONS = 100
 
 # Служебная категория для игр, которым не нужен выбор ОС покупателем.
 NO_OS_PLATFORM_NAME = "__NO_OS__"
@@ -282,35 +342,50 @@ _background_tasks: set = set()
 
 
 def spawn_background(coro) -> None:
-    # Держим ссылку на задачу, иначе её может собрать GC до завершения
+    """Запускает фоновую работу с удержанием ссылки и логированием результата."""
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def on_done(completed: asyncio.Task) -> None:
+        _background_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error:
+            logger.error(
+                "Фоновая задача завершилась с ошибкой",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(on_done)
 
 
 async def safe_edit_text(
-    callback: CallbackQuery, bot: Bot, text_msg: str, keyboard: InlineKeyboardMarkup, parse_mode: str = "Markdown"
+    callback: CallbackQuery,
+    bot: Bot,
+    text_msg: str,
+    keyboard: InlineKeyboardMarkup | None,
+    parse_mode: str = "Markdown",
 ) -> None:
-    # НОВОЕ: после экрана софта с фото сообщение является фото-сообщением, и
-    # обычный edit_text у него упадёт ("there is no text in the message to
-    # edit"). Эта обёртка ловит такой случай и вместо правки шлёт новое
-    # текстовое сообщение — используется на всех переходах, которые могут
-    # быть первым шагом сразу после экрана с фото.
+    """Безопасно меняет текстовый и медиа-экран, соблюдая лимиты Telegram."""
+    text_msg = clip_text(text_msg)
     try:
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode=parse_mode)
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             return
-        try:
+        with suppress(Exception):
             await callback.message.delete()
-        except Exception:
-            pass
         try:
             await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=parse_mode)
         except TelegramBadRequest:
-            # последняя страховка: битая Markdown-разметка не должна лишать
-            # пользователя сообщения (например, с купленным ключом)
-            await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=None)
+            logger.exception("Не удалось отправить экран с Markdown; повторяю без разметки")
+            plain_text = re.sub(r"\\([\\_*`\[])", r"\1", text_msg)
+            plain_text = plain_text.replace("**", "").replace("`", "")
+            await bot.send_message(callback.message.chat.id, plain_text, reply_markup=keyboard, parse_mode=None)
 
 
 def user_display(message_or_callback) -> str:
@@ -322,22 +397,85 @@ def user_display(message_or_callback) -> str:
 
 
 def parse_positive_amount(raw_text: str, max_amount: float = MAX_AMOUNT) -> float | None:
-    # Безопасный парсинг положительной денежной суммы из текста.
-    # Возвращает None, если значение некорректно (не число, <= 0, inf/nan, слишком большое).
+    """Парсит сумму через Decimal: без NaN/inf и с корректным округлением копеек."""
     if raw_text is None:
         return None
+    normalized = raw_text.strip().replace(" ", "").replace(",", ".")
+    if not normalized or len(normalized) > 40:
+        return None
     try:
-        value = float(raw_text.strip().replace(",", "."))
-    except ValueError:
+        value = Decimal(normalized)
+    except (InvalidOperation, ValueError):
         return None
-    if not math.isfinite(value):
+    if not value.is_finite() or value <= 0 or value > Decimal(str(max_amount)):
         return None
-    if value <= 0:
+    value = value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(value) if value > 0 else None
+
+
+def round_money(value) -> float:
+    """Единое округление денег во всех финансовых операциях."""
+    try:
+        decimal_value = Decimal(str(value))
+        if not decimal_value.is_finite():
+            return 0.0
+        return float(decimal_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError):
+        return 0.0
+
+
+def clip_text(value: str, limit: int = TELEGRAM_TEXT_LIMIT) -> str:
+    """Не даёт тексту выйти за лимит Telegram и не обрезает его без предупреждения."""
+    value = value or ""
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 32)].rstrip() + "\n\n… Список сокращён."
+
+
+def normalize_web_url(value: str, max_length: int = 500) -> str | None:
+    """Разрешает только обычные HTTP(S)-ссылки, безопасные для inline-кнопок."""
+    candidate = (value or "").strip()
+    if not candidate or len(candidate) > max_length:
         return None
-    if value > max_amount:
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    # Округляем до копеек, чтобы не плодить "грязные" значения из-за float
-    return round(value, 2)
+    if parsed.username or parsed.password:
+        return None
+    return candidate
+
+
+def format_dt(value: datetime | None, with_time: bool = True) -> str:
+    if not value:
+        return "—"
+    return value.strftime("%d.%m.%Y %H:%M" if with_time else "%d.%m.%Y")
+
+
+def page_bounds(total: int, page: int, per_page: int) -> tuple[int, int, int]:
+    total_pages = max(1, math.ceil(max(0, total) / per_page))
+    page = max(0, min(page, total_pages - 1))
+    return page, total_pages, page * per_page
+
+
+def pagination_row(callback_prefix: str, page: int, total_pages: int) -> list[InlineKeyboardButton]:
+    """Единая навигация; prefix получает номер страницы последним аргументом."""
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="‹ Назад", callback_data=f"{callback_prefix}{page - 1}"))
+    if total_pages > 1:
+        row.append(InlineKeyboardButton(text=f"{page + 1} / {total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        row.append(InlineKeyboardButton(text="Вперёд ›", callback_data=f"{callback_prefix}{page + 1}"))
+    return row
+
+
+async def clear_state_keep_promo(state: FSMContext) -> None:
+    """Сбрасывает незавершённый сценарий, но сохраняет активную скидку."""
+    data = await state.get_data()
+    promo_id = data.get("active_discount_promo_id")
+    await state.clear()
+    if promo_id:
+        await state.update_data(active_discount_promo_id=promo_id)
 
 
 def normalize_promo_code(value: str) -> str | None:
@@ -385,8 +523,8 @@ def log_balance_change(
     session.add(
         BalanceLog(
             user_id=user_id,
-            amount=round(amount, 2),
-            balance_after=round(balance_after, 2),
+            amount=round_money(amount),
+            balance_after=round_money(balance_after),
             reason=reason,
             related_id=related_id,
         )
@@ -428,17 +566,51 @@ async def find_user_by_identifier(session: AsyncSession, raw_identifier: str) ->
 # ==========================================
 LANGUAGES = {
     "uk": {
-        "welcome": "💎 ✦ **KRANIN SHOP** ✦ 💎\n⚡️ Надійний сервіс цифрових ліцензій та софту\n━━━━━━━━━━━━━━━━━━━\n💰 **Баланс:** `{balance:.2f} грн`\n━━━━━━━━━━━━━━━━━━━\n\n👇 Оберіть розділ у меню нижче:",
-        "banned": "❌ Ваш акаунт заблоковано в боті.",
-        "lang_changed": "✅ Мову успішно змінено на українську.",
-        "lang_btn": "🌐 Змінити мову / Сменить язык"
+        "welcome": (
+            "💎 **KRANIN SHOP**\n"
+            "Цифрові ліцензії та софт — в одному місці\n\n"
+            "⚡️ Миттєва видача після оплати\n"
+            "🔑 Усі ключі зберігаються в профілі\n"
+            "🆘 Підтримка на зв’язку\n\n"
+            "💰 **Ваш баланс:** `{balance:.2f} грн`\n\n"
+            "Оберіть потрібний розділ:"
+        ),
+        "banned": "🚫 Ваш акаунт заблоковано в боті.",
+        "lang_changed": "✅ Мову змінено на українську.",
+        "lang_btn": "🌐 Мова",
+        "catalog": "🛒 Каталог",
+        "profile": "👤 Профіль",
+        "deposit": "💳 Поповнити",
+        "promo": "🎟 Промокод",
+        "reviews": "⭐ Відгуки",
+        "referral": "🤝 Партнёрська програма",
+        "support": "🆘 Підтримка",
+        "help": "ℹ️ Допомога",
+        "admin": "🛠 Адмін-панель",
     },
     "ru": {
-        "welcome": "💎 ✦ **KRANIN SHOP** ✦ 💎\n⚡️ Надежный сервис цифровых лицензий и софта\n━━━━━━━━━━━━━━━━━━━\n💰 **Баланс:** `{balance:.2f} грн`\n━━━━━━━━━━━━━━━━━━━\n\n👇 Выберите раздел в меню ниже:",
-        "banned": "❌ Ваш аккаунт заблокирован в боте.",
-        "lang_changed": "✅ Язык успешно изменен на русский.",
-        "lang_btn": "🌐 Изменить язык / Змінити мову"
-    }
+        "welcome": (
+            "💎 **KRANIN SHOP**\n"
+            "Цифровые лицензии и софт — в одном месте\n\n"
+            "⚡️ Мгновенная выдача после оплаты\n"
+            "🔑 Все ключи сохраняются в профиле\n"
+            "🆘 Поддержка на связи\n\n"
+            "💰 **Ваш баланс:** `{balance:.2f} грн`\n\n"
+            "Выберите нужный раздел:"
+        ),
+        "banned": "🚫 Ваш аккаунт заблокирован в боте.",
+        "lang_changed": "✅ Язык изменён на русский.",
+        "lang_btn": "🌐 Язык",
+        "catalog": "🛒 Каталог",
+        "profile": "👤 Профиль",
+        "deposit": "💳 Пополнить",
+        "promo": "🎟 Промокод",
+        "reviews": "⭐ Отзывы",
+        "referral": "🤝 Партнёрская программа",
+        "support": "🆘 Поддержка",
+        "help": "ℹ️ Помощь",
+        "admin": "🛠 Админ-панель",
+    },
 }
 
 def get_language_kb(is_reg: bool = False):
@@ -472,7 +644,7 @@ class User(Base):
     def _round_balance(self, key, value):
         # Баланс — Float, поэтому после серии += / -= накапливается «грязь»
         # вида 49.99999999. Округляем до копеек при каждой записи.
-        return round(float(value), 2) if value is not None else value
+        return round_money(value) if value is not None else value
 
 class Game(Base):
     """Игра — отдельная категория каталога, внутри которой лежат ОС и софт."""
@@ -512,6 +684,10 @@ class Product(Base):
     software = relationship("Software", back_populates="products")
     keys = relationship("LicenseKey", back_populates="product", cascade="all, delete-orphan")
     subscriptions = relationship("RestockSubscription", back_populates="product", cascade="all, delete-orphan")
+
+    @validates("price")
+    def _round_price(self, key, value):
+        return round_money(value) if value is not None else value
 
 class LicenseKey(Base):
     __tablename__ = "license_keys"
@@ -555,6 +731,11 @@ class DepositRequest(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     amount: Mapped[float] = mapped_column(Float)
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    payment_card: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    receipt_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    receipt_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    processed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class WithdrawalRequest(Base):
@@ -564,6 +745,8 @@ class WithdrawalRequest(Base):
     amount: Mapped[float] = mapped_column(Float)
     card: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(20), default="pending")
+    processed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class BalanceLog(Base):
@@ -623,6 +806,7 @@ class Review(Base):
 
 class RestockSubscription(Base):
     __tablename__ = "restock_subscriptions"
+    __table_args__ = (UniqueConstraint("user_id", "product_id", name="uq_restock_user_product"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
@@ -664,6 +848,20 @@ class DbSessionMiddleware(BaseMiddleware):
                     elif isinstance(actual_event, CallbackQuery):
                         await actual_event.answer(msg_text, show_alert=True)
                     return
+
+                # Старые inline-кнопки и сообщения без /start больше не приводят
+                # к None-ошибкам: профиль создаётся автоматически. Для /start
+                # регистрацию по-прежнему выполняет cmd_start с выбором языка.
+                is_start = isinstance(actual_event, Message) and bool(
+                    actual_event.text and actual_event.text.startswith("/start")
+                )
+                if not user and not is_start:
+                    language = "ru" if (user_obj.language_code or "").casefold().startswith("ru") else "uk"
+                    session.add(User(id=user_obj.id, username=user_obj.username, language=language))
+                    try:
+                        await session.commit()
+                    except IntegrityError:
+                        await session.rollback()
             return await handler(event, data)
 
 class ThrottleMiddleware(BaseMiddleware):
@@ -713,6 +911,7 @@ class AdminStates(StatesGroup):
     waiting_for_broadcast_text = State()
     waiting_for_user_id = State()
     waiting_for_user_balance_change = State()
+    waiting_for_new_price = State()
 
 class DepositStates(StatesGroup):
     waiting_for_amount = State()
@@ -734,23 +933,43 @@ class UserStates(StatesGroup):
 def get_main_menu_kb(user_id: int, lang: str = "uk"):
     texts = LANGUAGES.get(lang, LANGUAGES["uk"])
     keyboard = [
-        [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
-         InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
-        [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo"),
-         InlineKeyboardButton(text="⭐ Отзывы", callback_data="show_reviews")],
-        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
-        [InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
-        [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
+        [InlineKeyboardButton(text=texts["catalog"], callback_data="shop")],
+        [InlineKeyboardButton(text=texts["profile"], callback_data="profile"),
+         InlineKeyboardButton(text=texts["deposit"], callback_data="deposit")],
+        [InlineKeyboardButton(text=texts["promo"], callback_data="enter_promo"),
+         InlineKeyboardButton(text=texts["reviews"], callback_data="show_reviews")],
+        [InlineKeyboardButton(text=texts["referral"], callback_data="ref_program")],
+        [InlineKeyboardButton(text=texts["help"], callback_data="help"),
+         InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
+        [InlineKeyboardButton(text=texts["support"], url=f"https://t.me/{SUPPORT_USERNAME}")],
     ]
     if user_id in ADMIN_IDS:
-        keyboard.append([InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")])
+        keyboard.append([InlineKeyboardButton(text=texts["admin"], callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def get_main_menu_text(balance: float, lang: str = "uk") -> str:
     texts = LANGUAGES.get(lang, LANGUAGES["uk"])
     return texts["welcome"].format(balance=balance)
+
+
+async def send_main_menu(message: Message, user: "User") -> None:
+    """Отправляет главное меню; при необходимости использует фирменную обложку."""
+    lang = user.language if user.language in LANGUAGES else "uk"
+    text_msg = get_main_menu_text(user.balance, lang)
+    keyboard = get_main_menu_kb(user.id, lang)
+    if WELCOME_PHOTO_FILE_ID:
+        try:
+            await message.answer_photo(
+                WELCOME_PHOTO_FILE_ID,
+                caption=clip_text(text_msg, TELEGRAM_CAPTION_LIMIT),
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+            return
+        except TelegramBadRequest:
+            logger.warning("WELCOME_PHOTO_FILE_ID недействителен; отправлено текстовое меню")
+    await message.answer(text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 
 def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
@@ -885,16 +1104,72 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
                 user.username = message.from_user.username
                 await session.commit()
 
-        lang = user.language if user and user.language in LANGUAGES else "uk"
-        await message.answer(
-            get_main_menu_text(user.balance, lang),
-            reply_markup=get_main_menu_kb(message.from_user.id, lang),
-            parse_mode="Markdown"
-        )
+        await send_main_menu(message, user)
     except Exception as e:
         await session.rollback()
         logger.error(f"Ошибка в cmd_start: {e}")
         await message.answer("⚠️ Произошла ошибка. Попробуйте снова.")
+
+@router.message(Command("menu"))
+async def cmd_menu(message: Message, session: AsyncSession, state: FSMContext):
+    await clear_state_keep_promo(state)
+    user = await session.get(User, message.from_user.id)
+    if user:
+        await send_main_menu(message, user)
+
+
+def get_help_text(lang: str) -> str:
+    if lang == "uk":
+        return (
+            "ℹ️ **Допомога**\n\n"
+            "**Як купити товар**\n"
+            "1. Відкрийте «Каталог».\n"
+            "2. Оберіть гру, платформу, софт і тариф.\n"
+            "3. Перевірте замовлення та підтвердьте покупку.\n\n"
+            "Ключ з’явиться одразу та назавжди залишиться в розділі «Профіль» → «Мої ключі».\n\n"
+            "**Оплата та промокоди**\n"
+            "Поповніть баланс через головне меню. Промокод на знижку застосовується автоматично до підходящого товару.\n\n"
+            f"Потрібна людина? Напишіть: @{SUPPORT_USERNAME}"
+        )
+    return (
+        "ℹ️ **Помощь**\n\n"
+        "**Как купить товар**\n"
+        "1. Откройте «Каталог».\n"
+        "2. Выберите игру, платформу, софт и тариф.\n"
+        "3. Проверьте заказ и подтвердите покупку.\n\n"
+        "Ключ появится сразу и навсегда останется в разделе «Профиль» → «Мои ключи».\n\n"
+        "**Оплата и промокоды**\n"
+        "Пополните баланс через главное меню. Промокод на скидку применится автоматически к подходящему товару.\n\n"
+        f"Нужен живой человек? Напишите: @{SUPPORT_USERNAME}"
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, session: AsyncSession):
+    user = await session.get(User, message.from_user.id)
+    lang = user.language if user and user.language in LANGUAGES else "ru"
+    await message.answer(
+        get_help_text(lang),
+        reply_markup=get_main_menu_kb(message.from_user.id, lang),
+        parse_mode="Markdown",
+    )
+
+
+@router.callback_query(F.data == "help")
+async def help_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    user = await session.get(User, callback.from_user.id)
+    lang = user.language if user and user.language in LANGUAGES else "ru"
+    await safe_edit_text(
+        callback,
+        bot,
+        get_help_text(lang),
+        InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Поддержка", url=f"https://t.me/{SUPPORT_USERNAME}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ]),
+    )
+    await callback.answer()
+
 
 @router.callback_query(F.data.in_({"reg_lang_uk", "reg_lang_ru"}))
 async def process_reg_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
@@ -918,11 +1193,7 @@ async def process_reg_language(callback: CallbackQuery, session: AsyncSession, s
 @router.callback_query(F.data == "main_menu")
 async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
     # Не теряем уже применённую скидку при переходе через главное меню.
-    state_data = await state.get_data()
-    active_discount_promo_id = state_data.get("active_discount_promo_id")
-    await state.clear()
-    if active_discount_promo_id:
-        await state.update_data(active_discount_promo_id=active_discount_promo_id)
+    await clear_state_keep_promo(state)
     user = await session.get(User, callback.from_user.id)
     balance = user.balance if user else 0.0
     lang = user.language if user and user.language in LANGUAGES else "uk"
@@ -938,21 +1209,18 @@ async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, stat
 # СМЕНА ЯЗЫКА
 # ==========================================
 @router.callback_query(F.data == "change_lang")
-async def change_lang_handler(callback: CallbackQuery):
-    await callback.message.edit_text(
+async def change_lang_handler(callback: CallbackQuery, bot: Bot):
+    await safe_edit_text(
+        callback,
+        bot,
         "🌐 **Виберіть мову / Выберите язык:**",
-        reply_markup=get_language_kb(is_reg=False),
-        parse_mode="Markdown"
+        get_language_kb(is_reg=False),
     )
     await callback.answer()
 
 @router.callback_query(F.data.in_({"lang_uk", "lang_ru"}))
 async def set_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
-    state_data = await state.get_data()
-    active_discount_promo_id = state_data.get("active_discount_promo_id")
-    await state.clear()
-    if active_discount_promo_id:
-        await state.update_data(active_discount_promo_id=active_discount_promo_id)
+    await clear_state_keep_promo(state)
     lang_code = "uk" if callback.data == "lang_uk" else "ru"
     user = await session.get(User, callback.from_user.id)
     if user:
@@ -973,12 +1241,13 @@ async def set_language(callback: CallbackQuery, session: AsyncSession, state: FS
 # ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ)
 # ==========================================
 @router.callback_query(F.data == "enter_promo")
-async def enter_promo_handler(callback: CallbackQuery, state: FSMContext):
+async def enter_promo_handler(callback: CallbackQuery, state: FSMContext, bot: Bot):
     await state.set_state(UserStates.waiting_for_promo_input)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
+        bot,
         "🎟 **Активация промокода**\n\nВведите ваш промокод:",
-        reply_markup=cancel_kb("main_menu"),
-        parse_mode="Markdown"
+        cancel_kb("main_menu"),
     )
     await callback.answer()
 
@@ -1049,7 +1318,10 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
             f"💸 Скидка: **{percent:.0f}%**\n"
             f"📦 Действует: **{escape_md(target_text)}**\n\n"
             "🛒 Перейдите в каталог и выберите подходящий товар. Скидка будет показана перед оплатой.",
-            reply_markup=get_main_menu_kb(message.from_user.id, "ru"),
+            reply_markup=get_main_menu_kb(
+                message.from_user.id,
+                (await session.get(User, message.from_user.id)).language,
+            ),
             parse_mode="Markdown"
         )
         return
@@ -1063,7 +1335,7 @@ async def process_promo_activation(message: Message, state: FSMContext, session:
         await state.clear()
         return
 
-    user.balance += float(promo.amount)
+    user.balance = round_money(user.balance + float(promo.amount))
     promo.uses_left -= 1
     session.add(PromoCodeUsage(
         promo_id=promo.id,
@@ -1103,7 +1375,7 @@ def review_stars(rating: int) -> str:
 
 @router.callback_query(F.data == "show_reviews")
 @router.callback_query(F.data.startswith("reviews_page_"))
-async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
     page = 0
     if callback.data.startswith("reviews_page_"):
         try:
@@ -1172,7 +1444,7 @@ async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession):
         [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await safe_edit_text(callback, bot, text_msg, InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
 
 
@@ -1183,6 +1455,9 @@ async def leave_review_start(callback: CallbackQuery, state: FSMContext, session
         select(Purchase).where(Purchase.user_id == callback.from_user.id).order_by(Purchase.purchased_at.desc())
     )
     purchases = result.scalars().all()
+    reviewed_product_ids = set((await session.execute(
+        select(Review.product_id).where(Review.user_id == callback.from_user.id)
+    )).scalars().all())
     seen = set()
     available = []
     for purchase in purchases:
@@ -1196,10 +1471,7 @@ async def leave_review_start(callback: CallbackQuery, state: FSMContext, session
         if not product_id or product_id in seen:
             continue
         seen.add(product_id)
-        exists_review = await session.scalar(
-            select(func.count(Review.id)).where(Review.user_id == callback.from_user.id, Review.product_id == product_id)
-        ) or 0
-        if not exists_review:
+        if product_id not in reviewed_product_ids:
             available.append((product_id, product_map.get(product_id, purchase.product_name)))
 
     if not available:
@@ -1347,6 +1619,7 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
     await message.answer(
         "✅ **Отзыв принят!**\n\nОн отправлен на модерацию и после проверки появится в разделе отзывов.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Крутить колесо фортуны", callback_data=f"wheelreview_{review.id}")],
             [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
             [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
@@ -1355,13 +1628,21 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
 
 
 @router.callback_query(F.data == "my_reviews")
+@router.callback_query(F.data.regexp(r"^my_reviews_page_[0-9]+$"))
 async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("my_reviews_page_") else 0
+    total = await session.scalar(
+        select(func.count(Review.id)).where(Review.user_id == callback.from_user.id)
+    ) or 0
+    page, total_pages, offset = page_bounds(total, page, HISTORY_PAGE_SIZE)
     result = await session.execute(
         select(Review, Software.name, Product.duration)
         .join(Product, Review.product_id == Product.id, isouter=True)
         .join(Software, Product.software_id == Software.id, isouter=True)
         .where(Review.user_id == callback.from_user.id)
-        .order_by(Review.created_at.desc()).limit(20)
+        .order_by(Review.created_at.desc())
+        .offset(offset)
+        .limit(HISTORY_PAGE_SIZE)
     )
     rows = result.all()
     if not rows:
@@ -1374,14 +1655,19 @@ async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
             blocks.append(
                 f"{review_stars(review.rating)} · `{escape_md(product_label)}`\n"
                 f"_{escape_md(review.text)}_\n"
-                f"{labels.get(review.status, review.status)} · {review.created_at.strftime('%d.%m.%Y')}"
+                f"{labels.get(review.status, review.status)} · {format_dt(review.created_at, False)}"
             )
         text_msg = "📋 **Мои отзывы**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    buttons = []
+    nav = pagination_row("my_reviews_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
         [InlineKeyboardButton(text="✍️ Новый отзыв", callback_data="leave_review")],
         [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ]), parse_mode="Markdown")
+    ])
+    await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -1389,8 +1675,8 @@ async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
 # 👤 ПРОФИЛЬ И ЛИЧНЫЙ КАБИНЕТ
 # ==========================================
 @router.callback_query(F.data == "profile")
-async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
-    await state.clear()
+async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
+    await clear_state_keep_promo(state)
     user_id = callback.from_user.id
     user = await session.get(User, user_id)
     if not user:
@@ -1406,37 +1692,40 @@ async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FS
     username = f"@{escape_md(user.username)}" if user.username else "не указан"
     lang_name = "🇺🇦 Українська" if user.language == "uk" else "🇷🇺 Русский"
     text_msg = (
-        "👤 **ЛИЧНЫЙ КАБИНЕТ**\n━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 ID: `{user_id}`\n"
-        f"👤 Username: {username}\n"
-        f"🌐 Язык: {lang_name}\n"
-        f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y')}`\n"
+        "👤 **МОЙ ПРОФИЛЬ**\n"
+        f"{username} · `{user_id}`\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Баланс: **`{user.balance:.2f} грн`**\n"
-        f"🛒 Покупок: `{total_purchases}`\n"
-        f"💸 Потрачено: `{float(total_spent):.2f} грн`\n"
-        f"🤝 Рефералов: `{referrals}`\n"
-        f"🎁 Реферальных бонусов: `{float(referral_bonus):.2f} грн`\n"
-        f"⭐ Отзывов: `{review_count}`"
+        f"💰 **Баланс:** `{user.balance:.2f} грн`\n"
+        f"🛒 **Покупки:** `{total_purchases}` · на `{float(total_spent):.2f} грн`\n"
+        f"🤝 **Рефералы:** `{referrals}` · бонусы `{float(referral_bonus):.2f} грн`\n"
+        f"⭐ **Отзывы:** `{review_count}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 {lang_name}\n"
+        f"📅 С нами с `{format_dt(user.created_at, False)}`"
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="profile_keys")],
-        [InlineKeyboardButton(text="📜 История покупок", callback_data="profile_purchase_history")],
-        [InlineKeyboardButton(text="💳 История баланса", callback_data="profile_balance_history")],
-        [InlineKeyboardButton(text="⭐ Мои отзывы", callback_data="my_reviews")],
-        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text="🧾 Покупки", callback_data="profile_purchase_history"),
+         InlineKeyboardButton(text="💳 Операции", callback_data="profile_balance_history")],
+        [InlineKeyboardButton(text="⭐ Мои отзывы", callback_data="my_reviews"),
+         InlineKeyboardButton(text="🤝 Рефералы", callback_data="ref_program")],
         [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await safe_edit_text(callback, bot, text_msg, keyboard)
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile_keys")
 async def profile_keys_menu(callback: CallbackQuery, session: AsyncSession):
     user_id = callback.from_user.id
-    result = await session.execute(select(Purchase.duration).where(Purchase.user_id == user_id).distinct())
-    durations = [d for d in result.scalars().all() if d]
+    result = await session.execute(
+        select(Purchase.duration, func.count(Purchase.id))
+        .where(Purchase.user_id == user_id)
+        .group_by(Purchase.duration)
+    )
+    duration_counts = {duration: count for duration, count in result.all() if duration}
+    durations = list(duration_counts)
     ordered = [d for d in DURATIONS if d in durations]
     ordered += [d for d in durations if d not in ordered]
     if not ordered:
@@ -1446,9 +1735,7 @@ async def profile_keys_menu(callback: CallbackQuery, session: AsyncSession):
         text_msg = "🔑 **Мои ключи**\n━━━━━━━━━━━━━━━━━━━\nВыберите срок:"
         buttons = []
         for duration in ordered:
-            count = await session.scalar(select(func.count(Purchase.id)).where(
-                Purchase.user_id == user_id, Purchase.duration == duration
-            )) or 0
+            count = duration_counts.get(duration, 0)
             buttons.append([InlineKeyboardButton(
                 text=f"📂 {duration} · {count} шт.", callback_data=f"profile_durv_{duration.replace(' ', '_')}"
             )])
@@ -1462,54 +1749,99 @@ async def profile_keys_menu(callback: CallbackQuery, session: AsyncSession):
 
 @router.callback_query(F.data.startswith("profile_durv_"))
 async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
-    duration = callback.data[len("profile_durv_"):].replace("_", " ")
+    payload = callback.data[len("profile_durv_"):]
+    duration_payload, separator, raw_page = payload.rpartition("_page_")
+    if separator and raw_page.isdigit():
+        page = int(raw_page)
+    else:
+        duration_payload = payload
+        page = 0
+    duration = duration_payload.replace("_", " ")
+    total = await session.scalar(
+        select(func.count(Purchase.id)).where(
+            Purchase.user_id == callback.from_user.id,
+            Purchase.duration == duration,
+        )
+    ) or 0
+    page, total_pages, offset = page_bounds(total, page, HISTORY_PAGE_SIZE)
     result = await session.execute(
-        select(Purchase).where(Purchase.user_id == callback.from_user.id, Purchase.duration == duration)
-        .order_by(Purchase.purchased_at.desc()).limit(30)
+        select(Purchase)
+        .where(Purchase.user_id == callback.from_user.id, Purchase.duration == duration)
+        .order_by(Purchase.purchased_at.desc())
+        .offset(offset)
+        .limit(HISTORY_PAGE_SIZE)
     )
     purchases = result.scalars().all()
     if not purchases:
         text_msg = "🔑 Записей не найдено."
     else:
         blocks = [
-            f"📦 **{escape_md(p.product_name)}**\n🔐 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            f"📦 **{escape_md(p.product_name)}**\n🔐 `{escape_md(p.key_issued)}`\n🕒 {format_dt(p.purchased_at)}"
             for p in purchases
         ]
-        text_msg = f"🔑 **Мои ключи — {escape_md(duration)}**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        text_msg = f"🔑 **Мои ключи · {escape_md(duration)}**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    buttons = []
+    nav = pagination_row(f"profile_durv_{duration_payload}_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
         [InlineKeyboardButton(text="🔙 К категориям", callback_data="profile_keys")],
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
-    ]), parse_mode="Markdown")
+    ])
+    await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile_purchase_history")
+@router.callback_query(F.data.regexp(r"^profile_purchases_page_[0-9]+$"))
 async def profile_purchase_history(callback: CallbackQuery, session: AsyncSession):
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("profile_purchases_page_") else 0
+    total = await session.scalar(
+        select(func.count(Purchase.id)).where(Purchase.user_id == callback.from_user.id)
+    ) or 0
+    page, total_pages, offset = page_bounds(total, page, HISTORY_PAGE_SIZE)
     result = await session.execute(
-        select(Purchase).where(Purchase.user_id == callback.from_user.id)
-        .order_by(Purchase.purchased_at.desc()).limit(20)
+        select(Purchase)
+        .where(Purchase.user_id == callback.from_user.id)
+        .order_by(Purchase.purchased_at.desc())
+        .offset(offset)
+        .limit(HISTORY_PAGE_SIZE)
     )
     purchases = result.scalars().all()
     if not purchases:
-        text_msg = "📜 **История покупок**\n\nПокупок пока нет."
+        text_msg = "🧾 **История покупок**\n\nПокупок пока нет."
     else:
         blocks = [
-            f"🛒 **{escape_md(p.product_name)}**\n💰 `{p.price_paid:.2f} грн`\n🔑 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            f"🛒 **{escape_md(p.product_name)}**\n💰 `{p.price_paid:.2f} грн`\n🔑 `{escape_md(p.key_issued)}`\n🕒 {format_dt(p.purchased_at)}"
             for p in purchases
         ]
-        text_msg = "📜 **История покупок**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        text_msg = "🧾 **История покупок**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    buttons = []
+    nav = pagination_row("profile_purchases_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ]), parse_mode="Markdown")
+    ])
+    await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 
 @router.callback_query(F.data == "profile_balance_history")
+@router.callback_query(F.data.regexp(r"^profile_balance_page_[0-9]+$"))
 async def profile_balance_history(callback: CallbackQuery, session: AsyncSession):
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("profile_balance_page_") else 0
+    total = await session.scalar(
+        select(func.count(BalanceLog.id)).where(BalanceLog.user_id == callback.from_user.id)
+    ) or 0
+    page, total_pages, offset = page_bounds(total, page, HISTORY_PAGE_SIZE)
     result = await session.execute(
-        select(BalanceLog).where(BalanceLog.user_id == callback.from_user.id)
-        .order_by(BalanceLog.created_at.desc()).limit(20)
+        select(BalanceLog)
+        .where(BalanceLog.user_id == callback.from_user.id)
+        .order_by(BalanceLog.created_at.desc())
+        .offset(offset)
+        .limit(HISTORY_PAGE_SIZE)
     )
     logs = result.scalars().all()
     labels = {
@@ -1526,13 +1858,18 @@ async def profile_balance_history(callback: CallbackQuery, session: AsyncSession
             blocks.append(
                 f"{labels.get(log.reason, log.reason)}\n"
                 f"💵 `{sign}{log.amount:.2f} грн` → `{log.balance_after:.2f} грн`\n"
-                f"🕒 {log.created_at.strftime('%d.%m.%Y %H:%M')}"
+                f"🕒 {format_dt(log.created_at)}"
             )
         text_msg = "💳 **История баланса**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
-    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    buttons = []
+    nav = pagination_row("profile_balance_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
         [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ]), parse_mode="Markdown")
+    ])
+    await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 
@@ -1540,6 +1877,7 @@ async def profile_balance_history(callback: CallbackQuery, session: AsyncSession
 # КАТАЛОГ И ПОКУПКИ С УВЕДОМЛЕНИЯМИ (RESTOCK)
 # ==========================================
 async def _edit_catalog_screen(callback: CallbackQuery, bot: Bot, text_msg: str, keyboard: InlineKeyboardMarkup) -> None:
+    text_msg = clip_text(text_msg)
     try:
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
     except TelegramBadRequest as exc:
@@ -1558,27 +1896,35 @@ async def _edit_catalog_screen(callback: CallbackQuery, bot: Bot, text_msg: str,
 
 
 @router.callback_query(F.data == "shop")
+@router.callback_query(F.data.regexp(r"^shop_page_[0-9]+$"))
 async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
-    """Шаг 1: показать игры. ОС и софт выбираются только после выбора игры."""
-    await state.clear()
+    """Шаг 1: paginated каталог игр; активная скидка сохраняется."""
+    await clear_state_keep_promo(state)
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("shop_page_") else 0
     result = await session.execute(
-        select(Game)
+        select(Game, func.count(Software.id))
         .join(Software, Software.game_id == Game.id)
-        .distinct()
+        .group_by(Game.id)
         .order_by(Game.name.asc(), Game.id.asc())
     )
-    games = result.scalars().all()
+    rows = result.all()
+    page, total_pages, offset = page_bounds(len(rows), page, CATALOG_PAGE_SIZE)
+    page_rows = rows[offset:offset + CATALOG_PAGE_SIZE]
     text_msg = (
-        "🛍 **МАГАЗИН ЛИЦЕНЗИЙ**\n"
+        "🛒 **КАТАЛОГ**\n"
+        "Выберите игру или категорию\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "🎮 **Шаг 1/4 — выберите игру:**"
+        "**Шаг 1 из 4 · Игра**"
     )
     buttons = [
-        [InlineKeyboardButton(text=f"🎮 {game.name[:58]}", callback_data=f"game_{game.id}")]
-        for game in games
+        [InlineKeyboardButton(text=f"🎮 {game.name[:46]} · {count}", callback_data=f"game_{game.id}")]
+        for game, count in page_rows
     ]
     if not buttons:
-        text_msg += "\n\nПока игры не добавлены."
+        text_msg += "\n\nКаталог пока пуст. Загляните позже."
+    nav = pagination_row("shop_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     await _edit_catalog_screen(callback, bot, text_msg, InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
@@ -1649,6 +1995,7 @@ async def _show_game_software_list(
     game_id: int,
     os_kind: str,
     back_callback: str,
+    page: int = 0,
 ) -> None:
     game = await session.get(Game, game_id)
     if not game:
@@ -1674,9 +2021,12 @@ async def _show_game_software_list(
     query = query.order_by(Software.name.asc(), Software.id.asc())
     result = await session.execute(query)
     rows = result.all()
+    page, total_pages, offset = page_bounds(len(rows), page, CATALOG_PAGE_SIZE)
+    page_rows = rows[offset:offset + CATALOG_PAGE_SIZE]
+    root_flag = 1 if back_callback == "shop" else 0
     buttons = [
-        [InlineKeyboardButton(text=f"🛡 {software.name[:58]}", callback_data=f"software_{software.id}")]
-        for software, _platform in rows
+        [InlineKeyboardButton(text=f"🛡 {software.name[:56]}", callback_data=f"software_{software.id}")]
+        for software, _platform in page_rows
     ]
     if not rows:
         text_msg = f"🎮 **{escape_md(game.name)}**\n\nДля выбранного раздела софт пока не добавлен."
@@ -1685,8 +2035,11 @@ async def _show_game_software_list(
             f"🎮 **{escape_md(game.name)}**\n"
             f"📱 {os_title}\n"
             "━━━━━━━━━━━━━━━━━━━\n"
-            "🛡 **Шаг 3/4 — выберите софт:**"
+            "**Шаг 3 из 4 · Софт**"
         )
+    nav = pagination_row(f"gsw_{game_id}_{os_kind}_{root_flag}_", page, total_pages)
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=back_callback)])
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     await _edit_catalog_screen(callback, bot, text_msg, InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -1709,6 +2062,23 @@ async def show_game_software_without_os(callback: CallbackQuery, session: AsyncS
     # Это действие появляется только в смешанном каталоге; «Назад» вернёт к выбору ОС.
     await _show_game_software_list(
         callback, session, bot, game_id, "noos", back_callback=f"game_{game_id}"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^gsw_[0-9]+_(android|ios|noos)_[01]_[0-9]+$"))
+async def show_game_software_page(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    _prefix, game_id, os_kind, root_flag, page = callback.data.split("_")
+    root_flag = int(root_flag)
+    back_callback = "shop" if root_flag else f"game_{game_id}"
+    await _show_game_software_list(
+        callback,
+        session,
+        bot,
+        int(game_id),
+        os_kind,
+        back_callback,
+        int(page),
     )
     await callback.answer()
 
@@ -1736,35 +2106,31 @@ async def show_softwares(callback: CallbackQuery, session: AsyncSession, bot: Bo
 async def _render_software_screen(
     callback: CallbackQuery, bot: Bot, software: "Software", text_msg: str, keyboard: InlineKeyboardMarkup
 ) -> None:
-    # НОВОЕ: если у софта задано фото (photo_file_id), показываем его как
-    # фото-сообщение — в Telegram фото у такого сообщения располагается
-    # НАД текстом (подписью), то есть ровно "фото над текстом", которое
-    # просили. Обычное edit_text не может превратить текстовое сообщение в
-    # фото, поэтому старое сообщение удаляется и отправляется новое.
+    """Рендерит карточку товара и не роняет сценарий при нерабочем file_id."""
     chat_id = callback.message.chat.id
     if software.photo_file_id:
         try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=software.photo_file_id,
-            caption=text_msg,
-            reply_markup=keyboard,
-            parse_mode="Markdown",
-        )
-        return
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=software.photo_file_id,
+                caption=clip_text(text_msg, TELEGRAM_CAPTION_LIMIT - 16),
+                reply_markup=keyboard,
+                parse_mode="Markdown",
+            )
+            with suppress(Exception):
+                await callback.message.delete()
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("Не удалось показать фото софта %s: %s", software.id, exc)
 
+    text_msg = clip_text(text_msg)
     try:
         await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
-    except TelegramBadRequest:
-        # Сообщение было фото (например, при возврате назад) — редактировать
-        # текстом нельзя, удаляем и отправляем новое текстовое сообщение.
-        try:
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc):
+            return
+        with suppress(Exception):
             await callback.message.delete()
-        except Exception:
-            pass
         await bot.send_message(chat_id, text_msg, reply_markup=keyboard, parse_mode="Markdown")
 
 
@@ -1788,14 +2154,23 @@ async def _show_products_for_software_id(
 
     back_callback = await get_software_back_callback(session, software)
 
-    # ФИКС: без ORDER BY Postgres отдаёт тарифы в произвольном порядке (после
-    # UPDATE строки «прыгали» в списке) — сортируем по цене, затем по id.
     result = await session.execute(
-        select(Product).filter_by(software_id=software_id).order_by(Product.price.asc(), Product.id.asc())
+        select(Product).filter_by(software_id=software_id).order_by(Product.id.asc())
     )
-    products = result.scalars().all()
+    products = sorted(
+        result.scalars().all(),
+        key=lambda item: (DURATION_SORT_ORDER.get(item.duration, len(DURATIONS)), item.price, item.id),
+    )
 
-    description_block = f"{escape_md(software.description)}\n\n" if software.description else ""
+    if software.description:
+        # У фото Telegram лимит подписи 1024 символа — оставляем место для тарифов.
+        description_limit = 560 if software.photo_file_id else 1500
+        description = software.description
+        if len(description) > description_limit:
+            description = description[:description_limit - 1].rstrip() + "…"
+        description_block = f"{escape_md(description)}\n\n"
+    else:
+        description_block = ""
 
     if not products:
         text_msg = f"🛒 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}❌ Тарифы для этого софта пока отсутствуют."
@@ -1807,7 +2182,7 @@ async def _show_products_for_software_id(
         await callback.answer()
         return
 
-    text_msg = f"🛡 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}⏳ **Шаг 4/4 — выберите срок ключа:**"
+    text_msg = f"🛡 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}**Шаг 4 из 4 · Тариф**\nВыберите срок лицензии:"
     # Остатки всех тарифов одним запросом вместо N+1
     stock_res = await session.execute(
         select(LicenseKey.product_id, func.count(LicenseKey.id))
@@ -1821,14 +2196,13 @@ async def _show_products_for_software_id(
         available_keys = stock_map.get(p.id, 0)
 
         if available_keys > 0:
-            status_text = f"🟢 {available_keys} шт."
             buttons.append([InlineKeyboardButton(
-                text=f"⏳ {p.duration} — 💵 {p.price:.2f} грн  ({status_text})",
+                text=f"🟢 {p.duration} · {p.price:.2f} грн · {available_keys} шт.",
                 callback_data=f"confirm_buy_{p.id}"
             )])
         else:
             buttons.append([InlineKeyboardButton(
-                text=f"🔴 {p.duration} — {p.price:.2f} грн (нет в наличии, 🔔 уведомить)",
+                text=f"🔔 {p.duration} · нет в наличии",
                 callback_data=f"notify_restock_{p.id}"
             )])
 
@@ -1843,16 +2217,24 @@ async def _show_products_for_software_id(
 async def notify_restock_handler(callback: CallbackQuery, session: AsyncSession):
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-
-    existing = await session.execute(select(RestockSubscription).filter_by(user_id=user_id, product_id=product_id))
-    if existing.scalars().first():
-        await callback.answer("🔔 Вы уже подписаны на уведомление об этом товаре!", show_alert=True)
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("❌ Товар больше не существует.", show_alert=True)
         return
 
-    sub = RestockSubscription(user_id=user_id, product_id=product_id)
-    session.add(sub)
-    await session.commit()
-    await callback.answer("✅ Готово! Бот уведомит вас, когда ключи поступят в продажу.", show_alert=True)
+    existing = await session.scalar(
+        select(RestockSubscription).filter_by(user_id=user_id, product_id=product_id)
+    )
+    if existing:
+        await callback.answer("🔔 Уведомление уже включено.", show_alert=True)
+        return
+
+    session.add(RestockSubscription(user_id=user_id, product_id=product_id))
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+    await callback.answer("✅ Сообщим, как только товар появится.", show_alert=True)
 
 # --- НОВОЕ: ШАГ ПОДТВЕРЖДЕНИЯ ПЕРЕД ПОКУПКОЙ ---
 @router.callback_query(F.data.startswith("confirm_buy_"))
@@ -1879,7 +2261,7 @@ async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSessio
         await callback.answer("❌ К сожалению, ключи только что закончились!", show_alert=True)
         return
 
-    final_price = round(float(product.price), 2)
+    final_price = round_money(product.price)
     discount_amount = 0.0
     promo = None
     promo_data = await state.get_data()
@@ -1900,8 +2282,8 @@ async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSessio
             return
         else:
             percent = max(0.0, min(100.0, float(promo.discount_percent or 0.0)))
-            discount_amount = round(float(product.price) * percent / 100.0, 2)
-            final_price = max(0.0, round(float(product.price) - discount_amount, 2))
+            discount_amount = round_money(float(product.price) * percent / 100.0)
+            final_price = max(0.0, round_money(float(product.price) - discount_amount))
 
     if balance < final_price:
         await callback.answer(
@@ -1921,15 +2303,15 @@ async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSessio
         price_block += f"\n✅ **К оплате:** `{final_price:.2f} грн`"
 
     text_msg = (
-        f"🧾 **Подтверждение покупки**\n"
+        f"🧾 **ВАШ ЗАКАЗ**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 **Товар:** `{escape_md(sw_name)}`\n"
-        f"⏳ **Срок:** `{escape_md(product.duration)}`\n"
+        f"📦 **{escape_md(sw_name)}**\n"
+        f"⏳ Тариф: `{escape_md(product.duration)}`\n"
         f"{price_block}\n"
-        f"💳 **Ваш баланс:** `{balance:.2f} грн`\n"
-        f"💳 **Баланс после покупки:** `{(balance - final_price):.2f} грн`\n"
-        f"━━━━━━━━━━━━━━━━━━━\n\n"
-        f"Подтвердите покупку — деньги будут списаны и вам сразу выдастся ключ."
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 Сейчас на балансе: `{balance:.2f} грн`\n"
+        f"✨ После покупки: `{(balance - final_price):.2f} грн`\n\n"
+        f"После подтверждения ключ будет выдан сразу."
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить покупку", callback_data=f"buy_product_{product.id}")],
@@ -1943,24 +2325,26 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
     product_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
 
-    product = await session.get(Product, product_id)
+    product = await lock_row(session, Product, product_id)
     if not product:
         await callback.answer("❌ Товар не найден!", show_alert=True)
         return
 
     software = await session.get(Software, product.software_id)
 
-    # ФИКС: блокируем строку пользователя на время транзакции, чтобы исключить
-    # race condition при двойном/параллельном нажатии на "Купить" — иначе баланс
-    # мог уйти в минус, т.к. обе транзакции проходили проверку balance до commit().
+    # Блокировки пользователя, товара и ключа исключают двойное списание,
+    # продажу одного ключа дважды и изменение цены во время оформления.
     user_res = await session.execute(
         select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True)
     )
     user = user_res.scalar_one_or_none()
+    if not user:
+        await callback.answer("❌ Профиль не найден. Отправьте /start и повторите.", show_alert=True)
+        return
 
     # Пересчитываем скидку непосредственно в момент списания, а не доверяем
     # цене из предыдущего экрана подтверждения.
-    original_price = round(float(product.price), 2)
+    original_price = round_money(product.price)
     final_price = original_price
     discount_amount = 0.0
     promo = None
@@ -1992,10 +2376,10 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
                 return
             else:
                 percent = max(0.0, min(100.0, float(promo.discount_percent or 0.0)))
-                discount_amount = round(original_price * percent / 100.0, 2)
-                final_price = max(0.0, round(original_price - discount_amount, 2))
+                discount_amount = round_money(original_price * percent / 100.0)
+                final_price = max(0.0, round_money(original_price - discount_amount))
 
-    if not user or user.balance < final_price:
+    if user.balance < final_price:
         await callback.answer(
             f"❌ Недостаточно средств! Требуется {final_price:.2f} грн", show_alert=True
         )
@@ -2013,7 +2397,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
         await callback.answer("❌ Ключи этого номинала закончились!", show_alert=True)
         return
 
-    user.balance -= final_price
+    user.balance = round_money(user.balance - final_price)
     license_key.is_sold = True
     log_balance_change(session, user.id, -final_price, "purchase", user.balance, related_id=product.id)
 
@@ -2037,8 +2421,8 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
         )
         referrer = referrer_res.scalar_one_or_none()
         if referrer:
-            ref_bonus = round(final_price * 0.05, 2)
-            referrer.balance += ref_bonus
+            ref_bonus = round_money(final_price * REFERRAL_PERCENT / 100.0)
+            referrer.balance = round_money(referrer.balance + ref_bonus)
             log_balance_change(session, referrer.id, ref_bonus, "referral_bonus", referrer.balance, related_id=user.id)
             referral_notice = (referrer.id, ref_bonus)
 
@@ -2060,23 +2444,31 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
             discount_amount=discount_amount,
             final_price=final_price,
         ))
-    await session.commit()
+    try:
+        await session.commit()
+    except SQLAlchemyError:
+        await session.rollback()
+        logger.exception("Не удалось завершить покупку product_id=%s user_id=%s", product_id, user_id)
+        await callback.answer(
+            "⚠️ Покупка не проведена, средства не списаны. Попробуйте ещё раз.",
+            show_alert=True,
+        )
+        return
     await state.update_data(active_discount_promo_id=None)
 
     success_text = (
-        f"✅ **Покупка успешно завершена!**\n"
+        f"✅ **ЗАКАЗ #{purchase.id} ОПЛАЧЕН**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
-        f"💰 **Обычная цена:** `{original_price:.2f} грн`\n"
-        + (f"🎟 **Скидка:** `-{discount_amount:.2f} грн` ({float(promo.discount_percent):.0f}%)\n" if promo else "")
-        + f"💳 **Списано с баланса:** `{final_price:.2f} грн`\n"
+        f"📦 **{escape_md(sw_name)}**\n"
+        f"⏳ Тариф: `{escape_md(product.duration)}`\n"
+        f"💳 Списано: **{final_price:.2f} грн**\n"
+        + (f"🎟 Скидка: `-{discount_amount:.2f} грн` ({float(promo.discount_percent):.0f}%)\n" if promo else "")
+        + f"💰 Баланс: `{user.balance:.2f} грн`\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🔑 **Ваш лицензионный ключ:**\n`{escape_md(license_key.key_string)}`\n\n"
-        + (f"📁 **Файлы:** [Открыть]({md_url(software.files_link)})\n\n" if software and software.files_link else "")
-        + f"📌 *Нажмите на ключ, чтобы скопировать.*\n"
-        f"💾 *Ключ надёжно сохранён в разделе «👤 Мой профиль».*\n\n"
-        f"🎰 **Оставьте отзыв о товаре и крутите колесо фортуны с топовыми призами!**\n"
-        f"⭐ Это займёт минуту, а взамен — шанс выиграть ключ или деньги на баланс."
+        f"🔑 **Ваш ключ — нажмите, чтобы скопировать:**\n`{escape_md(license_key.key_string)}`\n\n"
+        + (f"📁 [Файлы и инструкция]({md_url(software.files_link)})\n\n" if software and software.files_link else "")
+        + "💾 Ключ сохранён в «Профиль» → «Мои ключи».\n\n"
+        "⭐ Оставьте отзыв и получите вращение колеса фортуны."
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2124,7 +2516,11 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
     # НОВОЕ: уведомление админам о заканчивающемся остатке ключей.
     # Срабатывает один раз ровно в момент пересечения порога (а не на
     # каждой продаже ниже него) плюс отдельно — когда остаток обнулился.
-    if remaining_after_sale == LOW_STOCK_THRESHOLD or remaining_after_sale == 0:
+    crossed_low_stock = (
+        remaining_after_sale <= LOW_STOCK_THRESHOLD
+        and remaining_after_sale + 1 > LOW_STOCK_THRESHOLD
+    )
+    if crossed_low_stock or remaining_after_sale == 0:
         if remaining_after_sale == 0:
             stock_text = "🔴 **Ключи закончились полностью!**"
         else:
@@ -2188,7 +2584,8 @@ async def spin_wheel_review_handler(callback: CallbackQuery, session: AsyncSessi
             pass
         await asyncio.sleep(0.4)
 
-    roll = random.random()
+    # SystemRandom не позволяет предсказать результат по состоянию PRNG.
+    roll = secrets.randbelow(1_000_000) / 1_000_000
     prize_kind = "lose"
     if roll < WHEEL_KEY_CHANCE:
         prize_kind = "key"
@@ -2248,7 +2645,7 @@ async def spin_wheel_review_handler(callback: CallbackQuery, session: AsyncSessi
 
     if prize_kind == "balance":
         if user:
-            user.balance += WHEEL_BALANCE_PRIZE
+            user.balance = round_money(user.balance + WHEEL_BALANCE_PRIZE)
             log_balance_change(session, user.id, WHEEL_BALANCE_PRIZE, "wheel_bonus", user.balance, related_id=review_id)
         final_kind = "balance"
         result_text = (
@@ -2258,8 +2655,8 @@ async def spin_wheel_review_handler(callback: CallbackQuery, session: AsyncSessi
         )
     else:
         result_text = (
-            f"🎲 **Почти!**\n\n"
-            f"В этот раз не повезло — спасибо, что оставили отзыв! 🍀"
+            "🎲 **Почти!**\n\n"
+            "В этот раз не повезло — спасибо, что оставили отзыв! 🍀"
         )
 
     spin = WheelSpin(review_id=review_id, user_id=user_id, result=final_kind)
@@ -2355,7 +2752,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
             user_res = await session.execute(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
             user = user_res.scalar_one_or_none()
             if user:
-                user.balance += WHEEL_BALANCE_PRIZE
+                user.balance = round_money(user.balance + WHEEL_BALANCE_PRIZE)
                 log_balance_change(session, user.id, WHEEL_BALANCE_PRIZE, "wheel_bonus", user.balance, related_id=(spin.purchase_id or spin.review_id))
             spin.result = "balance"
             await session.commit()
@@ -2401,7 +2798,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
         f"📦 `{escape_md(software.name)}` — **{WHEEL_KEY_DURATION}**\n"
         f"🔑 `{escape_md(license_key.key_string)}`\n\n"
         + (f"📁 **Файлы:** [Открыть]({md_url(software.files_link)})\n\n" if software.files_link else "")
-        + f"💾 Ключ уже сохранён в разделе «👤 Мой профиль».",
+        + "💾 Ключ уже сохранён в разделе «👤 Мой профиль».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
@@ -2425,7 +2822,7 @@ async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSes
 # ==========================================
 @router.callback_query(F.data == "ref_program")
 async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
-    await state.clear()
+    await clear_state_keep_promo(state)
     user_id = callback.from_user.id
     user = await session.get(User, user_id)
     balance = user.balance if user else 0.0
@@ -2439,7 +2836,7 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
     text_msg = (
         f"🤝 **Реферальная программа**\n"
         f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Приглашайте друзей по вашей ссылке и получайте **5%** от суммы каждой их покупки прямо на баланс!\n\n"
+        f"Приглашайте друзей по вашей ссылке и получайте **{REFERRAL_PERCENT:.2f}%** от суммы каждой их покупки прямо на баланс!\n\n"
         f"👥 **Приглашено друзей:** `{total_refs}`\n"
         f"💰 **Доступный баланс:** `{balance:.2f} грн`\n"
         f"━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2453,7 +2850,7 @@ async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: 
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
         ]
     )
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await safe_edit_text(callback, bot, text_msg, keyboard)
     await callback.answer()
 
 @router.callback_query(F.data == "start_withdrawal")
@@ -2522,7 +2919,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
 
     data = await state.get_data()
     amount = data.get("amount")
-    if amount is None:
+    if not isinstance(amount, (int, float)) or not math.isfinite(amount) or not MIN_WITHDRAWAL <= amount <= MAX_AMOUNT:
         await message.answer("⚠️ Сессия вывода устарела, начните заново через «Реферальная система».")
         await state.clear()
         return
@@ -2538,7 +2935,7 @@ async def process_withdrawal_card(message: Message, state: FSMContext, session: 
         await state.clear()
         return
 
-    user.balance -= amount
+    user.balance = round_money(user.balance - amount)
     req = WithdrawalRequest(user_id=user_id, amount=amount, card=card)
     session.add(req)
     await session.flush()  # получаем req.id до commit, чтобы привязать к нему запись лога
@@ -2592,6 +2989,8 @@ async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot
         return
 
     req.status = "approved"
+    req.processed_by = callback.from_user.id
+    req.processed_at = datetime.now(timezone.utc)
     await session.commit()
 
     try:
@@ -2615,15 +3014,17 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
         return
 
-    req.status = "rejected"
-
-    # ФИКС: блокировка строки пользователя при возврате средств
     user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
-    if user:
-        user.balance += req.amount
-        log_balance_change(session, user.id, req.amount, "withdrawal_rejected_refund", user.balance, related_id=req.id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден. Возврат не выполнен.", show_alert=True)
+        return
 
+    req.status = "rejected"
+    req.processed_by = callback.from_user.id
+    req.processed_at = datetime.now(timezone.utc)
+    user.balance = round_money(user.balance + req.amount)
+    log_balance_change(session, user.id, req.amount, "withdrawal_rejected_refund", user.balance, related_id=req.id)
     await session.commit()
 
     try:
@@ -2641,7 +3042,7 @@ async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot:
 # ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ
 # ==========================================
 @router.callback_query(F.data == "deposit")
-async def start_deposit(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+async def start_deposit(callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot):
     # НОВОЕ: лимит заявок на пополнение в статусе "pending" на одного пользователя —
     # не даём плодить бесконечные заявки, пока предыдущие ещё не рассмотрены админом.
     pending_count = await session.scalar(
@@ -2659,10 +3060,11 @@ async def start_deposit(callback: CallbackQuery, state: FSMContext, session: Asy
         return
 
     await state.set_state(DepositStates.waiting_for_amount)
-    await callback.message.edit_text(
+    await safe_edit_text(
+        callback,
+        bot,
         f"💳 **Пополнение баланса**\n\nВведите сумму пополнения в гривнах числом (минимум {MIN_DEPOSIT:.0f} грн):",
-        reply_markup=cancel_kb("main_menu"),
-        parse_mode="Markdown"
+        cancel_kb("main_menu"),
     )
     await callback.answer()
 
@@ -2710,7 +3112,7 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
 
     # ФИКС: если состояние потерялось (перезапуск процесса), раньше создавалась
     # заявка на 0.00 грн, которую админ мог случайно «подтвердить».
-    if not isinstance(amount, (int, float)) or amount <= 0:
+    if not isinstance(amount, (int, float)) or not math.isfinite(amount) or not MIN_DEPOSIT <= amount <= MAX_AMOUNT:
         await state.clear()
         await message.answer("⚠️ Сессия пополнения устарела. Начните заново через «💳 Пополнить баланс».")
         return
@@ -2731,7 +3133,15 @@ async def process_receipt(message: Message, state: FSMContext, session: AsyncSes
         )
         return
 
-    req = DepositRequest(user_id=user_id, amount=amount)
+    receipt_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    receipt_type = "photo" if message.photo else "document"
+    req = DepositRequest(
+        user_id=user_id,
+        amount=amount,
+        payment_card=(data.get("card") or "")[:100] or None,
+        receipt_file_id=receipt_file_id,
+        receipt_type=receipt_type,
+    )
     session.add(req)
     await session.commit()
 
@@ -2799,14 +3209,17 @@ async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: B
         await callback.answer("❌ Заявка уже обработана!", show_alert=True)
         return
 
-    req.status = "approved"
-
-    # ФИКС: блокировка строки пользователя при зачислении депозита
     user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update().execution_options(populate_existing=True))
     user = user_res.scalar_one_or_none()
-    if user:
-        user.balance += req.amount
-        log_balance_change(session, user.id, req.amount, "deposit_approved", user.balance, related_id=req.id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден. Заявка не проведена.", show_alert=True)
+        return
+
+    req.status = "approved"
+    req.processed_by = callback.from_user.id
+    req.processed_at = datetime.now(timezone.utc)
+    user.balance = round_money(user.balance + req.amount)
+    log_balance_change(session, user.id, req.amount, "deposit_approved", user.balance, related_id=req.id)
     await session.commit()
 
     try:
@@ -2826,6 +3239,8 @@ async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bo
         return
 
     req.status = "rejected"
+    req.processed_by = callback.from_user.id
+    req.processed_at = datetime.now(timezone.utc)
     await session.commit()
 
     try:
@@ -2851,7 +3266,7 @@ async def _admin_dashboard_counts(session: AsyncSession):
 
 @router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
 @router.callback_query(F.data == "admin_dashboard_refresh", F.from_user.id.in_(ADMIN_IDS))
-async def admin_menu(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+async def admin_menu(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
     await state.clear()
     users, purchases, revenue, stock, pending_dep, pending_wdr, pending_reviews = await _admin_dashboard_counts(session)
     text_msg = (
@@ -2874,7 +3289,7 @@ async def admin_menu(callback: CallbackQuery, session: AsyncSession, state: FSMC
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_dashboard_refresh")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await safe_edit_text(callback, bot, text_msg, keyboard)
     await callback.answer()
 
 
@@ -2890,8 +3305,8 @@ async def admin_catalog_menu(callback: CallbackQuery, session: AsyncSession):
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить игру", callback_data="admin_add_game"), InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw")],
-        [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"), InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
-        [InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
+        [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"), InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price_select")],
+        [InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select"), InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
         [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"), InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
         [InlineKeyboardButton(text="📊 Склад по тарифам", callback_data="admin_stock")],
         [InlineKeyboardButton(text="🖼 Фото/описание", callback_data="admin_sw_media_select")],
@@ -2904,43 +3319,102 @@ async def admin_catalog_menu(callback: CallbackQuery, session: AsyncSession):
 
 
 @router.callback_query(F.data == "admin_stock", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.regexp(r"^admin_stock_page_[0-9]+$"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_stock_handler(callback: CallbackQuery, session: AsyncSession):
-    result = await session.execute(select(Product, Software).join(Software, Product.software_id == Software.id).order_by(Software.name.asc(), Product.id.asc()))
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("admin_stock_page_") else 0
+    result = await session.execute(
+        select(Product, Software)
+        .join(Software, Product.software_id == Software.id)
+        .order_by(Software.name.asc(), Product.id.asc())
+    )
     rows = result.all()
-    lines = ["📊 **СКЛАД ПО ТАРИФАМ**\n━━━━━━━━━━━━━━━━━━━"]
+    page, total_pages, offset = page_bounds(len(rows), page, CATALOG_PAGE_SIZE)
+    page_rows = rows[offset:offset + CATALOG_PAGE_SIZE]
+    product_ids = [product.id for product, _software in page_rows]
+    stock_map = {}
+    if product_ids:
+        stock_res = await session.execute(
+            select(LicenseKey.product_id, LicenseKey.is_sold, func.count(LicenseKey.id))
+            .where(LicenseKey.product_id.in_(product_ids))
+            .group_by(LicenseKey.product_id, LicenseKey.is_sold)
+        )
+        stock_map = {(pid, sold): count for pid, sold, count in stock_res.all()}
+    lines = ["📊 **СКЛАД ПО ТАРИФАМ**", "━━━━━━━━━━━━━━━━━━━"]
     buttons = []
-    if not rows:
+    if not page_rows:
         lines.append("Тарифов пока нет.")
-    for product, software in rows:
-        available = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == product.id, LicenseKey.is_sold == False)) or 0
-        sold = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == product.id, LicenseKey.is_sold == True)) or 0
-        icon = "🟢" if available else "🔴"
-        lines.append(f"{icon} **{escape_md(software.name)}** • `{escape_md(product.duration)}` → `{available}` шт. · продано `{sold}`")
-        buttons.append([InlineKeyboardButton(text=f"📥 Добавить в «{product.duration}»", callback_data=f"add_keys_prod_{product.id}")])
+    for product, software in page_rows:
+        available = stock_map.get((product.id, False), 0)
+        sold = stock_map.get((product.id, True), 0)
+        icon = "🟢" if available > LOW_STOCK_THRESHOLD else "🟡" if available else "🔴"
+        lines.append(
+            f"{icon} **{escape_md(software.name)}** · `{escape_md(product.duration)}`\n"
+            f"   В наличии `{available}` · продано `{sold}` · `{product.price:.2f} грн`"
+        )
+        buttons.append([InlineKeyboardButton(text=f"📥 {software.name[:30]} · {product.duration}", callback_data=f"add_keys_prod_{product.id}")])
+    nav = pagination_row("admin_stock_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton(text="🔙 Товары и склад", callback_data="admin_catalog")])
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.message.edit_text(clip_text("\n".join(lines)), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
     await callback.answer()
 
 
 @router.callback_query(F.data == "admin_sales", F.from_user.id.in_(ADMIN_IDS))
 async def admin_sales_menu(callback: CallbackQuery, session: AsyncSession):
-    today = datetime.now(timezone.utc).date()
+    now = datetime.now(timezone.utc)
+    today = now.date()
     total_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0))) or 0
     today_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(func.date(Purchase.purchased_at) == today)) or 0
+    week_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(Purchase.purchased_at >= now - timedelta(days=7))) or 0
+    month_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(Purchase.purchased_at >= now - timedelta(days=30))) or 0
     avg_check = await session.scalar(select(func.coalesce(func.avg(Purchase.price_paid), 0))) or 0
     purchases = await session.scalar(select(func.count(Purchase.id))) or 0
     text_msg = (
         "💳 **ПРОДАЖИ И ФИНАНСЫ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 Сегодня: **{float(today_revenue):.2f} грн**\n"
+        f"📆 7 дней: `{float(week_revenue):.2f} грн`\n"
+        f"🗓 30 дней: `{float(month_revenue):.2f} грн`\n"
         f"💰 За всё время: `{float(total_revenue):.2f} грн`\n"
-        f"📅 Сегодня: `{float(today_revenue):.2f} грн`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
         f"🛒 Покупок: `{purchases}`\n"
         f"🧾 Средний чек: `{float(avg_check):.2f} грн`"
     )
     await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧾 Неподтвержденные заявки", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="🧾 Неподтверждённые заявки", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="📤 Экспорт продаж CSV", callback_data="admin_export_sales")],
         [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
     ]), parse_mode="Markdown")
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin_export_sales", F.from_user.id.in_(ADMIN_IDS))
+async def admin_export_sales_handler(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(
+        select(Purchase).order_by(Purchase.purchased_at.desc()).limit(10_000)
+    )
+    purchases = result.scalars().all()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["purchase_id", "purchased_at_utc", "user_id", "product", "duration", "price_paid_uah"])
+    for purchase in purchases:
+        writer.writerow([
+            purchase.id,
+            purchase.purchased_at.isoformat() if purchase.purchased_at else "",
+            purchase.user_id,
+            purchase.product_name,
+            purchase.duration,
+            f"{purchase.price_paid:.2f}",
+        ])
+    document = BufferedInputFile(
+        output.getvalue().encode("utf-8-sig"),
+        filename=f"kranin_sales_{datetime.now(timezone.utc):%Y%m%d_%H%M}.csv",
+    )
+    await callback.message.answer_document(
+        document,
+        caption=f"📤 Продажи: {len(purchases)} записей (максимум 10 000 последних).",
+    )
+    await callback.answer("✅ CSV сформирован.")
 
 
 @router.callback_query(F.data == "admin_users", F.from_user.id.in_(ADMIN_IDS))
@@ -3030,6 +3504,8 @@ async def admin_pending_orders(callback: CallbackQuery, session: AsyncSession):
     for kind, req in page_items:
         prefix = "dep" if kind == "deposit" else "wdr"
         icon = "📥" if kind == "deposit" else "📤"
+        if kind == "deposit":
+            buttons.append([InlineKeyboardButton(text=f"🔎 Открыть пополнение #{req.id}", callback_data=f"admin_deposit_view_{req.id}")])
         buttons.append([
             InlineKeyboardButton(text=f"✅ {icon}#{req.id}", callback_data=f"approve_{prefix}_{req.id}"),
             InlineKeyboardButton(text=f"❌ {icon}#{req.id}", callback_data=f"reject_{prefix}_{req.id}"),
@@ -3054,6 +3530,58 @@ async def admin_pending_orders(callback: CallbackQuery, session: AsyncSession):
         parse_mode="Markdown"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_deposit_view_[0-9]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_deposit_view_handler(callback: CallbackQuery, session: AsyncSession):
+    req_id = int(callback.data.rsplit("_", 1)[1])
+    req = await session.get(DepositRequest, req_id)
+    if not req:
+        await callback.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+    user = await session.get(User, req.user_id)
+    username = f"@{escape_md(user.username)}" if user and user.username else "без username"
+    status_label = {"pending": "🕒 Ожидает", "approved": "✅ Подтверждена", "rejected": "❌ Отклонена"}.get(req.status, req.status)
+    text_msg = (
+        f"📥 **Пополнение #{req.id}**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 `{req.user_id}` · {username}\n"
+        f"💰 Сумма: **{req.amount:.2f} грн**\n"
+        f"💳 Карта получателя: `{escape_md(req.payment_card or 'не сохранена')}`\n"
+        f"📌 Статус: {status_label}\n"
+        f"🕒 Создана: `{format_dt(req.created_at)}`"
+    )
+    if req.processed_at:
+        text_msg += f"\n🛠 Обработана: `{format_dt(req.processed_at)}` · admin `{req.processed_by or '—'}`"
+    buttons = []
+    if req.receipt_file_id:
+        buttons.append([InlineKeyboardButton(text="📎 Открыть чек", callback_data=f"admin_deposit_receipt_{req.id}")])
+    if req.status == "pending":
+        buttons.append([
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_dep_{req.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_dep_{req.id}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="🔙 К заявкам", callback_data="admin_pending_orders")])
+    await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_deposit_receipt_[0-9]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_deposit_receipt_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.rsplit("_", 1)[1])
+    req = await session.get(DepositRequest, req_id)
+    if not req or not req.receipt_file_id:
+        await callback.answer("❌ Чек не сохранён для этой старой заявки.", show_alert=True)
+        return
+    caption = f"Чек к пополнению #{req.id} · {req.amount:.2f} грн"
+    try:
+        if req.receipt_type == "document":
+            await bot.send_document(callback.message.chat.id, req.receipt_file_id, caption=caption)
+        else:
+            await bot.send_photo(callback.message.chat.id, req.receipt_file_id, caption=caption)
+        await callback.answer()
+    except TelegramBadRequest:
+        await callback.answer("❌ Telegram не смог открыть сохранённый файл.", show_alert=True)
 
 
 @router.callback_query(F.data == "noop")
@@ -3714,7 +4242,6 @@ async def do_delete_promo(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("❌ Промокод не найден или уже был удален!", show_alert=True)
         return
 
-    code_name = promo.code
     # Сначала удаляем записи об активациях (нет каскада на уровне ORM-связи),
     # затем сам промокод, чтобы не упереться в FK-констрейнт.
     await session.execute(delete(PromoCodeUsage).where(PromoCodeUsage.promo_id == promo_id))
@@ -4062,7 +4589,7 @@ async def admin_change_balance_finish(message: Message, state: FSMContext, sessi
     old_balance = user.balance
 
     if is_relative:
-        new_balance = round(user.balance + val, 2)
+        new_balance = round_money(user.balance + val)
         if new_balance < 0:
             await message.answer(f"❌ Итоговый баланс не может быть отрицательным (получилось бы {new_balance:.2f} грн).")
             return
@@ -4071,10 +4598,10 @@ async def admin_change_balance_finish(message: Message, state: FSMContext, sessi
         if val < 0:
             await message.answer("❌ Баланс не может быть отрицательным.")
             return
-        user.balance = round(val, 2)
+        user.balance = round_money(val)
 
     # НОВОЕ: логируем ручную корректировку баланса администратором
-    delta = round(user.balance - old_balance, 2)
+    delta = round_money(user.balance - old_balance)
     log_balance_change(session, user.id, delta, "admin_adjust", user.balance, related_id=message.from_user.id)
 
     await session.commit()
@@ -4084,6 +4611,83 @@ async def admin_change_balance_finish(message: Message, state: FSMContext, sessi
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
         parse_mode="Markdown"
     )
+
+# --- ИЗМЕНЕНИЕ ЦЕНЫ БЕЗ РУЧНЫХ ЗАПРОСОВ К БД ---
+@router.callback_query(F.data == "admin_edit_price_select", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.regexp(r"^admin_price_page_[0-9]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_select_handler(callback: CallbackQuery, session: AsyncSession):
+    page = int(callback.data.rsplit("_", 1)[1]) if callback.data.startswith("admin_price_page_") else 0
+    result = await session.execute(
+        select(Product, Software)
+        .join(Software, Product.software_id == Software.id)
+        .order_by(Software.name.asc(), Product.id.asc())
+    )
+    rows = result.all()
+    page, total_pages, offset = page_bounds(len(rows), page, CATALOG_PAGE_SIZE)
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"✏️ {software.name[:32]} · {product.duration} · {product.price:.2f}",
+            callback_data=f"admin_price_prod_{product.id}",
+        )]
+        for product, software in rows[offset:offset + CATALOG_PAGE_SIZE]
+    ]
+    nav = pagination_row("admin_price_page_", page, total_pages)
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="🔙 Товары и склад", callback_data="admin_catalog")])
+    await callback.message.edit_text(
+        "✏️ **Изменение цены**\n\nВыберите тариф:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_price_prod_[0-9]+$"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_start(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    product_id = int(callback.data.rsplit("_", 1)[1])
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("❌ Тариф не найден.", show_alert=True)
+        return
+    software = await session.get(Software, product.software_id)
+    await state.update_data(price_product_id=product_id)
+    await state.set_state(AdminStates.waiting_for_new_price)
+    await callback.message.edit_text(
+        f"✏️ **Новая цена**\n\n📦 {escape_md(software.name if software else 'Товар')} · `{escape_md(product.duration)}`\n"
+        f"Текущая цена: `{product.price:.2f} грн`\n\nВведите новую цену числом:",
+        reply_markup=cancel_kb("admin_catalog"),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_new_price, F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_finish(message: Message, state: FSMContext, session: AsyncSession):
+    price = parse_positive_amount(message.text)
+    if price is None:
+        await message.answer("❌ Введите корректную положительную цену.", reply_markup=cancel_kb("admin_catalog"))
+        return
+    data = await state.get_data()
+    product_id = data.get("price_product_id")
+    product = await lock_row(session, Product, product_id)
+    if not product:
+        await state.clear()
+        await message.answer("❌ Тариф больше не существует.", reply_markup=admin_back_kb("admin_catalog"))
+        return
+    old_price = product.price
+    product.price = price
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ **Цена обновлена**\n\nБыло: `{old_price:.2f} грн`\nСтало: **{price:.2f} грн**\n\nУже оформленные заказы и история покупок не изменены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Склад", callback_data="admin_stock")],
+            [InlineKeyboardButton(text="🔙 Товары и склад", callback_data="admin_catalog")],
+        ]),
+        parse_mode="Markdown",
+    )
+
 
 # --- СОЗДАНИЕ ТАРИФОВ И УПРАВЛЕНИЕ СОФТОМ ---
 @router.callback_query(F.data == "admin_add_game", F.from_user.id.in_(ADMIN_IDS))
@@ -4466,10 +5070,13 @@ async def admin_sw_link_save(message: Message, state: FSMContext, session: Async
         sw.files_link = None
         result_text = f"✅ Ссылка для `{escape_md(sw.name)}` удалена."
     else:
-        if len(raw) > 500:
-            await message.answer("❌ Ссылка слишком длинная (максимум 500 символов). Пришлите короче.")
+        normalized_url = normalize_web_url(raw)
+        if not normalized_url:
+            await message.answer(
+                "❌ Нужна корректная ссылка, начинающаяся с https:// или http:// (максимум 500 символов, без логина и пароля в URL)."
+            )
             return
-        sw.files_link = raw
+        sw.files_link = normalized_url
         result_text = f"✅ Ссылка для `{escape_md(sw.name)}` сохранена и теперь будет выдаваться вместе с ключом."
 
     await session.commit()
@@ -4839,7 +5446,7 @@ async def clear_keys_menu(callback: CallbackQuery, session: AsyncSession):
     )
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🗑 Удалить непроданные ({unsold_count})", callback_data=f"confirm_del_unsold_{prod_id}")],
-        [InlineKeyboardButton(text=f"🔥 Удалить абсолютно ВСЕ ключи", callback_data=f"confirm_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="🔥 Удалить абсолютно ВСЕ ключи", callback_data=f"confirm_del_all_keys_{prod_id}")],
         [InlineKeyboardButton(text="🔙 К списку тарифов", callback_data="admin_del_keys_select")],
         [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]
     ])
@@ -4885,6 +5492,31 @@ async def do_del_all_keys(callback: CallbackQuery, session: AsyncSession):
     )
 
 # --- ЗАГРУЗКА КЛЮЧЕЙ ---
+async def _run_restock_notifications(bot: Bot, user_ids: list[int], software_name: str, duration: str) -> None:
+    """Отправляет уведомления вне транзакции и не блокирует ответ администратору."""
+    for user_id in user_ids:
+        for attempt in range(2):
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🔔 **Товар снова в наличии**\n\n📦 **{escape_md(software_name)}**\n⏳ `{escape_md(duration)}`",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🛒 Открыть каталог", callback_data="shop")],
+                    ]),
+                    parse_mode="Markdown",
+                )
+                break
+            except TelegramRetryAfter as exc:
+                if attempt == 0:
+                    await asyncio.sleep(min(float(exc.retry_after), 15.0))
+            except TelegramForbiddenError:
+                break
+            except Exception as exc:
+                logger.info("Не удалось уведомить %s о пополнении: %s", user_id, exc)
+                break
+        await asyncio.sleep(0.05)
+
+
 @router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
 async def admin_add_keys_select(callback: CallbackQuery, session: AsyncSession):
     res = await session.execute(select(Product))
@@ -5027,32 +5659,17 @@ async def process_keys_upload(message: Message, state: FSMContext, session: Asyn
     result_text += f"📊 Сейчас в наличии: `{available_now}`"
 
     if added_count > 0:
-        subs_res = await session.execute(
-            select(RestockSubscription).where(RestockSubscription.product_id == prod_id)
-        )
-        subs = subs_res.scalars().all()
+        subscriber_ids = list((await session.execute(
+            select(RestockSubscription.user_id).where(RestockSubscription.product_id == prod_id)
+        )).scalars().all())
         sw = await session.get(Software, prod.software_id)
         sw_name = sw.name if sw else "Товар"
-
-        for sub in subs:
-            for attempt in range(2):
-                try:
-                    await bot.send_message(
-                        sub.user_id,
-                        f"🔔 **Пополнение товара!**\n\n"
-                        f"Товар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
-                        parse_mode="Markdown",
-                    )
-                    break
-                except TelegramRetryAfter as e:
-                    # лимиты Telegram при большом числе подписчиков — ждём и пробуем ещё раз
-                    await asyncio.sleep(min(float(e.retry_after), 15.0))
-                except Exception:
-                    logger.info(f"Не удалось уведомить пользователя {sub.user_id} о пополнении.")
-                    break
-            await session.delete(sub)
-            await asyncio.sleep(0.05)
-        await session.commit()
+        if subscriber_ids:
+            await session.execute(
+                delete(RestockSubscription).where(RestockSubscription.product_id == prod_id)
+            )
+            await session.commit()
+            spawn_background(_run_restock_notifications(bot, subscriber_ids, sw_name, prod.duration))
 
     await message.answer(
         result_text,
@@ -5093,13 +5710,8 @@ async def fallback_user_message(message: Message, state: FSMContext, session: As
     if current_state is not None:
         return
     user = await session.get(User, message.from_user.id)
-    lang = user.language if user and user.language in LANGUAGES else "uk"
-    balance = user.balance if user else 0.0
-    await message.answer(
-        get_main_menu_text(balance, lang),
-        reply_markup=get_main_menu_kb(message.from_user.id, lang),
-        parse_mode="Markdown"
-    )
+    if user:
+        await send_main_menu(message, user)
 
 # ==========================================
 # HTTP-ЗАГЛУШКА ДЛЯ RENDER FREE
@@ -5122,25 +5734,37 @@ RENDER_STUB_HTML = (
 
 
 async def health_check(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok"})
+    """Liveness: процесс жив, даже если внешняя БД временно недоступна."""
+    return web.json_response({"status": "ok", "version": APP_VERSION})
+
+
+async def readiness_check(request: web.Request) -> web.Response:
+    """Readiness: отдельно проверяет доступность базы данных."""
+    try:
+        async with async_session_maker() as session:
+            await asyncio.wait_for(session.execute(text("SELECT 1")), timeout=3.0)
+        return web.json_response({"status": "ready", "database": "ok", "version": APP_VERSION})
+    except Exception:
+        logger.exception("Readiness check: база данных недоступна")
+        return web.json_response({"status": "not_ready", "database": "unavailable"}, status=503)
 
 
 async def index_page(request: web.Request) -> web.Response:
     return web.Response(text=RENDER_STUB_HTML, content_type="text/html")
 
 
-async def run_stub_server() -> None:
-    # Лёгкий HTTP-сервер только для того, чтобы Render Free видел открытый
-    # порт и не считал сервис "упавшим". Никакой бизнес-логики здесь нет.
+async def run_stub_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/", index_page)
     app.router.add_get("/health", health_check)
+    app.router.add_get("/ready", readiness_check)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logger.info(f"HTTP-заглушка запущена на порту {PORT}")
+    logger.info("HTTP health server запущен на порту %s", PORT)
+    return runner
 
 
 ACCOUNTS_PLATFORM_NAME = "Аккаунты • Taiwan"
@@ -5272,8 +5896,64 @@ async def run_migrations() -> None:
     except Exception as e:
         logger.exception("Миграция отдельной таблицы игр не выполнена: %s", e)
 
-    # Остальные исторические миграции проекта относятся к PostgreSQL.
+    # Миграции версии 3.0 для обеих поддерживаемых СУБД. create_all сам
+    # не добавляет колонки в уже существующие таблицы.
+    new_columns = {
+        "deposit_requests": {
+            "payment_card": "VARCHAR(100)",
+            "receipt_file_id": "VARCHAR(255)",
+            "receipt_type": "VARCHAR(20)",
+            "processed_by": "BIGINT",
+            "processed_at": "TIMESTAMP WITH TIME ZONE" if DATABASE_URL.startswith("postgresql") else "DATETIME",
+        },
+        "withdrawal_requests": {
+            "processed_by": "BIGINT",
+            "processed_at": "TIMESTAMP WITH TIME ZONE" if DATABASE_URL.startswith("postgresql") else "DATETIME",
+        },
+    }
+    try:
+        async with engine.begin() as conn:
+            for table_name, columns in new_columns.items():
+                if conn.dialect.name == "postgresql":
+                    for column_name, column_type in columns.items():
+                        await conn.execute(text(
+                            f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                        ))
+                else:
+                    existing_columns = await conn.run_sync(
+                        lambda sync_conn, table=table_name: {
+                            row[1]
+                            for row in sync_conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+                        }
+                    )
+                    for column_name, column_type in columns.items():
+                        if column_name not in existing_columns:
+                            await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
+
+            # Старые дубли подписок удаляются перед созданием уникального индекса.
+            await conn.execute(text(
+                "DELETE FROM restock_subscriptions WHERE id NOT IN "
+                "(SELECT MIN(id) FROM restock_subscriptions GROUP BY user_id, product_id)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_restock_user_product "
+                "ON restock_subscriptions(user_id, product_id)"
+            ))
+        logger.info("Миграции 3.0: реквизиты чеков, аудит заявок и подписки обновлены.")
+    except Exception as e:
+        raise RuntimeError(f"Критическая миграция 3.0 не выполнена: {e}") from e
+
     if not DATABASE_URL.startswith("postgresql"):
+        for idx_sql in (
+            "CREATE INDEX IF NOT EXISTS ix_license_keys_product_sold ON license_keys(product_id, is_sold)",
+            "CREATE INDEX IF NOT EXISTS ix_purchases_user_purchased ON purchases(user_id, purchased_at DESC)",
+            "CREATE INDEX IF NOT EXISTS ix_deposit_user_status ON deposit_requests(user_id, status)",
+        ):
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(text(idx_sql))
+            except Exception as e:
+                logger.warning("Создание SQLite-индекса не выполнено: %s", e)
         return
     try:
         async with engine.begin() as conn:
@@ -5441,31 +6121,52 @@ async def run_migrations() -> None:
 
 async def main() -> None:
     if not BOT_TOKEN:
-        logger.error("Переменная окружения BOT_TOKEN не задана. Останавливаю запуск.")
-        return
+        raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
 
-    # Создаём таблицы, если их ещё нет
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
     await run_migrations()
     await seed_platforms(async_session_maker)
 
+    storage = MemoryStorage()
+    if REDIS_URL:
+        try:
+            from aiogram.fsm.storage.redis import RedisStorage
+
+            storage = RedisStorage.from_url(REDIS_URL)
+            logger.info("FSM: подключено постоянное хранилище Redis")
+        except (ImportError, ValueError) as exc:
+            logger.warning("Redis FSM недоступен (%s); используется MemoryStorage", exc)
+    else:
+        logger.info("FSM: MemoryStorage; для сохранения сессий между рестартами задайте REDIS_URL")
+
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=storage)
     dp.update.middleware(DbSessionMiddleware(session_pool=async_session_maker))
-    dp.callback_query.outer_middleware(ThrottleMiddleware(interval=0.4))
+    dp.callback_query.outer_middleware(ThrottleMiddleware(interval=0.35))
     dp.include_router(router)
 
-    # HTTP-заглушка нужна Render Free, чтобы не убивать процесс из-за
-    # отсутствия открытого порта — поднимаем её параллельно с polling
-    await run_stub_server()
-
+    runner = None
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Бот запущен, начинаю polling...")
+        runner = await run_stub_server()
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Запустить бота"),
+            BotCommand(command="menu", description="Главное меню"),
+            BotCommand(command="help", description="Помощь и покупки"),
+        ])
+        await bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
+        logger.info("KRANIN SHOP %s запущен; polling начат", APP_VERSION)
         await dp.start_polling(bot)
     finally:
+        for task in list(_background_tasks):
+            task.cancel()
+        if _background_tasks:
+            await asyncio.gather(*list(_background_tasks), return_exceptions=True)
+        with suppress(Exception):
+            await storage.close()
+        if runner is not None:
+            await runner.cleanup()
         await bot.session.close()
         await engine.dispose()
 
