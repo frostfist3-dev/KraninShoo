@@ -6,6 +6,7 @@
 
 import asyncio
 import csv
+import html
 import io
 import logging
 import math
@@ -70,7 +71,7 @@ APP_VERSION = "3.0.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT").strip().lstrip("@")
-REVIEWS_CHANNEL_URL = os.getenv("REVIEWS_CHANNEL_URL", "https://t.me/KRANIN_REVIEWS").strip()
+REVIEWS_CHANNEL_URL = "https://t.me/KRANIN_REVIEWS"
 WELCOME_PHOTO_FILE_ID = os.getenv("WELCOME_PHOTO_FILE_ID", "").strip() or None
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
@@ -937,7 +938,7 @@ def get_main_menu_kb(user_id: int, lang: str = "uk"):
         [InlineKeyboardButton(text=texts["profile"], callback_data="profile"),
          InlineKeyboardButton(text=texts["deposit"], callback_data="deposit")],
         [InlineKeyboardButton(text=texts["promo"], callback_data="enter_promo"),
-         InlineKeyboardButton(text=texts["reviews"], callback_data="show_reviews")],
+         InlineKeyboardButton(text=texts["reviews"], url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text=texts["referral"], callback_data="ref_program")],
         [InlineKeyboardButton(text=texts["help"], callback_data="help"),
          InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
@@ -1376,75 +1377,18 @@ def review_stars(rating: int) -> str:
 @router.callback_query(F.data == "show_reviews")
 @router.callback_query(F.data.startswith("reviews_page_"))
 async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
-    page = 0
-    if callback.data.startswith("reviews_page_"):
-        try:
-            page = int(callback.data.split("_")[2])
-        except (ValueError, IndexError):
-            page = 0
-    total_reviews = await session.scalar(select(func.count(Review.id)).where(Review.status == "approved")) or 0
-    avg_rating = await session.scalar(select(func.avg(Review.rating)).where(Review.status == "approved")) or 0
-    breakdown_res = await session.execute(
-        select(Review.rating, func.count(Review.id)).where(Review.status == "approved").group_by(Review.rating)
+    """Публичный раздел отзывов ведёт в официальный Telegram-канал."""
+    text_msg = (
+        "⭐ **KRANIN SHOP — отзывы покупателей**\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        "Здесь публикуются реальные отзывы клиентов о покупках.\n"
+        "Нажмите кнопку ниже, чтобы открыть канал с отзывами."
     )
-    breakdown = {int(r): int(c) for r, c in breakdown_res.all()}
-    per_page = 4
-    total_pages = max(1, math.ceil(total_reviews / per_page))
-    page = max(0, min(page, total_pages - 1))
-
-    result = await session.execute(
-        select(Review, Software.name, Product.duration, User.username)
-        .join(Product, Review.product_id == Product.id, isouter=True)
-        .join(Software, Product.software_id == Software.id, isouter=True)
-        .join(User, Review.user_id == User.id, isouter=True)
-        .where(Review.status == "approved")
-        .order_by(Review.created_at.desc())
-        .offset(page * per_page).limit(per_page)
-    )
-    rows = result.all()
-
-    text_msg = "⭐ **Отзывы клиентов**\n━━━━━━━━━━━━━━━━━━━\n"
-    if total_reviews:
-        text_msg += f"🏆 Средняя оценка: **{float(avg_rating):.1f}/5** · всего `{total_reviews}`\n"
-        text_msg += (
-            f"5⭐ `{breakdown.get(5, 0)}` · 4⭐ `{breakdown.get(4, 0)}` · "
-            f"3⭐ `{breakdown.get(3, 0)}` · 2⭐ `{breakdown.get(2, 0)}` · 1⭐ `{breakdown.get(1, 0)}`\n"
-        )
-    else:
-        text_msg += "Пока нет опубликованных отзывов.\n"
-    text_msg += "━━━━━━━━━━━━━━━━━━━\n\n"
-    if not rows:
-        text_msg += "Здесь пока пусто — оставьте первый отзыв о покупке."
-    else:
-        blocks = []
-        for review, sw_name, duration, username in rows:
-            author = f"@{username}" if username else "Покупатель"
-            product_label = f"{sw_name} • {duration}" if sw_name else "Товар"
-            blocks.append(
-                f"{review_stars(review.rating)}  **{escape_md(author)}**\n"
-                f"📦 `{escape_md(product_label)}` · ✅ покупка подтверждена\n"
-                f"_{escape_md(review.text)}_\n"
-                f"🕒 {review.created_at.strftime('%d.%m.%Y')}"
-            )
-        text_msg += "\n\n──────────────\n\n".join(blocks)
-
-    buttons = []
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"reviews_page_{page - 1}"))
-    if total_pages > 1:
-        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"reviews_page_{page + 1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.extend([
-        [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="leave_review")],
-        [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
-        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Открыть канал отзывов", url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
-    await safe_edit_text(callback, bot, text_msg, InlineKeyboardMarkup(inline_keyboard=buttons))
+    await safe_edit_text(callback, bot, text_msg, keyboard)
     await callback.answer()
 
 
@@ -1596,34 +1540,67 @@ async def save_review_handler(message: Message, state: FSMContext, session: Asyn
     await state.clear()
 
     product_label = (await get_product_label_map(session)).get(int(product_id), "Товар")
-    admin_msg = (
-        f"⭐ **Новый отзыв на модерации**\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Отзыв: `{review.id}`\n"
-        f"👤 `{message.from_user.id}` ({user_display(message)})\n"
-        f"📦 `{escape_md(product_label)}`\n"
-        f"⭐ {review_stars(review.rating)}\n"
-        f"💬 {escape_md(text_val)}"
+    author = (
+        f"@{message.from_user.username}"
+        if message.from_user.username
+        else (message.from_user.full_name or "Покупатель")
     )
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"admin_approve_review_{review.id}"),
-         InlineKeyboardButton(text="🙈 Скрыть", callback_data=f"admin_hide_review_{review.id}")],
-        [InlineKeyboardButton(text="🔎 Открыть", callback_data=f"admin_review_view_{review.id}"),
-         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_del_review_confirm_{review.id}")],
-    ])
+    # Первое сообщение — готовый публичный пост без личных данных:
+    # администратор может переслать его в канал целиком, сохранив форматирование.
+    admin_msg = (
+        "<b>⭐ ОТЗЫВ ПОКУПАТЕЛЯ • KRANIN SHOP</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 <b>Товар:</b> {html.escape(product_label)}\n"
+        f"⭐ <b>Оценка:</b> {review_stars(review.rating)} ({review.rating}/5)\n"
+        "✅ <b>Покупка подтверждена</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>💬 ОТЗЫВ</b>\n"
+        f"<i>{html.escape(text_val)}</i>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>💎 KRANIN SHOP</b>"
+    )
+    # Служебные сведения идут отдельным сообщением и не попадут в канал,
+    # когда администратор пересылает готовый пост.
+    admin_details_msg = (
+        "🔒 СЛУЖЕБНАЯ ИНФОРМАЦИЯ — НЕ ПЕРЕСЫЛАТЬ\n"
+        f"👤 Покупатель: {author}\n"
+        f"🆔 Telegram ID: {message.from_user.id}\n"
+        f"🧾 Заказ: #{purchase.id} · Отзыв: #{review.id}\n"
+        f"📅 Дата: {format_dt(review.created_at)}\n"
+        f"↗️ Готовый пост выше можно переслать в {REVIEWS_CHANNEL_URL}"
+    )
+    delivered_to_admin = 0
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, admin_msg, reply_markup=admin_kb, parse_mode="Markdown")
+            await bot.send_message(admin_id, admin_msg, parse_mode="HTML")
+            delivered_to_admin += 1
+            try:
+                await bot.send_message(admin_id, admin_details_msg, parse_mode=None)
+            except Exception as details_error:
+                logger.error(f"Не удалось отправить служебные данные об отзыве админу {admin_id}: {details_error}")
         except Exception as e:
             logger.error(f"Не удалось уведомить админа о новом отзыве: {e}")
+
+    if delivered_to_admin:
+        confirmation = (
+            "✅ **Спасибо за отзыв!**\n\n"
+            "Ваш отзыв сохранён и отправлен администрации KRANIN SHOP.\n"
+            "После публикации он появится в нашем Telegram-канале."
+        )
+    else:
+        confirmation = (
+            "⚠️ **Отзыв сохранён, но уведомление администрации не доставлено.**\n\n"
+            "Пожалуйста, напишите в поддержку, чтобы отзыв не потерялся."
+        )
     await message.answer(
-        "✅ **Отзыв принят!**\n\nОн отправлен на модерацию и после проверки появится в разделе отзывов.",
+        confirmation,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎰 Крутить колесо фортуны", callback_data=f"wheelreview_{review.id}")],
-            [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+            [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
             [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-        ]), parse_mode="Markdown"
+        ]),
+        parse_mode="Markdown"
     )
 
 
@@ -1648,7 +1625,7 @@ async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
     if not rows:
         text_msg = "📋 **Мои отзывы**\n\nВы ещё не оставляли отзывов."
     else:
-        labels = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}
+        labels = {"pending": "🕒 На модерации", "approved": "✅ Проверен администрацией", "hidden": "🙈 Скрыт"}
         blocks = []
         for review, sw_name, duration in rows:
             product_label = f"{sw_name} • {duration}" if sw_name else "Товар"
@@ -1664,7 +1641,7 @@ async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
         buttons.append(nav)
     buttons.extend([
         [InlineKeyboardButton(text="✍️ Новый отзыв", callback_data="leave_review")],
-        [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+        [InlineKeyboardButton(text="⭐ Все отзывы", url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
     await callback.message.edit_text(clip_text(text_msg), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
@@ -3593,7 +3570,7 @@ async def noop_handler(callback: CallbackQuery):
 # --- ⭐ ПРОФЕССИОНАЛЬНАЯ МОДЕРАЦИЯ ОТЗЫВОВ ---
 REVIEW_FILTERS = {
     "pending": ("🕒 На модерации", "pending"),
-    "approved": ("✅ Опубликованные", "approved"),
+    "approved": ("✅ Проверенные", "approved"),
     "hidden": ("🙈 Скрытые", "hidden"),
     "all": ("📋 Все", None),
 }
@@ -3691,7 +3668,7 @@ async def admin_review_view(callback: CallbackQuery, session: AsyncSession):
     software = await session.get(Software, product.software_id) if product else None
     author = f"@{user.username}" if user and user.username else f"ID {review.user_id}"
     label = f"{software.name} • {product.duration}" if software and product else "Старый отзыв без товара"
-    status_label = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}.get(review.status, review.status)
+    status_label = {"pending": "🕒 На модерации", "approved": "✅ Проверен администрацией", "hidden": "🙈 Скрыт"}.get(review.status, review.status)
     text_msg = (
         f"⭐ **Отзыв #{review.id}**\n━━━━━━━━━━━━━━━━━━━\n"
         f"👤 Автор: `{escape_md(author)}`\n"
@@ -3727,7 +3704,7 @@ async def admin_approve_review(callback: CallbackQuery, session: AsyncSession, b
     review.status = "approved"
     await session.commit()
     try:
-        await bot.send_message(review.user_id, "✅ Ваш отзыв прошёл модерацию и опубликован в разделе «⭐ Отзывы»!")
+        await bot.send_message(review.user_id, "✅ Ваш отзыв проверен администрацией KRANIN SHOP. Спасибо за обратную связь!")
     except Exception:
         pass
     await callback.answer("✅ Отзыв опубликован.", show_alert=True)
