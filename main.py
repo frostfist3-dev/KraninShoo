@@ -1505,33 +1505,132 @@ async def profile_balance_history(callback: CallbackQuery, session: AsyncSession
 # КАТАЛОГ И ПОКУПКИ С УВЕДОМЛЕНИЯМИ (RESTOCK)
 # ==========================================
 @router.callback_query(F.data == "shop")
-async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+async def show_games(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    """Первый шаг каталога — выбор игры/категории.
+
+    В текущей схеме имя Software — это отображаемое имя позиции каталога.
+    Одинаковые имена, заведённые для разных ОС, объединяются в одну игру.
+    Это позволяет восстановить цепочку без пересоздания каталога и потери товаров.
+    """
     await state.clear()
-    result = await session.execute(select(Platform).order_by(Platform.name.asc()))
-    platforms = result.scalars().all()
+    result = await session.execute(
+        select(func.min(Software.id).label("game_id"), Software.name)
+        .group_by(Software.name)
+        .order_by(Software.name.asc())
+    )
+    games = result.all()
 
     text_msg = (
         "🛍 **МАГАЗИН ЛИЦЕНЗИЙ**\n"
         "━━━━━━━━━━━━━━━━━━━\n"
-        "📱 Выберите платформу вашего устройства:"
+        "🎮 Сначала выберите игру:"
     )
     buttons = []
-    for p in platforms:
-        name_lower = p.name.lower()
-        if "android" in name_lower:
+    for game_id, game_name in games:
+        icon = "🎮" if "аккаунт" in game_name.lower() else "🕹"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {game_name[:55]}",
+            callback_data=f"game_{game_id}",
+        )])
+
+    if not buttons:
+        text_msg += "\n\nПока нет доступных игр. Загляните позже."
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    await callback.message.edit_text(
+        text_msg,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("game_"))
+async def show_game_os(callback: CallbackQuery, session: AsyncSession):
+    """Второй шаг — показываем только ОС, для которых заведена выбранная игра."""
+    try:
+        game_id = int(callback.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректная игра.", show_alert=True)
+        return
+
+    game = await session.get(Software, game_id)
+    if not game:
+        await callback.answer("Игра больше не найдена. Откройте каталог заново.", show_alert=True)
+        return
+
+    rows = await session.execute(
+        select(Platform.id, Platform.name)
+        .join(Software, Software.platform_id == Platform.id)
+        .where(Software.name == game.name)
+        .group_by(Platform.id, Platform.name)
+        .order_by(Platform.name.asc())
+    )
+    platforms = rows.all()
+
+    buttons = []
+    for platform_id, platform_name in platforms:
+        lower_name = platform_name.lower()
+        if "android" in lower_name:
             icon = "🤖"
-        elif "ios" in name_lower:
+        elif "ios" in lower_name:
             icon = "🍏"
-        elif "аккаунт" in name_lower:
+        elif "аккаунт" in lower_name:
             icon = "🎮"
         else:
-            icon = "📦"
-        buttons.append([InlineKeyboardButton(text=f"{icon} {p.name}", callback_data=f"platform_{p.id}")])
+            icon = "📱"
+        buttons.append([InlineKeyboardButton(
+            text=f"{icon} {platform_name}",
+            callback_data=f"gameos_{game.id}_{platform_id}",
+        )])
 
-    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    buttons.append([InlineKeyboardButton(text="🔙 К выбору игры", callback_data="shop")])
+    await callback.message.edit_text(
+        f"🎮 **{escape_md(game.name)}**\n━━━━━━━━━━━━━━━━━━━\n📱 Теперь выберите операционную систему:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
 
-    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("gameos_"))
+async def show_game_os_products(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    """После выбора ОС открывает товар выбранной игры на этой ОС."""
+    try:
+        _, game_id_raw, platform_id_raw = callback.data.split("_")
+        game_id, platform_id = int(game_id_raw), int(platform_id_raw)
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный выбор ОС.", show_alert=True)
+        return
+
+    game = await session.get(Software, game_id)
+    if not game:
+        await callback.answer("Игра больше не найдена. Откройте каталог заново.", show_alert=True)
+        return
+
+    result = await session.execute(
+        select(Software)
+        .where(Software.name == game.name, Software.platform_id == platform_id)
+        .order_by(Software.id.asc())
+    )
+    matching = result.scalars().all()
+    if not matching:
+        await callback.answer("Для этой игры пока нет товаров на выбранной ОС.", show_alert=True)
+        return
+
+    if len(matching) == 1:
+        await _show_products_for_software(callback, session, bot, matching[0].id)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"🛡 {sw.name[:40]} · вариант {index}", callback_data=f"software_{sw.id}")]
+        for index, sw in enumerate(matching, start=1)
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 К выбору ОС", callback_data=f"game_{game.id}")])
+    await callback.message.edit_text(
+        f"🎮 **{escape_md(game.name)}**\n━━━━━━━━━━━━━━━━━━━\nВыберите вариант:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("platform_"))
@@ -1598,7 +1697,17 @@ async def _render_software_screen(
 
 @router.callback_query(F.data.startswith("software_"))
 async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot):
-    software_id = int(callback.data.split("_")[1])
+    try:
+        software_id = int(callback.data.split("_")[1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+    await _show_products_for_software(callback, session, bot, software_id)
+
+
+async def _show_products_for_software(
+    callback: CallbackQuery, session: AsyncSession, bot: Bot, software_id: int
+):
     software = await session.get(Software, software_id)
     if not software:
         await callback.answer("❌ Софт не найден!", show_alert=True)
@@ -1618,7 +1727,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot
     if not product_rows:
         text_msg = f"🛒 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}❌ Тарифы для этого софта пока отсутствуют."
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")],
+            [InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"game_{software.id}")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
         ])
         await _render_software_screen(callback, bot, software, text_msg, keyboard)
@@ -1641,7 +1750,7 @@ async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot
                 callback_data=f"notify_restock_{p.id}"
             )])
 
-    buttons.append([InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"game_{software.id}")])
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1948,7 +2057,7 @@ async def process_purchase(callback: CallbackQuery, session: AsyncSession, state
         [InlineKeyboardButton(text="✍️ Оставить отзыв и крутить колесо 🎰", callback_data=f"leave_review_product_{product.id}")],
         [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
-        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
+        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"game_{software.id}" if software else "shop")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
     await callback.message.answer(
