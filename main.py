@@ -1,0 +1,5314 @@
+import asyncio
+import logging
+import math
+import os
+import random
+import secrets
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+try:
+    from aiogram.fsm.storage.redis import RedisStorage
+except ImportError:  # Redis — необязательная зависимость для постоянного FSM
+    RedisStorage = None
+from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    case,
+    DateTime,
+    Index,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    delete,
+    exists,
+    func,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# ==========================================
+# ЛОГИРОВАНИЕ И КОНФИГУРАЦИЯ БД
+# ==========================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT").strip()
+REVIEWS_CHANNEL_URL = os.getenv("REVIEWS_CHANNEL_URL", "https://t.me/KRANIN_REVIEWS").strip()
+if SUPPORT_USERNAME.startswith("https://t.me/"):
+    SUPPORT_URL = SUPPORT_USERNAME
+else:
+    SUPPORT_URL = f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
+
+def env_int(name: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        logger.warning("Некорректная переменная %s — используется значение %s", name, default)
+        value = default
+    if minimum is not None and value < minimum:
+        logger.warning("Переменная %s меньше минимума %s — используется %s", name, minimum, minimum)
+        value = minimum
+    return value
+
+
+def env_float(name: str, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip().replace(",", "."))
+        if not math.isfinite(value):
+            raise ValueError("non-finite")
+    except (TypeError, ValueError):
+        logger.warning("Некорректная переменная %s — используется значение %s", name, default)
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+raw_admin_ids = os.getenv("ADMIN_IDS", "8479717148")
+ADMIN_IDS = [int(x.strip()) for x in raw_admin_ids.split(",") if x.strip().isdigit()]
+# НОВОЕ: диагностика — os.getenv возвращает дефолт ТОЛЬКО если переменная
+# окружения полностью не задана. Если ADMIN_IDS на Render задан, но пустой
+# или содержит нечисловой мусор (пробелы, лишние запятые и т.п.), список
+# молча становится пустым — и все уведомления админам (отзывы, депозиты,
+# низкий остаток и т.д.) просто не с кем отправлять: цикл `for admin_id in
+# ADMIN_IDS` ни разу не выполнится, поэтому в логах не будет даже ошибки.
+logger.info(f"ADMIN_IDS: raw='{raw_admin_ids}' -> parsed={ADMIN_IDS}")
+if not ADMIN_IDS:
+    logger.warning(
+        "ADMIN_IDS пуст! Все уведомления администраторам (отзывы, депозиты, "
+        "низкий остаток ключей и т.д.) отправляться не будут. Проверьте "
+        "переменную окружения ADMIN_IDS на Render — она должна содержать "
+        "ваш Telegram ID (число), например: 123456789"
+    )
+
+# Разумные пределы для финансовых сумм, чтобы отсечь inf/nan/переполнения
+MAX_AMOUNT = 1_000_000.0
+MIN_WITHDRAWAL = 500.0
+MIN_DEPOSIT = env_float("MIN_DEPOSIT", 20.0, minimum=1.0, maximum=MAX_AMOUNT)
+
+# Сколько заявок на пополнение в статусе "pending" может одновременно
+# висеть у одного пользователя, прежде чем он сможет создать новую
+MAX_PENDING_DEPOSITS = env_int("MAX_PENDING_DEPOSITS", 3, minimum=1)
+
+# НОВОЕ: порог остатка ключей, при пересечении которого админам приходит
+# уведомление "товар заканчивается". Срабатывает ровно один раз при
+# достижении этого количества (а не на каждой продаже ниже порога),
+# плюс отдельное уведомление при полном обнулении остатка.
+LOW_STOCK_THRESHOLD = env_int("LOW_STOCK_THRESHOLD", 3, minimum=0)
+REFERRAL_BONUS_PERCENT = env_float("REFERRAL_BONUS_PERCENT", 5.0, minimum=0.0, maximum=100.0)
+MAX_KEYS_PER_UPLOAD = env_int("MAX_KEYS_PER_UPLOAD", 500, minimum=1)
+BROADCAST_DELAY_SECONDS = env_float("BROADCAST_DELAY_SECONDS", 0.06, minimum=0.05, maximum=2.0)
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
+# НОВОЕ: колесо фортуны после покупки — вероятности и призы
+WHEEL_KEY_CHANCE = 0.05       # 5% — ключ на 1 день любого софта
+WHEEL_BALANCE_CHANCE = 0.05   # 5% — 50 грн на баланс
+# оставшиеся 90% — "повезёт в следующий раз"
+WHEEL_BALANCE_PRIZE = 50.0
+WHEEL_KEY_DURATION = "1 день"
+
+# Максимальные длины пользовательского текста, чтобы не словить необработанный
+# DataError от БД (Postgres обрывает insert, если строка длиннее колонки)
+MAX_REVIEW_LENGTH = 500
+MAX_PROMO_CODE_LENGTH = 50
+MAX_SOFTWARE_NAME_LENGTH = 100
+MAX_DURATION_LENGTH = 50
+
+# Порт для HTTP-заглушки: Render Free Web Service требует, чтобы процесс
+# слушал $PORT, иначе деплой считается "упавшим" и уходит в бесконечный рестарт
+PORT = env_int("PORT", 10000, minimum=1)
+
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite+aiosqlite:///bot.db"
+    engine = create_async_engine(
+        DATABASE_URL, echo=False, pool_pre_ping=True, pool_recycle=300
+    )
+else:
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://").replace("postgresql://", "postgresql+asyncpg://")
+    # asyncpg получает TLS через connect_args, поэтому убираем параметры
+    # libpq (sslmode/channel_binding), которые драйвер asyncpg не понимает.
+    if "?" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.split("?")[0]
+
+    connect_args = {}
+    db_url_lower = DATABASE_URL.lower()
+    if any(domain in db_url_lower for domain in (
+        "oregon-postgres", "frankfurt-postgres", "render.com", "neon.tech"
+    )):
+        connect_args = {"ssl": "require"}
+
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args=connect_args,
+        pool_pre_ping=True,
+        pool_recycle=300,
+    )
+
+DEFAULT_CARDS = [
+    "4441 1111 5555 7352 (Моно)",
+    "4323 3473 8685 7285 (А-Банк)",
+    "5232 4410 4407 1160 (Альянс)",
+]
+# Карты можно менять в настройках Render без редактирования исходника.
+# Разделитель — новая строка или точка с запятой. Пустая переменная сохраняет старые реквизиты.
+raw_payment_cards = os.getenv("PAYMENT_CARDS", "").replace(";", "\n")
+CARDS = [card.strip() for card in raw_payment_cards.splitlines() if card.strip()] or DEFAULT_CARDS
+
+PERMANENT_DURATION = "Навсегда"
+DURATIONS = ["1 день", "7 дней", "30 дней", PERMANENT_DURATION]
+
+async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+router = Router()
+BROADCAST_LOCK = asyncio.Lock()
+
+
+# ==========================================
+# ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК
+# ==========================================
+# ФИКС ГЛАВНОГО БАГА "БОТ ЗАВИСАЕТ": если внутри любого хэндлера возникало
+# необработанное исключение (например, Telegram отклонял edit_text из-за
+# сломанной Markdown-разметки в ключе), aiogram просто логировал ошибку и
+# останавливал обработку апдейта. callback.answer() при этом ни разу не
+# вызывался, поэтому у пользователя нажатая кнопка вечно "крутилась"
+# (Telegram ждёт answerCallbackQuery до ~30-60 сек, и это выглядит как
+# зависание бота). Теперь любая ошибка перехватывается централизованно:
+# мы логируем её и гарантированно отвечаем пользователю, чтобы кнопка
+# разблокировалась, а чат не зависал в ожидании ответа.
+@router.errors()
+async def global_error_handler(event: ErrorEvent, bot: Bot) -> bool:
+    logger.exception(
+        f"Необработанная ошибка при обработке апдейта: {event.exception}",
+        exc_info=event.exception,
+    )
+
+    update = event.update
+    try:
+        if update.callback_query:
+            try:
+                await update.callback_query.answer(
+                    "⚠️ Произошла ошибка при обработке запроса. Попробуйте ещё раз "
+                    "или обратитесь в поддержку.",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+        elif update.message:
+            try:
+                await update.message.answer(
+                    "⚠️ Произошла ошибка при обработке запроса. Попробуйте ещё раз "
+                    "или обратитесь в поддержку."
+                )
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("Ошибка внутри самого глобального обработчика ошибок")
+
+    # НОВОЕ: уведомляем админов о непредвиденных ошибках, чтобы их не пришлось
+    # искать вручную в логах Render
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🐞 Ошибка в боте: `{escape_md(str(event.exception))[:500]}`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    return True
+
+
+def escape_md(value) -> str:
+    if value is None:
+        return ""
+    value = str(value)
+    for ch in ("\\", "_", "*", "`", "["):
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
+async def safe_edit_text(
+    callback: CallbackQuery, bot: Bot, text_msg: str, keyboard: InlineKeyboardMarkup, parse_mode: str = "Markdown"
+) -> None:
+    # НОВОЕ: после экрана софта с фото сообщение является фото-сообщением, и
+    # обычный edit_text у него упадёт ("there is no text in the message to
+    # edit"). Эта обёртка ловит такой случай и вместо правки шлёт новое
+    # текстовое сообщение — используется на всех переходах, которые могут
+    # быть первым шагом сразу после экрана с фото.
+    try:
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode=parse_mode)
+    except TelegramBadRequest:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await bot.send_message(callback.message.chat.id, text_msg, reply_markup=keyboard, parse_mode=parse_mode)
+
+
+def user_display(message_or_callback) -> str:
+    u = message_or_callback.from_user
+    username = u.username
+    if username:
+        return f"@{escape_md(username)}"
+    return "без юзернейма"
+
+
+def money_round(value) -> float:
+    """Round all wallet operations to cents using financial half-up rounding."""
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            raise ValueError("non-finite amount")
+        return float(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid monetary value: {value!r}") from exc
+
+
+def money_add(current, delta) -> float:
+    """Avoid repeated binary-float drift when changing a user's balance."""
+    return money_round(Decimal(str(current)) + Decimal(str(delta)))
+
+
+def parse_positive_amount(raw_text: str, max_amount: float = MAX_AMOUNT) -> float | None:
+    # Безопасный парсинг положительной денежной суммы из текста.
+    # Возвращает None, если значение некорректно (не число, <= 0, inf/nan, слишком большое).
+    if raw_text is None:
+        return None
+    try:
+        value = float(raw_text.strip().replace(",", "."))
+    except ValueError:
+        return None
+    if not math.isfinite(value):
+        return None
+    if value <= 0:
+        return None
+    if value > max_amount:
+        return None
+    # Округляем до копеек, чтобы не плодить "грязные" значения из-за float
+    return money_round(value)
+
+
+def normalize_duration(value: str) -> str:
+    """Нормализует срок тарифа, сохраняя старые произвольные значения."""
+    value = (value or "").strip()
+    aliases = {
+        "навсегда": PERMANENT_DURATION,
+        "навечно": PERMANENT_DURATION,
+        "бессрочно": PERMANENT_DURATION,
+        "forever": PERMANENT_DURATION,
+        "permanent": PERMANENT_DURATION,
+    }
+    return aliases.get(value.casefold(), value)
+
+
+def log_balance_change(
+    session: AsyncSession,
+    user_id: int,
+    amount: float,
+    reason: str,
+    balance_after: float,
+    related_id: int | None = None,
+) -> None:
+    # Добавляет запись в лог операций с балансом (таблица BalanceLog).
+    # Не делает commit самостоятельно — запись уходит в базу вместе
+    # с остальными изменениями текущей транзакции.
+    # amount: дельта изменения баланса (положительная — начисление, отрицательная — списание)
+    # balance_after: баланс пользователя ПОСЛЕ применения этой операции
+    session.add(
+        BalanceLog(
+            user_id=user_id,
+            amount=money_round(amount),
+            balance_after=money_round(balance_after),
+            reason=reason,
+            related_id=related_id,
+        )
+    )
+
+
+def escape_like(value: str) -> str:
+    # Экранирует служебные символы SQL LIKE/ILIKE (% и _ — вайлдкарды),
+    # иначе username вида "john_doe" будет матчить и "johnXdoe".
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def find_user_by_identifier(session: AsyncSession, raw_identifier: str) -> "User | None":
+    # Ищет пользователя по Telegram ID (число) либо по username (с @ или без).
+    identifier = raw_identifier.strip()
+    if identifier.startswith("@"):
+        identifier = identifier[1:]
+
+    if not identifier:
+        return None
+
+    if identifier.isdigit():
+        user = await session.get(User, int(identifier))
+        if user:
+            return user
+        # число может быть и частью username, поэтому продолжаем поиск ниже,
+        # только если по ID никого не нашли
+
+    # ФИКС: экранируем % и _ в пользовательском вводе, иначе ILIKE трактует
+    # их как вайлдкарды SQL и может найти не того пользователя
+    res = await session.execute(
+        select(User).where(User.username.ilike(escape_like(identifier), escape="\\"))
+    )
+    return res.scalars().first()
+
+
+# ==========================================
+# ЛОКАЛИЗАЦИЯ И ЯЗЫКИ
+# ==========================================
+LANGUAGES = {
+    "uk": {
+        "welcome": "💎 ✦ **KRANIN SHOP** ✦ 💎\n⚡️ Надійний сервіс цифрових ліцензій та софту\n━━━━━━━━━━━━━━━━━━━\n💰 **Баланс:** `{balance:.2f} грн`\n━━━━━━━━━━━━━━━━━━━\n\n👇 Оберіть розділ у меню нижче:",
+        "banned": "❌ Ваш акаунт заблоковано в боті.",
+        "lang_changed": "✅ Мову успішно змінено на українську.",
+        "lang_btn": "🌐 Змінити мову / Сменить язык"
+    },
+    "ru": {
+        "welcome": "💎 ✦ **KRANIN SHOP** ✦ 💎\n⚡️ Надежный сервис цифровых лицензий и софта\n━━━━━━━━━━━━━━━━━━━\n💰 **Баланс:** `{balance:.2f} грн`\n━━━━━━━━━━━━━━━━━━━\n\n👇 Выберите раздел в меню ниже:",
+        "banned": "❌ Ваш аккаунт заблокирован в боте.",
+        "lang_changed": "✅ Язык успешно изменен на русский.",
+        "lang_btn": "🌐 Изменить язык / Змінити мову"
+    }
+}
+
+def get_language_kb(is_reg: bool = False):
+    prefix = "reg_lang_" if is_reg else "lang_"
+    keyboard = [
+        [InlineKeyboardButton(text="🇺🇦 Українська", callback_data=f"{prefix}uk"),
+         InlineKeyboardButton(text="🇷🇺 Русский", callback_data=f"{prefix}ru")]
+    ]
+    if not is_reg:
+        keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+# ==========================================
+# МОДЕЛИ БАЗЫ ДАННЫХ
+# ==========================================
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    balance: Mapped[float] = mapped_column(Float, default=0.0)
+    referred_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=True)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
+    language: Mapped[str] = mapped_column(String(10), default="uk")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class Platform(Base):
+    __tablename__ = "platforms"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+    softwares = relationship("Software", back_populates="platform", cascade="all, delete-orphan")
+
+class Software(Base):
+    __tablename__ = "softwares"
+    __table_args__ = (Index("idx_softwares_platform_name", "platform_id", "name"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    platform_id: Mapped[int] = mapped_column(ForeignKey("platforms.id"))
+    name: Mapped[str] = mapped_column(String(100))
+    # НОВОЕ: file_id фото Telegram, которое показывается над текстом при выборе софта
+    photo_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # НОВОЕ: описание софта (например, текст про аккаунт), показывается над списком тарифов
+    description: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # НОВОЕ: ссылка на файлы (например, инструкция/архив), выдаётся покупателю вместе с ключом
+    files_link: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    platform = relationship("Platform", back_populates="softwares")
+    products = relationship("Product", back_populates="software", cascade="all, delete-orphan")
+
+class Product(Base):
+    __tablename__ = "products"
+    __table_args__ = (Index("idx_products_software_duration", "software_id", "duration"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    software_id: Mapped[int] = mapped_column(ForeignKey("softwares.id"))
+    duration: Mapped[str] = mapped_column(String(50))
+    price: Mapped[float] = mapped_column(Float)
+    software = relationship("Software", back_populates="products")
+    keys = relationship("LicenseKey", back_populates="product", cascade="all, delete-orphan")
+    subscriptions = relationship("RestockSubscription", back_populates="product", cascade="all, delete-orphan")
+
+class LicenseKey(Base):
+    __tablename__ = "license_keys"
+    __table_args__ = (Index("idx_license_keys_product_sold", "product_id", "is_sold"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    key_string: Mapped[str] = mapped_column(String(255), unique=True)
+    is_sold: Mapped[bool] = mapped_column(Boolean, default=False)
+    product = relationship("Product", back_populates="keys")
+
+class Purchase(Base):
+    __tablename__ = "purchases"
+    __table_args__ = (Index("idx_purchases_user_date_v2", "user_id", "purchased_at"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    # Точный тариф и цена на момент покупки — нужны для истории, статистики и отзывов.
+    product_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("products.id"), nullable=True)
+    product_name: Mapped[str] = mapped_column(String(100))
+    key_issued: Mapped[str] = mapped_column(String(255))
+    duration: Mapped[str] = mapped_column(String(50), default="")
+    price_paid: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    # Idempotency token protects against double taps / replayed Telegram callbacks.
+    order_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
+    purchased_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+# НОВОЕ: колесо фортуны после покупки. Отдельная таблица (а не колонка в
+# Purchase) специально для того, чтобы не трогать уже существующую в
+# продакшене таблицу purchases — create_all создаёт только отсутствующие
+# таблицы и не делает ALTER TABLE, поэтому новая таблица безопасно
+# появится сама при следующем запуске без ручной миграции.
+class WheelSpin(Base):
+    __tablename__ = "wheel_spins"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # ИЗМЕНЕНО: purchase_id стал nullable — спин теперь может быть привязан
+    # либо к покупке, либо к отзыву (review_id). Ровно одно из двух заполнено.
+    purchase_id: Mapped[int | None] = mapped_column(ForeignKey("purchases.id"), unique=True, nullable=True)
+    review_id: Mapped[int | None] = mapped_column(ForeignKey("reviews.id"), unique=True, nullable=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    result: Mapped[str] = mapped_column(String(20))  # key / balance / lose
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class DepositRequest(Base):
+    __tablename__ = "deposit_requests"
+    __table_args__ = (Index("idx_deposit_user_status", "user_id", "status"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    amount: Mapped[float] = mapped_column(Float)
+    # Сохраняем реквизиты и file_id чека: админ сможет найти и перепроверить
+    # заявку даже если исходное уведомление в Telegram потерялось.
+    payment_card: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    receipt_file_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    receipt_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # Если пополнение началось из покупки, сохраним цель — после одобрения
+    # пользователь получит кнопку возврата к этому товару. Без FK, чтобы
+    # удаление товара не ломало историю уже созданных заявок.
+    purchase_product_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class WithdrawalRequest(Base):
+    __tablename__ = "withdrawal_requests"
+    __table_args__ = (Index("idx_withdrawal_user_status", "user_id", "status"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    amount: Mapped[float] = mapped_column(Float)
+    card: Mapped[str] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class BalanceLog(Base):
+    # Журнал всех операций, меняющих баланс пользователя.
+    __tablename__ = "balance_logs"
+    __table_args__ = (Index("idx_balance_logs_user_date_v2", "user_id", "created_at"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    amount: Mapped[float] = mapped_column(Float)  # дельта: + начисление, - списание
+    balance_after: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(String(50))  # purchase / deposit_approved / withdrawal_request / ...
+    # ФИКС: raньше был Integer (int32) — падало с DataError "value out of int32
+    # range", когда сюда записывали Telegram user_id (BigInteger), например
+    # в реферальных бонусах и ручной корректировке баланса админом.
+    related_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)  # id связанной сущности (заявки, покупки, user_id и т.д.)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class PromoCode(Base):
+    __tablename__ = "promo_codes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(50), unique=True)
+    amount: Mapped[float] = mapped_column(Float)
+    uses_left: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class PromoCodeUsage(Base):
+    # НОВОЕ: фиксирует, что конкретный пользователь уже активировал конкретный
+    # промокод — не даёт одному человеку в одиночку выесть весь uses_left,
+    # повторно присылая один и тот же код.
+    __tablename__ = "promo_code_usages"
+    __table_args__ = (UniqueConstraint("promo_id", "user_id", name="uq_promo_user_once"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    promo_id: Mapped[int] = mapped_column(ForeignKey("promo_codes.id"))
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class Review(Base):
+    __tablename__ = "reviews"
+    __table_args__ = (Index("idx_reviews_user_date", "user_id", "created_at"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    # Отзыв привязан к конкретному тарифу/покупке. Старые записи могут иметь NULL.
+    product_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("products.id"), nullable=True)
+    purchase_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("purchases.id"), nullable=True)
+    rating: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(String(500))
+    # Снимок названия товара: отзыв остаётся понятным даже после удаления тарифа.
+    product_label: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    status: Mapped[str] = mapped_column(String(20), default="pending", server_default="pending")
+
+class RestockSubscription(Base):
+    __tablename__ = "restock_subscriptions"
+    __table_args__ = (UniqueConstraint("user_id", "product_id", name="uq_restock_user_product"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"))
+    product = relationship("Product", back_populates="subscriptions")
+
+# ==========================================
+# MIDDLEWARE & STATES
+# ==========================================
+class DbSessionMiddleware(BaseMiddleware):
+    def __init__(self, session_pool):
+        super().__init__()
+        self.session_pool = session_pool
+
+    async def __call__(self, handler, event: Update, data):
+        async with self.session_pool() as session:
+            data["session"] = session
+            # ФИКС: middleware зарегистрирован через dp.update.middleware(...),
+            # поэтому `event` здесь — это верхнеуровневый Update, а у него
+            # НЕТ атрибута from_user (он есть только у вложенных
+            # Update.message / Update.callback_query). getattr(event,
+            # "from_user", None) молча возвращал None всегда, и проверка
+            # бана никогда не выполнялась. Достаём реальное вложенное
+            # событие (message/callback_query/...) и берём from_user у него.
+            actual_event = (
+                event.message
+                or event.callback_query
+                or event.edited_message
+                or event.channel_post
+                or event.my_chat_member
+            )
+            user_obj = getattr(actual_event, "from_user", None) if actual_event else None
+            if user_obj:
+                user = await session.get(User, user_obj.id)
+                if user and user.is_banned:
+                    lang = user.language if user.language in LANGUAGES else "uk"
+                    msg_text = LANGUAGES[lang]["banned"]
+                    if isinstance(actual_event, Message):
+                        await actual_event.answer(msg_text)
+                    elif isinstance(actual_event, CallbackQuery):
+                        await actual_event.answer(msg_text, show_alert=True)
+                    return
+            return await handler(event, data)
+
+class AdminStates(StatesGroup):
+    waiting_for_software_platform = State()
+    waiting_for_software_name = State()
+    waiting_for_duration = State()
+    waiting_for_price = State()
+    waiting_for_keys = State()
+    waiting_for_software_media = State()
+    waiting_for_software_files_link = State()
+    waiting_for_promo_code = State()
+    waiting_for_promo_amount = State()
+    waiting_for_promo_uses = State()
+    waiting_for_broadcast_audience = State()
+    waiting_for_broadcast_text = State()
+    waiting_for_user_id = State()
+    waiting_for_user_balance_change = State()
+    waiting_for_product_price = State()
+
+class DepositStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_receipt = State()
+
+class WithdrawalStates(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_card = State()
+
+class UserStates(StatesGroup):
+    waiting_for_promo_input = State()
+    waiting_for_review_product = State()
+    waiting_for_review_rating = State()
+    waiting_for_review_text = State()
+
+# ==========================================
+# ГЛАВНОЕ МЕНЮ И СТАРТ
+# ==========================================
+def get_main_menu_kb(user_id: int, lang: str = "uk"):
+    texts = LANGUAGES.get(lang, LANGUAGES["uk"])
+    keyboard = [
+        [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
+         InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo"),
+         InlineKeyboardButton(text="⭐ Отзывы", callback_data="show_reviews")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
+        [InlineKeyboardButton(text="🆘 Поддержка", url=SUPPORT_URL)],
+    ]
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def get_main_menu_text(balance: float, lang: str = "uk") -> str:
+    texts = LANGUAGES.get(lang, LANGUAGES["uk"])
+    return texts["welcome"].format(balance=balance)
+
+
+def cancel_kb(target: str = "main_menu", label: str = "❌ Отмена") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, callback_data=target)]])
+
+
+def admin_back_kb(target: str = "admin_panel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data=target)]])
+
+
+async def get_product_label_map(session: AsyncSession) -> dict[int, str]:
+    result = await session.execute(
+        select(Product.id, Software.name, Product.duration)
+        .join(Software, Product.software_id == Software.id)
+        .order_by(Software.name.asc(), Product.id.asc())
+    )
+    return {pid: f"{sw_name} • {duration}" for pid, sw_name, duration in result.all()}
+
+
+async def resolve_user_purchased_product(session: AsyncSession, user_id: int, product_id: int):
+    product = await session.get(Product, product_id)
+    if not product:
+        return None
+    result = await session.execute(
+        select(Purchase)
+        .where(Purchase.user_id == user_id, Purchase.product_id == product_id)
+        .order_by(Purchase.purchased_at.desc())
+        .limit(1)
+    )
+    purchase = result.scalars().first()
+    if purchase:
+        return purchase
+
+    software = await session.get(Software, product.software_id)
+    if not software:
+        return None
+    legacy_name = f"{software.name} ({product.duration})"
+    result = await session.execute(
+        select(Purchase)
+        .where(
+            Purchase.user_id == user_id,
+            Purchase.product_id.is_(None),
+            Purchase.duration == product.duration,
+            Purchase.product_name == legacy_name,
+        )
+        .order_by(Purchase.purchased_at.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def get_broadcast_user_ids(session: AsyncSession, audience: str) -> list[int]:
+    active_user = User.is_banned.is_(False)
+    if audience == "buyers":
+        result = await session.execute(
+            select(User.id).join(Purchase, Purchase.user_id == User.id)
+            .where(active_user).distinct()
+        )
+        return list(result.scalars().all())
+    if audience == "nonbuyers":
+        result = await session.execute(
+            select(User.id).where(active_user, ~exists().where(Purchase.user_id == User.id))
+        )
+        return list(result.scalars().all())
+    if audience == "balance":
+        result = await session.execute(select(User.id).where(active_user, User.balance > 0))
+        return list(result.scalars().all())
+    result = await session.execute(select(User.id).where(active_user))
+    return list(result.scalars().all())
+
+
+BROADCAST_AUDIENCES = {
+    "all": "👥 Все пользователи",
+    "buyers": "🛒 Только покупатели",
+    "nonbuyers": "🌱 Без покупок",
+    "balance": "💰 Пользователи с балансом",
+}
+
+
+@router.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext, session: AsyncSession):
+    await state.clear()
+    user = await session.get(User, message.from_user.id)
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+    balance = user.balance if user else 0.0
+    await message.answer(
+        "✅ Действие отменено.\n\n" + get_main_menu_text(balance, lang),
+        reply_markup=get_main_menu_kb(message.from_user.id, lang), parse_mode="Markdown"
+    )
+
+
+@router.message(Command("help"))
+async def help_command(message: Message):
+    await message.answer(
+        "ℹ️ **Помощь по Kranin Shop**\n\n"
+        "🛒 Каталог — выбрать товар и оформить покупку.\n"
+        "👤 Профиль — ключи, история покупок и баланс.\n"
+        "💳 Пополнение — отправьте заявку и чек.\n"
+        "🎟 Промокод — активировать код.\n"
+        "🔎 Поиск — найти софт по названию.\n\n"
+        "Команда /cancel отменяет текущий ввод. По вопросам оплаты и доступа обращайтесь в поддержку.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Открыть магазин", callback_data="shop")],
+            [InlineKeyboardButton(text="🆘 Поддержка", url=SUPPORT_URL)],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ]), parse_mode="Markdown"
+    )
+
+
+@router.message(Command("id"))
+async def id_command(message: Message):
+    await message.answer(f"Ваш Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject, session: AsyncSession, state: FSMContext):
+    try:
+        await state.clear()
+        user = await session.get(User, message.from_user.id)
+        if not user:
+            referrer_id = None
+            if command.args and command.args.isdigit():
+                possible_ref = int(command.args)
+                if possible_ref != message.from_user.id:
+                    # ФИКС: проверяем, что реферер реально существует в базе,
+                    # иначе FK-констрейнт уронит commit() и регистрация не пройдёт.
+                    referrer_exists = await session.get(User, possible_ref)
+                    if referrer_exists:
+                        referrer_id = possible_ref
+
+            user = User(
+                id=message.from_user.id,
+                username=message.from_user.username,
+                referred_by=referrer_id,
+                language="uk"
+            )
+            session.add(user)
+            await session.commit()
+
+            await message.answer(
+                "🌐 **Будь ласка, виберіть мову / Пожалуйста, выберите язык:**",
+                reply_markup=get_language_kb(is_reg=True),
+                parse_mode="Markdown"
+            )
+            return
+
+        else:
+            if user.username != message.from_user.username:
+                user.username = message.from_user.username
+                await session.commit()
+
+        lang = user.language if user and user.language in LANGUAGES else "uk"
+        await message.answer(
+            get_main_menu_text(user.balance, lang),
+            reply_markup=get_main_menu_kb(message.from_user.id, lang),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Ошибка в cmd_start: {e}")
+        await message.answer("⚠️ Произошла ошибка. Попробуйте снова.")
+
+@router.callback_query(F.data.in_({"reg_lang_uk", "reg_lang_ru"}))
+async def process_reg_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    lang_code = "uk" if callback.data == "reg_lang_uk" else "ru"
+    user = await session.get(User, callback.from_user.id)
+    if user:
+        user.language = lang_code
+        await session.commit()
+
+    balance = user.balance if user else 0.0
+    texts = LANGUAGES[lang_code]
+
+    await callback.message.edit_text(
+        get_main_menu_text(balance, lang_code),
+        reply_markup=get_main_menu_kb(callback.from_user.id, lang_code),
+        parse_mode="Markdown"
+    )
+    await callback.answer(texts["lang_changed"])
+
+@router.callback_query(F.data == "main_menu")
+async def main_menu_handler(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
+    await state.clear()
+    user = await session.get(User, callback.from_user.id)
+    balance = user.balance if user else 0.0
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+
+    await safe_edit_text(
+        callback, bot,
+        get_main_menu_text(balance, lang),
+        get_main_menu_kb(callback.from_user.id, lang),
+    )
+    await callback.answer()
+
+# ==========================================
+# СМЕНА ЯЗЫКА
+# ==========================================
+@router.callback_query(F.data == "change_lang")
+async def change_lang_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🌐 **Виберіть мову / Выберите язык:**",
+        reply_markup=get_language_kb(is_reg=False),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.in_({"lang_uk", "lang_ru"}))
+async def set_language(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    lang_code = "uk" if callback.data == "lang_uk" else "ru"
+    user = await session.get(User, callback.from_user.id)
+    if user:
+        user.language = lang_code
+        await session.commit()
+
+    texts = LANGUAGES[lang_code]
+    balance = user.balance if user else 0.0
+
+    await callback.message.edit_text(
+        get_main_menu_text(balance, lang_code),
+        reply_markup=get_main_menu_kb(callback.from_user.id, lang_code),
+        parse_mode="Markdown"
+    )
+    await callback.answer(texts["lang_changed"])
+
+# ==========================================
+# ПРОМОКОДЫ (ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ)
+# ==========================================
+@router.callback_query(F.data == "enter_promo")
+async def enter_promo_handler(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.waiting_for_promo_input)
+    await callback.message.edit_text(
+        "🎟 **Активация промокода**\n\nВведите ваш промокод:",
+        reply_markup=cancel_kb("main_menu"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(UserStates.waiting_for_promo_input)
+async def process_promo_activation(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте промокод текстом.", reply_markup=cancel_kb("main_menu"))
+        return
+    code_text = message.text.strip()
+
+    # ФИКС: используем блокировку строки промокода, чтобы два одновременных
+    # использования не смогли оба пройти проверку uses_left > 0.
+    res = await session.execute(
+        select(PromoCode).filter_by(code=code_text).with_for_update()
+    )
+    promo = res.scalars().first()
+
+    if not promo or promo.uses_left <= 0:
+        await message.answer("❌ Промокод не найден или срок его активаций исчерпан!", reply_markup=cancel_kb("main_menu"))
+        await state.clear()
+        return
+
+    # ФИКС: не даём одному пользователю активировать один и тот же промокод
+    # повторно — раньше это позволяло в одиночку выесть весь uses_left.
+    already_used_res = await session.execute(
+        select(PromoCodeUsage).filter_by(promo_id=promo.id, user_id=message.from_user.id)
+    )
+    if already_used_res.scalars().first():
+        await message.answer("❌ Вы уже активировали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
+        await state.clear()
+        return
+
+    user_res = await session.execute(select(User).where(User.id == message.from_user.id).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if not user:
+        await state.clear()
+        return
+
+    user.balance = money_add(user.balance, promo.amount)
+    promo.uses_left -= 1
+    session.add(PromoCodeUsage(promo_id=promo.id, user_id=user.id))
+    log_balance_change(session, user.id, promo.amount, "promo_code", user.balance, related_id=promo.id)
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Подстраховка на случай гонки: уникальный constraint поймал
+        # повторную активацию, которую не успела отсечь проверка выше
+        await session.rollback()
+        await message.answer("❌ Вы уже активировали этот промокод ранее!", reply_markup=cancel_kb("main_menu"))
+        await state.clear()
+        return
+
+    await state.clear()
+
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+    await message.answer(
+        f"🎉 **Промокод успешно активирован!**\nВам начислено `{promo.amount:.2f} грн` на баланс.",
+        reply_markup=get_main_menu_kb(message.from_user.id, lang),
+        parse_mode="Markdown"
+    )
+
+# ==========================================
+# ⭐ НОРМАЛЬНАЯ СИСТЕМА ОТЗЫВОВ
+# ==========================================
+# Отзыв можно оставить только по реально купленному тарифу.
+# Один пользователь может оставить один отзыв на один тариф.
+
+
+def review_stars(rating: int) -> str:
+    rating = max(1, min(5, int(rating)))
+    return "⭐" * rating + "☆" * (5 - rating)
+
+
+@router.callback_query(F.data == "show_reviews")
+@router.callback_query(F.data.startswith("reviews_page_"))
+async def show_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+    page = 0
+    if callback.data.startswith("reviews_page_"):
+        try:
+            page = int(callback.data.split("_")[2])
+        except (ValueError, IndexError):
+            page = 0
+    total_reviews = await session.scalar(select(func.count(Review.id)).where(Review.status == "approved")) or 0
+    avg_rating = await session.scalar(select(func.avg(Review.rating)).where(Review.status == "approved")) or 0
+    breakdown_res = await session.execute(
+        select(Review.rating, func.count(Review.id)).where(Review.status == "approved").group_by(Review.rating)
+    )
+    breakdown = {int(r): int(c) for r, c in breakdown_res.all()}
+    per_page = 4
+    total_pages = max(1, math.ceil(total_reviews / per_page))
+    page = max(0, min(page, total_pages - 1))
+
+    result = await session.execute(
+        select(Review, Software.name, Product.duration, User.username)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .join(User, Review.user_id == User.id, isouter=True)
+        .where(Review.status == "approved")
+        .order_by(Review.created_at.desc())
+        .offset(page * per_page).limit(per_page)
+    )
+    rows = result.all()
+
+    text_msg = "⭐ **Отзывы клиентов**\n━━━━━━━━━━━━━━━━━━━\n"
+    if total_reviews:
+        text_msg += f"🏆 Средняя оценка: **{float(avg_rating):.1f}/5** · всего `{total_reviews}`\n"
+        text_msg += (
+            f"5⭐ `{breakdown.get(5, 0)}` · 4⭐ `{breakdown.get(4, 0)}` · "
+            f"3⭐ `{breakdown.get(3, 0)}` · 2⭐ `{breakdown.get(2, 0)}` · 1⭐ `{breakdown.get(1, 0)}`\n"
+        )
+    else:
+        text_msg += "Пока нет опубликованных отзывов.\n"
+    text_msg += "━━━━━━━━━━━━━━━━━━━\n\n"
+    if not rows:
+        text_msg += "Здесь пока пусто — оставьте первый отзыв о покупке."
+    else:
+        blocks = []
+        for review, sw_name, duration, username in rows:
+            author = f"@{username}" if username else "Покупатель"
+            product_label = (
+                f"{sw_name} • {duration}" if sw_name
+                else (review.product_label or "Товар")
+            )
+            blocks.append(
+                f"{review_stars(review.rating)}  **{escape_md(author)}**\n"
+                f"📦 `{escape_md(product_label)}` · ✅ покупка подтверждена\n"
+                f"_{escape_md(review.text)}_\n"
+                f"🕒 {review.created_at.strftime('%d.%m.%Y')}"
+            )
+        text_msg += "\n\n──────────────\n\n".join(blocks)
+
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"reviews_page_{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"reviews_page_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
+        [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data="leave_review")],
+        [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
+        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "leave_review")
+@router.callback_query(F.data.startswith("leave_review_product_"))
+async def leave_review_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    # Кнопка после покупки передаёт product_id: так пользователь сразу видит
+    # именно что купленный товар, а не выбирает его среди старых покупок.
+    requested_product_id = None
+    if callback.data.startswith("leave_review_product_"):
+        try:
+            requested_product_id = int(callback.data.rsplit("_", 1)[1])
+        except (ValueError, IndexError):
+            await callback.answer("❌ Некорректный товар.", show_alert=True)
+            return
+        owned_purchase = await resolve_user_purchased_product(
+            session, callback.from_user.id, requested_product_id
+        )
+        if not owned_purchase:
+            await callback.answer("❌ Покупка не найдена в вашем аккаунте.", show_alert=True)
+            return
+
+    product_map = await get_product_label_map(session)
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == callback.from_user.id).order_by(Purchase.purchased_at.desc())
+    )
+    purchases = result.scalars().all()
+    seen = set()
+    available = []
+    for purchase in purchases:
+        product_id = purchase.product_id
+        if not product_id:
+            for pid, label in product_map.items():
+                sw_name, duration = label.rsplit(" • ", 1)
+                if purchase.product_name == f"{sw_name} ({duration})" and purchase.duration == duration:
+                    product_id = pid
+                    break
+        if not product_id or product_id in seen:
+            continue
+        if requested_product_id is not None and product_id != requested_product_id:
+            continue
+        seen.add(product_id)
+        exists_review = await session.scalar(
+            select(func.count(Review.id)).where(Review.user_id == callback.from_user.id, Review.product_id == product_id)
+        ) or 0
+        if not exists_review:
+            available.append((product_id, product_map.get(product_id, purchase.product_name)))
+
+    if not available:
+        await state.clear()
+        await callback.answer("✅ По всем вашим покупкам отзыв уже оставлен.", show_alert=True)
+        return
+
+    await state.set_state(UserStates.waiting_for_review_product)
+    buttons = [[InlineKeyboardButton(text=f"📦 {label[:58]}", callback_data=f"review_product_{pid}")] for pid, label in available[:20]]
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")])
+    # ВАЖНО: не редактируем исходное сообщение с ключом/покупкой. Весь
+    # сценарий отзыва живёт в новом сообщении, которое можно редактировать.
+    await callback.message.answer(
+        "✍️ **Новый отзыв**\n\nВыберите товар, который вы покупали:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown"
+    )
+    await callback.answer("Форма отзыва открыта")
+
+
+@router.callback_query(F.data.startswith("review_product_"))
+async def process_review_product(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    try:
+        product_id = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный товар.", show_alert=True)
+        return
+    purchase = await resolve_user_purchased_product(session, callback.from_user.id, product_id)
+    if not purchase:
+        await callback.answer("❌ Этот товар не найден среди ваших покупок.", show_alert=True)
+        return
+    already = await session.scalar(
+        select(func.count(Review.id)).where(Review.user_id == callback.from_user.id, Review.product_id == product_id)
+    ) or 0
+    if already:
+        await callback.answer("✅ Отзыв по этому товару уже существует.", show_alert=True)
+        await state.clear()
+        return
+    label = (await get_product_label_map(session)).get(product_id, "Товар")
+    await state.update_data(product_id=product_id, purchase_id=purchase.id)
+    await state.set_state(UserStates.waiting_for_review_rating)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐⭐⭐⭐⭐ 5/5", callback_data="review_stars_5")],
+        [InlineKeyboardButton(text="⭐⭐⭐⭐ 4/5", callback_data="review_stars_4")],
+        [InlineKeyboardButton(text="⭐⭐⭐ 3/5", callback_data="review_stars_3")],
+        [InlineKeyboardButton(text="⭐⭐ 2/5", callback_data="review_stars_2")],
+        [InlineKeyboardButton(text="⭐ 1/5", callback_data="review_stars_1")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="show_reviews")],
+    ])
+    await callback.message.edit_text(
+        f"✍️ **Отзыв о товаре**\n\n📦 `{escape_md(label)}`\n\nВыберите оценку:",
+        reply_markup=keyboard, parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("review_stars_"))
+async def process_review_rating(callback: CallbackQuery, state: FSMContext):
+    try:
+        rating = int(callback.data.split("_")[2])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректная оценка.", show_alert=True)
+        return
+    if not 1 <= rating <= 5:
+        await callback.answer("❌ Оценка должна быть от 1 до 5.", show_alert=True)
+        return
+    data = await state.get_data()
+    if not data.get("product_id"):
+        await state.clear()
+        await callback.answer("❌ Сессия отзыва устарела. Начните заново.", show_alert=True)
+        return
+    await state.update_data(rating=rating)
+    await state.set_state(UserStates.waiting_for_review_text)
+    await callback.message.edit_text(
+        f"📝 **Ваша оценка: {review_stars(rating)}**\n\nНапишите отзыв одним сообщением.\nМинимум 5, максимум {MAX_REVIEW_LENGTH} символов.",
+        reply_markup=cancel_kb("show_reviews"), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.message(UserStates.waiting_for_review_text)
+async def save_review_handler(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    if not message.text or not message.text.strip():
+        await message.answer("❌ Отправьте текст отзыва.", reply_markup=cancel_kb("show_reviews"))
+        return
+    text_val = message.text.strip()
+    if len(text_val) < 5:
+        await message.answer("❌ Отзыв слишком короткий — минимум 5 символов.")
+        return
+    if len(text_val) > MAX_REVIEW_LENGTH:
+        await message.answer(f"❌ Максимум {MAX_REVIEW_LENGTH} символов.")
+        return
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not product_id:
+        await state.clear()
+        await message.answer("⚠️ Сессия устарела. Начните отзыв заново.")
+        return
+    purchase = await resolve_user_purchased_product(session, message.from_user.id, int(product_id))
+    if not purchase:
+        await state.clear()
+        await message.answer("❌ Не удалось подтвердить покупку этого товара.")
+        return
+    existing = await session.scalar(
+        select(func.count(Review.id)).where(Review.user_id == message.from_user.id, Review.product_id == int(product_id))
+    ) or 0
+    if existing:
+        await state.clear()
+        await message.answer("✅ Отзыв по этому товару уже существует.")
+        return
+    product_label = (await get_product_label_map(session)).get(int(product_id), purchase.product_name)
+    review = Review(
+        user_id=message.from_user.id,
+        product_id=int(product_id),
+        purchase_id=purchase.id,
+        rating=int(data.get("rating", 5)),
+        text=text_val,
+        product_label=product_label,
+        status="pending",
+    )
+    session.add(review)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await state.clear()
+        await message.answer("✅ Такой отзыв уже был создан.")
+        return
+    await state.clear()
+
+    admin_msg = (
+        f"⭐ **Новый отзыв на модерации**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Отзыв: `{review.id}`\n"
+        f"👤 `{message.from_user.id}` ({user_display(message)})\n"
+        f"📦 `{escape_md(product_label)}`\n"
+        f"⭐ {review_stars(review.rating)}\n"
+        f"💬 {escape_md(text_val)}"
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"admin_approve_review_{review.id}"),
+         InlineKeyboardButton(text="🙈 Скрыть", callback_data=f"admin_hide_review_{review.id}")],
+        [InlineKeyboardButton(text="🔎 Открыть", callback_data=f"admin_review_view_{review.id}"),
+         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_del_review_confirm_{review.id}")],
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_msg, reply_markup=admin_kb, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Не удалось уведомить админа о новом отзыве: {e}")
+    await message.answer(
+        "✅ **Отзыв принят!**\n\nОн отправлен на модерацию и после проверки появится в разделе отзывов.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎰 Крутить колесо фортуны", callback_data=f"wheelreview_{review.id}")],
+            [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+            [InlineKeyboardButton(text="📋 Мои отзывы", callback_data="my_reviews")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ]), parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "my_reviews")
+@router.callback_query(F.data.startswith("my_reviews_page_"))
+async def my_reviews_handler(callback: CallbackQuery, session: AsyncSession):
+    page = 0
+    if callback.data.startswith("my_reviews_page_"):
+        try:
+            page = max(0, int(callback.data.rsplit("_", 1)[1]))
+        except ValueError:
+            page = 0
+    user_id = callback.from_user.id
+    total = await session.scalar(select(func.count(Review.id)).where(Review.user_id == user_id)) or 0
+    per_page = 5
+    total_pages = max(1, math.ceil(total / per_page))
+    page = min(page, total_pages - 1)
+    result = await session.execute(
+        select(Review, Software.name, Product.duration)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .where(Review.user_id == user_id)
+        .order_by(Review.created_at.desc()).offset(page * per_page).limit(per_page)
+    )
+    rows = result.all()
+    if not rows:
+        text_msg = "📋 **Мои отзывы**\n\nВы ещё не оставляли отзывов."
+    else:
+        labels = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}
+        blocks = []
+        for review, sw_name, duration in rows:
+            product_label = (
+                f"{sw_name} • {duration}" if sw_name
+                else (review.product_label or "Товар")
+            )
+            review_preview = review.text[:220] + ("…" if len(review.text) > 220 else "")
+            blocks.append(
+                f"{review_stars(review.rating)} · `{escape_md(product_label)}`\n"
+                f"_{escape_md(review_preview)}_\n"
+                f"{labels.get(review.status, review.status)} · {review.created_at.strftime('%d.%m.%Y')}"
+            )
+        text_msg = (
+            f"📋 **Мои отзывы** · страница {page + 1}/{total_pages}\n"
+            "━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+        )
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"my_reviews_page_{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"my_reviews_page_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
+        [InlineKeyboardButton(text="✍️ Новый отзыв", callback_data="leave_review")],
+        [InlineKeyboardButton(text="⭐ Все отзывы", callback_data="show_reviews")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+# ==========================================
+# 👤 ПРОФИЛЬ И ЛИЧНЫЙ КАБИНЕТ
+# ==========================================
+@router.callback_query(F.data == "profile")
+async def show_profile(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    user = await session.get(User, user_id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+        return
+    total_purchases = await session.scalar(select(func.count(Purchase.id)).where(Purchase.user_id == user_id)) or 0
+    total_spent = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(Purchase.user_id == user_id)) or 0
+    referrals = await session.scalar(select(func.count(User.id)).where(User.referred_by == user_id)) or 0
+    referral_bonus = await session.scalar(select(func.coalesce(func.sum(BalanceLog.amount), 0)).where(
+        BalanceLog.user_id == user_id, BalanceLog.reason == "referral_bonus"
+    )) or 0
+    review_count = await session.scalar(select(func.count(Review.id)).where(Review.user_id == user_id)) or 0
+    username = f"@{escape_md(user.username)}" if user.username else "не указан"
+    lang_name = "🇺🇦 Українська" if user.language == "uk" else "🇷🇺 Русский"
+    text_msg = (
+        "👤 **ЛИЧНЫЙ КАБИНЕТ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"👤 Username: {username}\n"
+        f"🌐 Язык: {lang_name}\n"
+        f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y')}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Баланс: **`{user.balance:.2f} грн`**\n"
+        f"🛒 Покупок: `{total_purchases}`\n"
+        f"💸 Потрачено: `{float(total_spent):.2f} грн`\n"
+        f"🤝 Рефералов: `{referrals}`\n"
+        f"🎁 Реферальных бонусов: `{float(referral_bonus):.2f} грн`\n"
+        f"⭐ Отзывов: `{review_count}`"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Мои ключи", callback_data="profile_keys")],
+        [InlineKeyboardButton(text="📜 История покупок", callback_data="profile_purchase_history")],
+        [InlineKeyboardButton(text="💳 История баланса", callback_data="profile_balance_history")],
+        [InlineKeyboardButton(text="⭐ Мои отзывы", callback_data="my_reviews")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
+        [InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_keys")
+async def profile_keys_menu(callback: CallbackQuery, session: AsyncSession):
+    user_id = callback.from_user.id
+    result = await session.execute(select(Purchase.duration).where(Purchase.user_id == user_id).distinct())
+    durations = [d for d in result.scalars().all() if d]
+    ordered = [d for d in DURATIONS if d in durations]
+    ordered += [d for d in durations if d not in ordered]
+    if not ordered:
+        text_msg = "🔑 **Мои ключи**\n\nПокупок пока нет."
+        buttons = [[InlineKeyboardButton(text="🛒 Каталог", callback_data="shop")]]
+    else:
+        text_msg = "🔑 **Мои ключи**\n━━━━━━━━━━━━━━━━━━━\nВыберите срок:"
+        buttons = []
+        for duration in ordered:
+            count = await session.scalar(select(func.count(Purchase.id)).where(
+                Purchase.user_id == user_id, Purchase.duration == duration
+            )) or 0
+            buttons.append([InlineKeyboardButton(
+                text=f"📂 {duration[:34]} · {count} шт.", callback_data=f"profile_durv_{duration.replace(' ', '_')}"
+            )])
+    buttons += [
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("profile_durv_"))
+async def show_profile_keys(callback: CallbackQuery, session: AsyncSession):
+    duration = callback.data[len("profile_durv_"):].replace("_", " ")
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == callback.from_user.id, Purchase.duration == duration)
+        .order_by(Purchase.purchased_at.desc()).limit(30)
+    )
+    purchases = result.scalars().all()
+    if not purchases:
+        text_msg = "🔑 Записей не найдено."
+    else:
+        blocks = [
+            f"📦 **{escape_md(p.product_name)}**\n🔐 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            for p in purchases
+        ]
+        text_msg = f"🔑 **Мои ключи — {escape_md(duration)}**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К категориям", callback_data="profile_keys")],
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_purchase_history")
+@router.callback_query(F.data.startswith("profile_purchases_page_"))
+async def profile_purchase_history(callback: CallbackQuery, session: AsyncSession):
+    page = 0
+    if callback.data.startswith("profile_purchases_page_"):
+        try:
+            page = max(0, int(callback.data.rsplit("_", 1)[1]))
+        except ValueError:
+            page = 0
+    user_id = callback.from_user.id
+    total = await session.scalar(select(func.count(Purchase.id)).where(Purchase.user_id == user_id)) or 0
+    per_page = 5
+    pages = max(1, math.ceil(total / per_page))
+    page = min(page, pages - 1)
+    result = await session.execute(
+        select(Purchase).where(Purchase.user_id == user_id)
+        .order_by(Purchase.purchased_at.desc()).offset(page * per_page).limit(per_page)
+    )
+    purchases = result.scalars().all()
+    if not purchases:
+        text_msg = "📜 **История покупок**\n\nПокупок пока нет."
+    else:
+        blocks = [
+            f"🛒 **{escape_md(p.product_name)}**\n💰 `{p.price_paid:.2f} грн`\n🔑 `{escape_md(p.key_issued)}`\n🕒 {p.purchased_at.strftime('%d.%m.%Y %H:%M')}"
+            for p in purchases
+        ]
+        text_msg = f"📜 **История покупок** · страница {page + 1}/{pages}\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"profile_purchases_page_{page - 1}"))
+    if pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"profile_purchases_page_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.extend([
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "profile_balance_history")
+async def profile_balance_history(callback: CallbackQuery, session: AsyncSession):
+    result = await session.execute(
+        select(BalanceLog).where(BalanceLog.user_id == callback.from_user.id)
+        .order_by(BalanceLog.created_at.desc()).limit(20)
+    )
+    logs = result.scalars().all()
+    labels = {
+        "purchase": "🛒 Покупка", "deposit_approved": "📥 Пополнение", "withdrawal_request": "📤 Вывод",
+        "withdrawal_rejected_refund": "↩️ Возврат", "referral_bonus": "🤝 Реферальный бонус",
+        "promo_code": "🎟 Промокод", "wheel_bonus": "🎰 Приз", "admin_adjust": "🛠 Корректировка",
+    }
+    if not logs:
+        text_msg = "💳 **История баланса**\n\nОпераций пока нет."
+    else:
+        blocks = []
+        for log in logs:
+            sign = "+" if log.amount >= 0 else ""
+            blocks.append(
+                f"{labels.get(log.reason, log.reason)}\n"
+                f"💵 `{sign}{log.amount:.2f} грн` → `{log.balance_after:.2f} грн`\n"
+                f"🕒 {log.created_at.strftime('%d.%m.%Y %H:%M')}"
+            )
+        text_msg = "💳 **История баланса**\n━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n──────────────\n\n".join(blocks)
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 В профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+# ==========================================
+# КАТАЛОГ И ПОКУПКИ С УВЕДОМЛЕНИЯМИ (RESTOCK)
+# ==========================================
+@router.callback_query(F.data == "shop")
+async def show_platforms(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    result = await session.execute(select(Platform).order_by(Platform.name.asc()))
+    platforms = result.scalars().all()
+
+    text_msg = (
+        "🛍 **МАГАЗИН ЛИЦЕНЗИЙ**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "📱 Выберите платформу вашего устройства:"
+    )
+    buttons = []
+    for p in platforms:
+        name_lower = p.name.lower()
+        if "android" in name_lower:
+            icon = "🤖"
+        elif "ios" in name_lower:
+            icon = "🍏"
+        elif "аккаунт" in name_lower:
+            icon = "🎮"
+        else:
+            icon = "📦"
+        buttons.append([InlineKeyboardButton(text=f"{icon} {p.name}", callback_data=f"platform_{p.id}")])
+
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("platform_"))
+async def show_softwares(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    platform_id = int(callback.data.split("_")[1])
+    platform = await session.get(Platform, platform_id)
+
+    result = await session.execute(select(Software).filter_by(platform_id=platform_id).order_by(Software.name.asc()))
+    softwares = result.scalars().all()
+
+    if not softwares:
+        text_msg = f"🛒 **Каталог — {escape_md(platform.name) if platform else 'Платформа'}**\n\n❌ На данную платформу софт пока не добавлен."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 К выбору платформ", callback_data="shop")]])
+        await safe_edit_text(callback, bot, text_msg, keyboard)
+        await callback.answer()
+        return
+
+    text_msg = f"🛍 **{escape_md(platform.name)}**\n━━━━━━━━━━━━━━━━━━━\n⚡️ Выберите нужный софт:"
+    buttons = []
+    for sw in softwares:
+        buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"software_{sw.id}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 К платформам", callback_data="shop")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await safe_edit_text(callback, bot, text_msg, keyboard)
+    await callback.answer()
+
+async def _render_software_screen(
+    callback: CallbackQuery, bot: Bot, software: "Software", text_msg: str, keyboard: InlineKeyboardMarkup
+) -> None:
+    # НОВОЕ: если у софта задано фото (photo_file_id), показываем его как
+    # фото-сообщение — в Telegram фото у такого сообщения располагается
+    # НАД текстом (подписью), то есть ровно "фото над текстом", которое
+    # просили. Обычное edit_text не может превратить текстовое сообщение в
+    # фото, поэтому старое сообщение удаляется и отправляется новое.
+    chat_id = callback.message.chat.id
+    if software.photo_file_id:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        if len(text_msg) <= 1000:
+            await bot.send_photo(
+                chat_id=chat_id, photo=software.photo_file_id, caption=text_msg,
+                reply_markup=keyboard, parse_mode="Markdown",
+            )
+        else:
+            await bot.send_photo(chat_id=chat_id, photo=software.photo_file_id, caption=f"🛡 **{escape_md(software.name)}**")
+            await bot.send_message(chat_id, text_msg, reply_markup=keyboard, parse_mode="Markdown")
+        return
+
+    try:
+        await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramBadRequest:
+        # Сообщение было фото (например, при возврате назад) — редактировать
+        # текстом нельзя, удаляем и отправляем новое текстовое сообщение.
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await bot.send_message(chat_id, text_msg, reply_markup=keyboard, parse_mode="Markdown")
+
+
+@router.callback_query(F.data.startswith("software_"))
+async def show_products(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    software_id = int(callback.data.split("_")[1])
+    software = await session.get(Software, software_id)
+    if not software:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    result = await session.execute(
+        select(Product, func.count(LicenseKey.id).filter(LicenseKey.is_sold.is_(False)).label("available"))
+        .outerjoin(LicenseKey, LicenseKey.product_id == Product.id)
+        .where(Product.software_id == software_id)
+        .group_by(Product.id)
+        .order_by(Product.price.asc(), Product.id.asc())
+    )
+    product_rows = result.all()
+
+    description_block = f"{escape_md(software.description)}\n\n" if software.description else ""
+
+    if not product_rows:
+        text_msg = f"🛒 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}❌ Тарифы для этого софта пока отсутствуют."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ])
+        await _render_software_screen(callback, bot, software, text_msg, keyboard)
+        await callback.answer()
+        return
+
+    text_msg = f"🛡 **{escape_md(software.name)}**\n━━━━━━━━━━━━━━━━━━━\n{description_block}📌 Выберите продукт:"
+    buttons = []
+    for p, available_keys in product_rows:
+
+        if available_keys > 0:
+            status_text = f"🟢 {available_keys} шт."
+            buttons.append([InlineKeyboardButton(
+                text=f"⏳ {p.duration[:18]} · {p.price:.2f} грн · {available_keys} шт.",
+                callback_data=f"confirm_buy_{p.id}"
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                text=f"🔔 {p.duration[:18]} · {p.price:.2f} грн · нет в наличии",
+                callback_data=f"notify_restock_{p.id}"
+            )])
+
+    buttons.append([InlineKeyboardButton(text="🔙 К списку софта", callback_data=f"platform_{software.platform_id}")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await _render_software_screen(callback, bot, software, text_msg, keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("notify_restock_"))
+async def notify_restock_handler(callback: CallbackQuery, session: AsyncSession):
+    product_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    existing = await session.execute(select(RestockSubscription).filter_by(user_id=user_id, product_id=product_id))
+    if existing.scalars().first():
+        await callback.answer("🔔 Вы уже подписаны на уведомление об этом товаре!", show_alert=True)
+        return
+
+    sub = RestockSubscription(user_id=user_id, product_id=product_id)
+    session.add(sub)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await callback.answer("🔔 Вы уже подписаны на уведомления по этому товару.", show_alert=True)
+        return
+    await callback.answer("✅ Готово! Бот уведомит вас, когда ключи поступят в продажу.", show_alert=True)
+
+# --- НОВОЕ: ШАГ ПОДТВЕРЖДЕНИЯ ПЕРЕД ПОКУПКОЙ ---
+@router.callback_query(F.data.startswith("confirm_buy_"))
+async def confirm_purchase_handler(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
+    product_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("❌ Товар не найден!", show_alert=True)
+        return
+
+    software = await session.get(Software, product.software_id)
+    sw_name = software.name if software else "Товар"
+
+    user = await session.get(User, user_id)
+    balance = user.balance if user else 0.0
+
+    # Проверяем, что ключи всё ещё есть в наличии на момент показа подтверждения
+    avail_res = await session.execute(
+        select(func.count(LicenseKey.id)).filter_by(product_id=product.id, is_sold=False)
+    )
+    available = avail_res.scalar() or 0
+
+    if available <= 0:
+        await callback.answer("❌ К сожалению, ключи только что закончились!", show_alert=True)
+        return
+
+    if balance < product.price:
+        await begin_purchase_topup(callback, session, state, bot, product.id)
+        return
+
+    text_msg = (
+        f"🧾 **Подтверждение покупки**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Товар:** `{escape_md(sw_name)}`\n"
+        f"⏳ **Срок:** `{escape_md(product.duration)}`\n"
+        f"💰 **Цена:** `{product.price:.2f} грн`\n"
+        f"💳 **Ваш баланс:** `{balance:.2f} грн`\n"
+        f"💳 **Баланс после покупки:** `{(balance - product.price):.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"Подтвердите покупку — деньги будут списаны и вам сразу выдастся ключ."
+    )
+    order_token = secrets.token_hex(16)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить покупку", callback_data=f"buy_product_{product.id}_{order_token}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"software_{product.software_id}")],
+    ])
+    await safe_edit_text(callback, bot, text_msg, keyboard)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("buy_product_"))
+async def process_purchase(callback: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot):
+    parts = callback.data.split("_")
+    try:
+        product_id = int(parts[2])
+        order_token = parts[3] if len(parts) > 3 else None
+    except (ValueError, IndexError):
+        await callback.answer("❌ Кнопка покупки повреждена. Откройте каталог заново.", show_alert=True)
+        return
+    if not order_token or len(order_token) > 64:
+        await callback.answer("⌛ Эта кнопка устарела. Откройте товар и подтвердите покупку ещё раз.", show_alert=True)
+        return
+    user_id = callback.from_user.id
+
+    product_res = await session.execute(select(Product).where(Product.id == product_id).with_for_update())
+    product = product_res.scalar_one_or_none()
+    if not product:
+        await callback.answer("❌ Товар не найден!", show_alert=True)
+        return
+    if not math.isfinite(float(product.price)) or product.price <= 0:
+        await callback.answer("❌ У этого тарифа некорректная цена. Обратитесь к администратору.", show_alert=True)
+        return
+
+    software = await session.get(Software, product.software_id)
+
+    # ФИКС: блокируем строку пользователя на время транзакции, чтобы исключить
+    # race condition при двойном/параллельном нажатии на "Купить" — иначе баланс
+    # мог уйти в минус, т.к. обе транзакции проходили проверку balance до commit().
+    user_res = await session.execute(
+        select(User).where(User.id == user_id).with_for_update()
+    )
+    user = user_res.scalar_one_or_none()
+
+    # Re-check after acquiring the user lock: a second identical callback waits
+    # for the first transaction, then sees its committed order and cannot spend
+    # the balance or consume another key.
+    existing_order = await session.scalar(select(Purchase.id).where(Purchase.order_token == order_token))
+    if existing_order:
+        await callback.answer("✅ Эта покупка уже была обработана. Повторно деньги не списывались.", show_alert=True)
+        return
+
+    if not user or user.balance < product.price:
+        # Освобождаем блокировки пользователя/товара до перехода к пополнению.
+        await session.rollback()
+        await begin_purchase_topup(callback, session, state, bot, product_id)
+        return
+
+    key_res = await session.execute(
+        select(LicenseKey)
+        .filter_by(product_id=product.id, is_sold=False)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    license_key = key_res.scalars().first()
+
+    if not license_key:
+        await callback.answer("❌ Ключи этого номинала закончились!", show_alert=True)
+        return
+
+    user.balance = money_add(user.balance, -product.price)
+    license_key.is_sold = True
+    log_balance_change(session, user.id, -product.price, "purchase", user.balance, related_id=product.id)
+
+    # НОВОЕ: остаток ключей ПОСЛЕ этой продажи (autoflush применит is_sold=True
+    # до выполнения этого SELECT, поэтому только что проданный ключ уже не
+    # попадёт в подсчёт "в наличии")
+    remaining_res = await session.execute(
+        select(func.count(LicenseKey.id)).filter_by(product_id=product.id, is_sold=False)
+    )
+    remaining_after_sale = remaining_res.scalar() or 0
+
+    referral_notification = None
+    if user.referred_by:
+        referrer_res = await session.execute(
+            select(User).where(User.id == user.referred_by).with_for_update()
+        )
+        referrer = referrer_res.scalar_one_or_none()
+        if referrer:
+            ref_bonus = money_round(
+                Decimal(str(product.price)) * Decimal(str(REFERRAL_BONUS_PERCENT)) / Decimal("100")
+            )
+            referrer.balance = money_add(referrer.balance, ref_bonus)
+            log_balance_change(session, referrer.id, ref_bonus, "referral_bonus", referrer.balance, related_id=user.id)
+            referral_notification = (referrer.id, ref_bonus)
+
+    sw_name = software.name if software else "Товар"
+    purchase = Purchase(
+        user_id=user.id,
+        product_id=product.id,
+        product_name=f"{sw_name} ({product.duration})",
+        key_issued=license_key.key_string,
+        duration=product.duration,
+        price_paid=product.price,
+        order_token=order_token,
+    )
+    session.add(purchase)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        logger.exception("Не удалось завершить покупку user_id=%s product_id=%s", user_id, product_id)
+        already_processed = await session.scalar(select(Purchase.id).where(Purchase.order_token == order_token))
+        if already_processed:
+            await callback.answer("✅ Эта покупка уже была обработана. Повторного списания нет.", show_alert=True)
+        else:
+            await callback.answer(
+                "❌ Не удалось завершить покупку. Баланс и ключ не изменены — попробуйте ещё раз.",
+                show_alert=True,
+            )
+        return
+
+    # Закрываем индикатор загрузки сразу после commit, пока отправляются
+    # уведомления и сообщения пользователю.
+    await callback.answer("✅ Покупка оплачена")
+
+    # Уведомляем реферера только после подтверждённого commit: иначе он мог
+    # получить сообщение о бонусе при откатившейся покупке.
+    if referral_notification:
+        referrer_id, ref_bonus = referral_notification
+        try:
+            await callback.bot.send_message(
+                referrer_id,
+                f"🎉 **Реферальный бонус!**\nВаш реферал совершил покупку. Вам начислено `{ref_bonus:.2f} грн` на баланс!",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление рефереру {referrer_id}: {e}")
+
+    # НОВОЕ: уведомление админам о каждой покупке ключа — с данными о
+    # покупателе, товаре, сумме и оставшемся на складе количестве.
+    purchase_notify_msg = (
+        f"💸 **Новая покупка!**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Покупатель: `{user.id}` ({user_display(callback)})\n"
+        f"📦 Товар: `{escape_md(sw_name)}`\n"
+        f"⏳ Тариф: `{escape_md(product.duration)}`\n"
+        f"💰 Сумма: `{product.price:.2f} грн`\n"
+        f"📊 Остаток на складе: `{remaining_after_sale}` шт."
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await callback.bot.send_message(admin_id, purchase_notify_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление о покупке админу {admin_id}: {e}")
+
+    # НОВОЕ: уведомление админам о заканчивающемся остатке ключей.
+    # Срабатывает один раз ровно в момент пересечения порога (а не на
+    # каждой продаже ниже него) плюс отдельно — когда остаток обнулился.
+    if remaining_after_sale == LOW_STOCK_THRESHOLD or remaining_after_sale == 0:
+        if remaining_after_sale == 0:
+            stock_text = "🔴 **Ключи закончились полностью!**"
+        else:
+            stock_text = f"🟡 **Остаток ключей на исходе:** `{remaining_after_sale}` шт."
+        low_stock_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data=f"add_keys_prod_{product.id}")],
+        ])
+        for admin_id in ADMIN_IDS:
+            try:
+                await callback.bot.send_message(
+                    admin_id,
+                    f"{stock_text}\n\n"
+                    f"📦 Товар: `{escape_md(sw_name)}`\n"
+                    f"⏳ Тариф: `{escape_md(product.duration)}`",
+                    reply_markup=low_stock_kb,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление о низком остатке админу {admin_id}: {e}")
+
+    success_text = (
+        f"✅ **Покупка успешно завершена!**\n"
+        f"🧾 Заказ: `#{purchase.id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Товар:** `{escape_md(sw_name)}` — `{escape_md(product.duration)}`\n"
+        f"💳 **Списано с баланса:** `{product.price:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 **Ваш лицензионный ключ:**\n`{escape_md(license_key.key_string)}`\n\n"
+        + f"📌 *Нажмите на ключ, чтобы скопировать.*\n"
+        f"💾 *Ключ надёжно сохранён в разделе «👤 Мой профиль».*\n\n"
+        f"🎰 **Оставьте отзыв о товаре и крутите колесо фортуны с топовыми призами!**\n"
+        f"⭐ Это займёт минуту, а взамен — шанс выиграть ключ или деньги на баланс."
+    )
+
+    # Отвязываем старую кнопку подтверждения, чтобы её повторное нажатие не
+    # пыталось выполнить покупку ещё раз. Сам ключ отправляется отдельным
+    # сообщением БЕЗ кнопок: навигация и форма отзыва его больше не редактируют.
+    try:
+        await callback.message.edit_text(
+            "✅ **Покупка завершена.**\nКлюч отправлен отдельным сообщением ниже.",
+            reply_markup=None,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.warning("Не удалось заменить сообщение подтверждения покупки: %s", e)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    try:
+        await callback.message.answer(success_text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        # Покупка уже сохранена в БД. Даже если Telegram временно не принял
+        # сообщение, ключ остаётся доступен в профиле/истории покупок.
+        logger.exception("Ключ не удалось отправить сразу user_id=%s purchase_id=%s: %s", user_id, purchase.id, e)
+        try:
+            await callback.bot.send_message(
+                user_id,
+                "⚠️ Покупка сохранена, но сообщение с ключом не отправилось. "
+                "Откройте Профиль → История покупок, ключ там сохранён.",
+            )
+        except Exception:
+            pass
+
+    # Отдельная отправка URL без Markdown-экранирования: ссылки с '_' и
+    # другими спецсимволами Telegram распознаёт как обычные ссылки.
+    if software and software.files_link:
+        try:
+            await callback.bot.send_message(
+                user_id,
+                f"📁 Файлы и инструкция к покупке:\n{software.files_link}",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Не удалось отправить ссылку на файлы user_id=%s purchase_id=%s", user_id, purchase.id)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Оставить отзыв и крутить колесо 🎰", callback_data=f"leave_review_product_{product.id}")],
+        [InlineKeyboardButton(text="📢 Канал отзывов", url=REVIEWS_CHANNEL_URL)],
+        [InlineKeyboardButton(text="👤 Посмотреть мои ключи", callback_data="profile")],
+        [InlineKeyboardButton(text="🛒 Купить еще софт", callback_data=f"platform_{software.platform_id}" if software else "shop")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.answer(
+        "👇 **Покупка успешно оформлена. Что делаем дальше?**",
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+# ==========================================
+# 🎰 КОЛЕСО ФОРТУНЫ ПОСЛЕ ПОКУПКИ
+# ==========================================
+# Один спин на одну покупку (обеспечено уникальным purchase_id в WheelSpin +
+# перехватом IntegrityError на случай двойного нажатия/гонки).
+# Шансы: 5% — ключ на 1 день ЛЮБОГО СОФТА НА ВЫБОР пользователя,
+# 5% — 50 грн на баланс, 90% — мимо.
+# ==========================================
+# 🎰 КОЛЕСО ФОРТУНЫ ЗА ОТЗЫВ
+# ==========================================
+# Тот же механизм, что и после покупки, но привязан к id отзыва
+# (WheelSpin.review_id, уникален) — один спин на один отзыв.
+@router.callback_query(F.data.startswith("wheelreview_"))
+async def spin_wheel_review_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    review_id = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+
+    review = await session.get(Review, review_id)
+    if not review or review.user_id != user_id:
+        await callback.answer("❌ Этот отзыв вам не принадлежит.", show_alert=True)
+        return
+
+    already_res = await session.execute(select(WheelSpin).filter_by(review_id=review_id))
+    if already_res.scalars().first():
+        await callback.answer("🎰 Вы уже крутили колесо за этот отзыв!", show_alert=True)
+        return
+
+    frames = ["🎰 🍒 ▪️ ▪️", "🎰 ▪️ 🔑 ▪️", "🎰 ▪️ ▪️ 💰", "🎰 ✨ ✨ ✨"]
+    anim_msg = await bot.send_message(
+        callback.message.chat.id,
+        f"{frames[0]}\n\n_Крутим колесо фортуны..._",
+        parse_mode="Markdown"
+    )
+    for frame in frames[1:]:
+        try:
+            await anim_msg.edit_text(
+                f"{frame}\n\n_Крутим колесо фортуны..._",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
+
+    roll = random.random()
+    prize_kind = "lose"
+    if roll < WHEEL_KEY_CHANCE:
+        prize_kind = "key"
+    elif roll < WHEEL_KEY_CHANCE + WHEEL_BALANCE_CHANCE:
+        prize_kind = "balance"
+
+    if prize_kind == "key":
+        avail_res = await session.execute(
+            select(Software.id, Software.name, func.count(LicenseKey.id))
+            .join(Product, Product.software_id == Software.id)
+            .join(LicenseKey, LicenseKey.product_id == Product.id)
+            .where(Product.duration == WHEEL_KEY_DURATION, LicenseKey.is_sold == False)
+            .group_by(Software.id, Software.name)
+        )
+        available_softwares = avail_res.all()
+
+        if not available_softwares:
+            prize_kind = "balance"
+        else:
+            spin = WheelSpin(review_id=review_id, user_id=user_id, result="key_pending")
+            session.add(spin)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                await anim_msg.edit_text(
+                    "🎰 Вы уже крутили колесо за этот отзыв!",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+                    ])
+                )
+                await callback.answer()
+                return
+
+            buttons = [
+                [InlineKeyboardButton(
+                    text=f"📦 {sw_name} ({cnt} шт.)",
+                    callback_data=f"wheel_pick_{spin.id}_{sw_id}"
+                )]
+                for sw_id, sw_name, cnt in available_softwares
+            ]
+            await anim_msg.edit_text(
+                f"🎉 **ДЖЕКПОТ!** 🎉\n\n"
+                f"Вы выиграли ключ на **{WHEEL_KEY_DURATION}**!\n"
+                f"👇 Выберите, какой софт хотите получить:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+    user = user_res.scalar_one_or_none()
+
+    result_text = ""
+    final_kind = "lose"
+
+    if prize_kind == "balance":
+        if user:
+            user.balance = money_add(user.balance, WHEEL_BALANCE_PRIZE)
+            log_balance_change(session, user.id, WHEEL_BALANCE_PRIZE, "wheel_bonus", user.balance, related_id=review_id)
+        final_kind = "balance"
+        result_text = (
+            f"🎉 **Поздравляем!** 🎉\n\n"
+            f"Вы выиграли **{WHEEL_BALANCE_PRIZE:.0f} грн** на баланс!\n"
+            f"💰 Новый баланс: `{(user.balance if user else 0):.2f} грн`"
+        )
+    else:
+        result_text = (
+            f"🎲 **Почти!**\n\n"
+            f"В этот раз не повезло — спасибо, что оставили отзыв! 🍀"
+        )
+
+    spin = WheelSpin(review_id=review_id, user_id=user_id, result=final_kind)
+    session.add(spin)
+
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await anim_msg.edit_text(
+            "🎰 Вы уже крутили колесо за этот отзыв!",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+            ])
+        )
+        await callback.answer()
+        return
+
+    await anim_msg.edit_text(
+        result_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
+            [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+    if final_kind == "balance":
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🎰 Пользователь `{user_id}` выиграл приз в колесе фортуны (за отзыв): {WHEEL_BALANCE_PRIZE:.0f} грн",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+
+@router.callback_query(F.data.startswith("wheel_pick_"))
+async def wheel_pick_software_handler(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    parts = callback.data.split("_")
+    spin_id = int(parts[2])
+    software_id = int(parts[3])
+    user_id = callback.from_user.id
+
+    # Lock the prize row first: two rapid taps must not reserve two keys
+    # against the same one-time spin.
+    spin_res = await session.execute(
+        select(WheelSpin).where(WheelSpin.id == spin_id).with_for_update()
+    )
+    spin = spin_res.scalar_one_or_none()
+    if not spin or spin.user_id != user_id:
+        await callback.answer("❌ Этот приз вам не принадлежит.", show_alert=True)
+        return
+
+    if spin.result != "key_pending":
+        await callback.answer("🎰 Этот приз уже был получен ранее!", show_alert=True)
+        return
+
+    software = await session.get(Software, software_id)
+    if not software:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    # Берём случайный доступный ключ на 1 день среди тарифов выбранного софта
+    key_res = await session.execute(
+        select(LicenseKey)
+        .join(Product, LicenseKey.product_id == Product.id)
+        .where(
+            Product.software_id == software_id,
+            Product.duration == WHEEL_KEY_DURATION,
+            LicenseKey.is_sold == False,
+        )
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    license_key = key_res.scalars().first()
+
+    if not license_key:
+        # Пока пользователь выбирал — ключи именно этого софта закончились.
+        # Приз не сгорает: предлагаем выбрать другой софт.
+        avail_res = await session.execute(
+            select(Software.id, Software.name, func.count(LicenseKey.id))
+            .join(Product, Product.software_id == Software.id)
+            .join(LicenseKey, LicenseKey.product_id == Product.id)
+            .where(Product.duration == WHEEL_KEY_DURATION, LicenseKey.is_sold == False)
+            .group_by(Software.id, Software.name)
+        )
+        available_softwares = avail_res.all()
+
+        if not available_softwares:
+            # Совсем ничего не осталось — заменяем приз на баланс
+            user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+            user = user_res.scalar_one_or_none()
+            if user:
+                user.balance = money_add(user.balance, WHEEL_BALANCE_PRIZE)
+                log_balance_change(session, user.id, WHEEL_BALANCE_PRIZE, "wheel_bonus", user.balance, related_id=(spin.purchase_id or spin.review_id))
+            spin.result = "balance"
+            await session.commit()
+            await callback.message.edit_text(
+                f"😔 К сожалению, ключи этого софта только что закончились.\n\n"
+                f"🎉 Вместо ключа начисляем **{WHEEL_BALANCE_PRIZE:.0f} грн** на баланс!\n"
+                f"💰 Новый баланс: `{(user.balance if user else 0):.2f} грн`",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+                ]),
+                parse_mode="Markdown"
+            )
+            await callback.answer()
+            return
+
+        buttons = [
+            [InlineKeyboardButton(text=f"📦 {sw_name[:40]} ({cnt} шт.)", callback_data=f"wheel_pick_{spin.id}_{sw_id}")]
+            for sw_id, sw_name, cnt in available_softwares
+        ]
+        await callback.answer("😔 Именно этот софт только что закончился, выберите другой!", show_alert=True)
+        await callback.message.edit_text(
+            f"🎉 **ДЖЕКПОТ!** 🎉\n\nВы выиграли ключ на **{WHEEL_KEY_DURATION}**!\n👇 Выберите софт:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="Markdown"
+        )
+        return
+
+    license_key.is_sold = True
+    bonus_purchase = Purchase(
+        user_id=user_id,
+        product_id=license_key.product_id,
+        product_name=f"🎁 Приз колеса фортуны: {software.name}",
+        key_issued=license_key.key_string,
+        duration=WHEEL_KEY_DURATION,
+        price_paid=0.0,
+    )
+    session.add(bonus_purchase)
+    spin.result = "key"
+    await session.commit()
+
+    await callback.message.edit_text(
+        f"🎉 **Готово!** 🎉\n\n"
+        f"📦 `{escape_md(software.name)}` — **{WHEEL_KEY_DURATION}**\n"
+        f"🔑 `{escape_md(license_key.key_string)}`\n\n"
+        + f"💾 Ключ уже сохранён в разделе «👤 Мой профиль».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+        ]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+    if software.files_link:
+        try:
+            await bot.send_message(
+                user_id,
+                f"📁 Файлы и инструкция к призу:\n{software.files_link}",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            logger.exception("Не удалось отправить ссылку на файлы приза user_id=%s spin_id=%s", user_id, spin.id)
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🎰 Пользователь `{user_id}` выиграл и забрал ключ в колесе фортуны: `{escape_md(software.name)}` ({WHEEL_KEY_DURATION})",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+# ==========================================
+# РЕФЕРАЛЬНАЯ СИСТЕМА И ВЫВОД СРЕДСТВ
+# ==========================================
+@router.callback_query(F.data == "ref_program")
+async def show_ref_program(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
+    await state.clear()
+    user_id = callback.from_user.id
+    user = await session.get(User, user_id)
+    balance = user.balance if user else 0.0
+
+    ref_count_res = await session.execute(select(func.count(User.id)).where(User.referred_by == user_id))
+    total_refs = ref_count_res.scalar() or 0
+
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+
+    text_msg = (
+        f"🤝 **Реферальная программа**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Приглашайте друзей по вашей ссылке и получайте **{REFERRAL_BONUS_PERCENT:g}%** от суммы каждой их покупки прямо на баланс!\n\n"
+        f"👥 **Приглашено друзей:** `{total_refs}`\n"
+        f"💰 **Доступный баланс:** `{balance:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🔗 **Ваша реферальная ссылка:**\n`{ref_link}`"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"📤 Вывести средства (от {MIN_WITHDRAWAL:.0f} грн)", callback_data="start_withdrawal")],
+            [InlineKeyboardButton(text="🛒 Каталог софта", callback_data="shop")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")]
+        ]
+    )
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data == "start_withdrawal")
+async def start_withdrawal_handler(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    user = await session.get(User, callback.from_user.id)
+    balance = user.balance if user else 0.0
+    if balance < MIN_WITHDRAWAL:
+        await callback.answer(
+            f"❌ Минимальная сумма вывода {MIN_WITHDRAWAL:.0f} грн. На вашем балансе: {balance:.2f} грн",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(WithdrawalStates.waiting_for_amount)
+    await callback.message.edit_text(
+        f"📤 **Вывод средств**\n\n"
+        f"💳 Ваш доступный баланс: `{balance:.2f} грн`\n\n"
+        f"Введите сумму для вывода (минимум {MIN_WITHDRAWAL:.0f} грн):",
+        reply_markup=cancel_kb("ref_program"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(WithdrawalStates.waiting_for_amount)
+async def process_withdrawal_amount(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 500", reply_markup=cancel_kb("ref_program"))
+        return
+
+    # ФИКС: используем безопасный парсер, отсекающий inf/nan/отрицательные/слишком большие суммы
+    amount = parse_positive_amount(message.text)
+    if amount is None:
+        await message.answer("❌ Введите корректную сумму числом!", reply_markup=cancel_kb("ref_program"))
+        return
+
+    user = await session.get(User, message.from_user.id)
+    balance = user.balance if user else 0.0
+
+    if amount < MIN_WITHDRAWAL:
+        await message.answer(f"❌ Минимальная сумма вывода — {MIN_WITHDRAWAL:.0f} грн. Введите сумму повторно:", reply_markup=cancel_kb("ref_program"))
+        return
+    if amount > balance:
+        await message.answer(f"❌ У вас недостаточно средств! Доступно: `{balance:.2f} грн`. Введите сумму:", reply_markup=cancel_kb("ref_program"), parse_mode="Markdown")
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(WithdrawalStates.waiting_for_card)
+    await message.answer("💳 Введите номер банковской карты для получения выплаты:", reply_markup=cancel_kb("ref_program"))
+
+@router.message(WithdrawalStates.waiting_for_card)
+async def process_withdrawal_card(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    if not message.text:
+        await message.answer("❌ Отправьте номер карты текстом.", reply_markup=cancel_kb("ref_program"))
+        return
+
+    card = message.text.strip()
+    # Простая валидация номера карты: 13-19 цифр, допускаются пробелы
+    digits_only = card.replace(" ", "")
+    if not digits_only.isdigit() or not (13 <= len(digits_only) <= 19):
+        await message.answer(
+            "❌ Некорректный номер карты. Введите номер карты (13-19 цифр):",
+            reply_markup=cancel_kb("ref_program")
+        )
+        return
+
+    data = await state.get_data()
+    amount = parse_positive_amount(str(data.get("amount", "")))
+    if amount is None or amount < MIN_WITHDRAWAL:
+        await message.answer("⚠️ Сессия вывода устарела или сумма некорректна. Начните заново через «Реферальная система».")
+        await state.clear()
+        return
+
+    user_id = message.from_user.id
+
+    # ФИКС: блокируем строку пользователя, чтобы исключить одновременное создание
+    # нескольких заявок на вывод, суммарно превышающих реальный баланс.
+    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if not user or user.balance < amount:
+        await message.answer("❌ Недостаточно средств на балансе.")
+        await state.clear()
+        return
+
+    user.balance = money_add(user.balance, -amount)
+    req = WithdrawalRequest(user_id=user_id, amount=amount, card=card)
+    session.add(req)
+    await session.flush()  # получаем req.id до commit, чтобы привязать к нему запись лога
+    log_balance_change(session, user_id, -amount, "withdrawal_request", user.balance, related_id=req.id)
+    await session.commit()
+    await state.clear()
+
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+    await message.answer(
+        f"✅ **Заявка на вывод создана!**\n\n"
+        f"💰 Сумма: `{amount:.2f} грн`\n"
+        f"💳 Карта: `{escape_md(card)}`\n\n"
+        f"⏳ Ожидайте обработки администратором.",
+        reply_markup=get_main_menu_kb(user_id, lang),
+        parse_mode="Markdown"
+    )
+
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить выплату", callback_data=f"approve_wdr_{req.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_wdr_{req.id}")
+        ]]
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📤 **Заявка на вывод средств #{req.id}**\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
+                    f"💰 Сумма: `{amount:.2f} грн`\n"
+                    f"💳 Карта: `{escape_md(card)}`"
+                ),
+                reply_markup=admin_kb,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.exception(f"Не удалось отправить уведомление о выводе админу {admin_id}: {e}")
+
+@router.callback_query(F.data.startswith("approve_wdr_"), F.from_user.id.in_(ADMIN_IDS))
+async def approve_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req_res = await session.execute(
+        select(WithdrawalRequest).where(WithdrawalRequest.id == req_id).with_for_update()
+    )
+    req = req_res.scalar_one_or_none()
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "approved"
+    await session.commit()
+
+    current_text = callback.message.text or ""
+    await callback.message.edit_text(text=current_text + "\n\n✅ **ВЫПЛАЧЕНО**", reply_markup=None, parse_mode="Markdown")
+    try:
+        await bot.send_message(
+            req.user_id,
+            f"🎉 **Ваша заявка на вывод `{req.amount:.2f} грн` успешно обработана!**\nСредства отправлены на карту `{escape_md(req.card)}`.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("reject_wdr_"), F.from_user.id.in_(ADMIN_IDS))
+async def reject_withdrawal(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req_res = await session.execute(
+        select(WithdrawalRequest).where(WithdrawalRequest.id == req_id).with_for_update()
+    )
+    req = req_res.scalar_one_or_none()
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "rejected"
+
+    # ФИКС: блокировка строки пользователя при возврате средств
+    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if user:
+        user.balance = money_add(user.balance, req.amount)
+        log_balance_change(session, user.id, req.amount, "withdrawal_rejected_refund", user.balance, related_id=req.id)
+
+    await session.commit()
+
+    current_text = callback.message.text or ""
+    await callback.message.edit_text(text=current_text + "\n\n❌ **ОТКЛОНЕНО (Средства возвращены)**", reply_markup=None, parse_mode="Markdown")
+    try:
+        await bot.send_message(
+            req.user_id,
+            f"❌ Ваша заявка на вывод `{req.amount:.2f} грн` была отклонена. Средства возвращены на ваш баланс.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+# ==========================================
+# ПОПОЛНЕНИЕ БАЛАНСА И ПРИЕМ ЧЕКОВ
+# ==========================================
+async def begin_purchase_topup(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    state: FSMContext,
+    bot: Bot,
+    product_id: int,
+) -> None:
+    """Open payment instructions for the exact price of the selected product."""
+    product = await session.get(Product, product_id)
+    if not product or not math.isfinite(float(product.price)) or product.price <= 0:
+        await callback.answer("❌ Товар больше недоступен. Откройте каталог заново.", show_alert=True)
+        return
+
+    # Не предлагаем оплачивать товар, если склад уже пуст.
+    available = await session.scalar(
+        select(func.count(LicenseKey.id)).where(
+            LicenseKey.product_id == product.id,
+            LicenseKey.is_sold.is_(False),
+        )
+    ) or 0
+    if available <= 0:
+        await callback.answer("❌ Ключи этого тарифа закончились. Выберите другой товар.", show_alert=True)
+        return
+
+    pending_count = await session.scalar(
+        select(func.count(DepositRequest.id)).where(
+            DepositRequest.user_id == callback.from_user.id,
+            DepositRequest.status == "pending",
+        )
+    ) or 0
+    if pending_count >= MAX_PENDING_DEPOSITS:
+        await callback.answer(
+            f"У вас уже есть {pending_count} заявок на пополнение в обработке. Дождитесь их проверки.",
+            show_alert=True,
+        )
+        return
+
+    user = await session.get(User, callback.from_user.id)
+    software = await session.get(Software, product.software_id)
+    amount = money_round(product.price)
+    selected_card = random.choice(CARDS)
+
+    # Сбрасываем возможные старые данные формы — этот сценарий всегда имеет
+    # фиксированную сумму и не должен наследовать сумму/реквизиты другой заявки.
+    await state.clear()
+    await state.set_data({
+        "amount": amount,
+        "card": selected_card,
+        "purchase_product_id": product.id,
+    })
+    await state.set_state(DepositStates.waiting_for_receipt)
+
+    current_balance = money_round(user.balance) if user else 0.0
+    text_msg = (
+        "💳 **Пополнение для покупки**\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 **Товар:** `{escape_md(software.name if software else 'Товар')}`\n"
+        f"⏳ **Срок:** `{escape_md(product.duration)}`\n"
+        f"💰 **Стоимость товара:** `{amount:.2f} грн`\n"
+        f"💳 **Ваш текущий баланс:** `{current_balance:.2f} грн`\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 **Реквизиты для перевода:**\n`{selected_card}`\n\n"
+        f"Переведите **ровно {amount:.2f} грн**. После оплаты отправьте сюда фото или файл чека.\n"
+        "Заявка уйдёт администратору. После подтверждения пополнение появится на балансе, "
+        "а бот пришлёт кнопку для возврата к этому товару."
+    )
+    keyboard = cancel_kb("main_menu")
+    await safe_edit_text(callback, bot, text_msg, keyboard)
+    await callback.answer("Открыто пополнение на сумму товара.")
+
+
+@router.callback_query(F.data == "deposit")
+async def start_deposit(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    await state.clear()
+    # НОВОЕ: лимит заявок на пополнение в статусе "pending" на одного пользователя —
+    # не даём плодить бесконечные заявки, пока предыдущие ещё не рассмотрены админом.
+    pending_count = await session.scalar(
+        select(func.count(DepositRequest.id)).where(
+            DepositRequest.user_id == callback.from_user.id,
+            DepositRequest.status == "pending",
+        )
+    )
+    if pending_count and pending_count >= MAX_PENDING_DEPOSITS:
+        await callback.answer(
+            f"❌ У вас уже есть {pending_count} заявок на пополнение, ожидающих проверки. "
+            f"Дождитесь их обработки администратором, прежде чем создавать новую.",
+            show_alert=True
+        )
+        return
+
+    await state.set_state(DepositStates.waiting_for_amount)
+    await callback.message.edit_text(
+        f"💳 **Пополнение баланса**\n\nВведите сумму пополнения в гривнах числом (минимум {MIN_DEPOSIT:.0f} грн):",
+        reply_markup=cancel_kb("main_menu"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(DepositStates.waiting_for_amount)
+async def process_deposit_amount(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Отправьте сумму текстом (числом), например: 300", reply_markup=cancel_kb("main_menu"))
+        return
+
+    # ФИКС: безопасный парсер сумм (отсекает inf/nan и т.д.) — критично для депозитов,
+    # так как раньше float("inf") проходил проверку "amount <= 0" и мог довести
+    # до бесконечного зачисления при невнимательном подтверждении админом.
+    amount = parse_positive_amount(message.text)
+    if amount is None:
+        await message.answer("❌ Введите корректную сумму числом!", reply_markup=cancel_kb("main_menu"))
+        return
+
+    # НОВОЕ: минимальная сумма пополнения
+    if amount < MIN_DEPOSIT:
+        await message.answer(
+            f"❌ Минимальная сумма пополнения — {MIN_DEPOSIT:.0f} грн. Введите сумму повторно:",
+            reply_markup=cancel_kb("main_menu")
+        )
+        return
+
+    selected_card = random.choice(CARDS)
+    await state.update_data(amount=amount, card=selected_card)
+    await state.set_state(DepositStates.waiting_for_receipt)
+
+    text_msg = (
+        f"💳 **Оплата по реквизитам**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 **Сумма к оплате:** `{amount:.2f} грн`\n\n"
+        f"📌 **Реквизиты для перевода:**\n`{selected_card}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📸 Переведите точную сумму и **отправьте сюда фото или файл чека**."
+    )
+    await message.answer(text_msg, reply_markup=cancel_kb("main_menu"), parse_mode="Markdown")
+
+@router.message(DepositStates.waiting_for_receipt, F.photo | F.document)
+async def process_receipt(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    amount = parse_positive_amount(str(data.get("amount", "")))
+    selected_card = data.get("card")
+    user_id = message.from_user.id
+    raw_purchase_product_id = data.get("purchase_product_id")
+    try:
+        purchase_product_id = int(raw_purchase_product_id) if raw_purchase_product_id is not None else None
+    except (TypeError, ValueError):
+        purchase_product_id = None
+    is_purchase_topup = purchase_product_id is not None
+    if amount is None or (amount < MIN_DEPOSIT and not is_purchase_topup) or selected_card not in CARDS:
+        await state.clear()
+        await message.answer(
+            "⚠️ Данные оплаты устарели или повреждены. Начните пополнение заново через меню.",
+            reply_markup=get_main_menu_kb(user_id),
+        )
+        return
+
+    # Блокируем пользователя на время проверки лимита и создания заявки:
+    # две почти одновременные отправки чека не смогут превысить лимит pending.
+    user_res = await session.execute(select(User).where(User.id == user_id).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if not user:
+        await state.clear()
+        await message.answer("⚠️ Профиль не найден. Нажмите /start и попробуйте снова.")
+        return
+    pending_count = await session.scalar(
+        select(func.count(DepositRequest.id)).where(
+            DepositRequest.user_id == user_id,
+            DepositRequest.status == "pending",
+        )
+    ) or 0
+    if pending_count >= MAX_PENDING_DEPOSITS:
+        await session.rollback()
+        await state.clear()
+        await message.answer(
+            f"❌ У вас уже есть {pending_count} заявок на пополнение в обработке. "
+            f"Дождитесь их подтверждения администратором.",
+            reply_markup=get_main_menu_kb(user_id, user.language if user.language in LANGUAGES else "uk"),
+        )
+        return
+
+    receipt_type = "photo" if message.photo else "document"
+    receipt_file_id = message.photo[-1].file_id if message.photo else message.document.file_id
+    req = DepositRequest(
+        user_id=user_id,
+        amount=amount,
+        payment_card=selected_card,
+        receipt_file_id=receipt_file_id,
+        receipt_type=receipt_type,
+        purchase_product_id=purchase_product_id,
+    )
+    session.add(req)
+    await session.commit()
+
+    await state.clear()
+    user = await session.get(User, user_id)
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+
+    await message.answer(
+        "⏳ **Чек принят!** Заявка отправлена администратору на проверку.",
+        reply_markup=get_main_menu_kb(user_id, lang),
+        parse_mode="Markdown"
+    )
+
+    admin_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"approve_dep_{req.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_dep_{req.id}"),
+        ]]
+    )
+
+    caption_text = (
+        f"📥 **Заявка на пополнение #{req.id}**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Пользователь: `{user_id}` ({user_display(message)})\n"
+        f"💰 Сумма: `{amount:.2f} грн`"
+        + (f"\n🛒 Пополнение под покупку товара ID `{purchase_product_id}`" if purchase_product_id else "")
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            if message.photo:
+                await bot.send_photo(
+                    chat_id=admin_id,
+                    photo=message.photo[-1].file_id,
+                    caption=caption_text,
+                    reply_markup=admin_kb,
+                    parse_mode="Markdown"
+                )
+            elif message.document:
+                await bot.send_document(
+                    chat_id=admin_id,
+                    document=message.document.file_id,
+                    caption=caption_text,
+                    reply_markup=admin_kb,
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.exception(f"Не удалось отправить чек администратору {admin_id}: {e}")
+
+@router.message(DepositStates.waiting_for_receipt)
+async def process_receipt_wrong_type(message: Message):
+    await message.answer(
+        "📌 Пожалуйста, отправьте **фото или файл** чека об оплате.",
+        reply_markup=cancel_kb("main_menu"),
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(F.data.startswith("admin_deposit_receipt_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_deposit_receipt(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    try:
+        request_id = int(callback.data.rsplit("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный номер заявки.", show_alert=True)
+        return
+    req = await session.get(DepositRequest, request_id)
+    if not req:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    if not req.receipt_file_id or req.receipt_type not in {"photo", "document"}:
+        await callback.answer("Для этой старой заявки чек не сохранён.", show_alert=True)
+        return
+    caption = (
+        f"📎 Чек по заявке #{req.id}\n"
+        f"Пользователь: {req.user_id}\n"
+        f"Сумма: {req.amount:.2f} грн\n"
+        f"Реквизиты: {req.payment_card or 'не сохранены'}\n"
+        f"Статус: {req.status}"
+    )
+    try:
+        if req.receipt_type == "photo":
+            await bot.send_photo(callback.from_user.id, req.receipt_file_id, caption=caption)
+        else:
+            await bot.send_document(callback.from_user.id, req.receipt_file_id, caption=caption)
+    except Exception:
+        logger.exception("Не удалось повторно отправить чек deposit_id=%s admin_id=%s", req.id, callback.from_user.id)
+        await callback.answer("Не удалось отправить чек. Проверьте доступ бота к файлу.", show_alert=True)
+        return
+    await callback.answer("Чек отправлен вам в личные сообщения.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("approve_dep_"), F.from_user.id.in_(ADMIN_IDS))
+async def approve_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req_res = await session.execute(
+        select(DepositRequest).where(DepositRequest.id == req_id).with_for_update()
+    )
+    req = req_res.scalar_one_or_none()
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "approved"
+
+    # ФИКС: блокировка строки пользователя при зачислении депозита
+    user_res = await session.execute(select(User).where(User.id == req.user_id).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if not user:
+        await session.rollback()
+        await callback.answer("❌ Пользователь не найден. Заявка не изменена.", show_alert=True)
+        return
+    user.balance = money_add(user.balance, req.amount)
+    log_balance_change(session, user.id, req.amount, "deposit_approved", user.balance, related_id=req.id)
+    await session.commit()
+
+    if callback.message.caption is not None:
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
+    else:
+        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n✅ ПОДТВЕРЖДЕНО", reply_markup=None)
+
+    try:
+        approved_text = f"🎉 **Баланс успешно пополнен на {req.amount:.2f} грн!**"
+        approved_keyboard = None
+        if req.purchase_product_id:
+            target_product = await session.get(Product, req.purchase_product_id)
+            if target_product:
+                available = await session.scalar(
+                    select(func.count(LicenseKey.id)).where(
+                        LicenseKey.product_id == target_product.id,
+                        LicenseKey.is_sold.is_(False),
+                    )
+                ) or 0
+                if available > 0:
+                    approved_text += "\n\n🛒 Ваш товар всё ещё доступен. Нажмите кнопку ниже, чтобы вернуться к покупке."
+                    approved_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="🛒 Вернуться к покупке", callback_data=f"confirm_buy_{target_product.id}")
+                    ]])
+                else:
+                    approved_text += "\n\n⚠️ К сожалению, ключи этого товара уже закончились. Баланс сохранён — выберите другой товар в каталоге."
+        await bot.send_message(
+            req.user_id, approved_text, reply_markup=approved_keyboard, parse_mode="Markdown"
+        )
+    except Exception:
+        logger.exception("Не удалось уведомить пользователя об одобрении депозита id=%s", req.id)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("reject_dep_"), F.from_user.id.in_(ADMIN_IDS))
+async def reject_deposit(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    req_id = int(callback.data.split("_")[2])
+    req_res = await session.execute(
+        select(DepositRequest).where(DepositRequest.id == req_id).with_for_update()
+    )
+    req = req_res.scalar_one_or_none()
+
+    if not req or req.status != "pending":
+        await callback.answer("❌ Заявка уже обработана!", show_alert=True)
+        return
+
+    req.status = "rejected"
+    await session.commit()
+
+    if callback.message.caption is not None:
+        await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
+    else:
+        await callback.message.edit_text(text=(callback.message.text or "") + "\n\n❌ ОТКЛОНЕНО", reply_markup=None)
+
+    try:
+        await bot.send_message(req.user_id, "❌ Ваша заявка на пополнение была отклонена.")
+    except Exception:
+        pass
+    await callback.answer()
+
+# ==========================================
+# ПАНЕЛЬ АДМИНИСТРАТОРА И РАСШИРЕННЫЕ ФУНКЦИИ
+# ==========================================
+async def _admin_dashboard_counts(session: AsyncSession):
+    users = await session.scalar(select(func.count(User.id))) or 0
+    purchases = await session.scalar(select(func.count(Purchase.id))) or 0
+    revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0))) or 0
+    stock = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.is_sold == False)) or 0
+    pending_dep = await session.scalar(select(func.count(DepositRequest.id)).where(DepositRequest.status == "pending")) or 0
+    pending_wdr = await session.scalar(select(func.count(WithdrawalRequest.id)).where(WithdrawalRequest.status == "pending")) or 0
+    pending_reviews = await session.scalar(select(func.count(Review.id)).where(Review.status == "pending")) or 0
+    return users, purchases, float(revenue), stock, pending_dep, pending_wdr, pending_reviews
+
+
+@router.callback_query(F.data == "admin_panel", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data == "admin_dashboard_refresh", F.from_user.id.in_(ADMIN_IDS))
+async def admin_menu(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    users, purchases, revenue, stock, pending_dep, pending_wdr, pending_reviews = await _admin_dashboard_counts(session)
+    text_msg = (
+        "🛠 **KRANIN ADMIN • DASHBOARD**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Пользователей: `{users}`\n"
+        f"🛒 Покупок: `{purchases}`\n"
+        f"💰 Оборот: `{revenue:.2f} грн`\n"
+        f"📦 Ключей на складе: `{stock}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Пополнения: `{pending_dep}` · 📤 Выводы: `{pending_wdr}`\n"
+        f"⭐ Модерация отзывов: `{pending_reviews}`"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Товары и склад", callback_data="admin_catalog")],
+        [InlineKeyboardButton(text="💳 Продажи и заявки", callback_data="admin_sales")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="⭐ Отзывы", callback_data="admin_reviews_manage")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_start_broadcast")],
+        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin_promo_list")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_dashboard_refresh")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_catalog", F.from_user.id.in_(ADMIN_IDS))
+async def admin_catalog_menu(callback: CallbackQuery, session: AsyncSession):
+    stock = await session.scalar(select(func.count(LicenseKey.id)).where(LicenseKey.is_sold == False)) or 0
+    softwares = await session.scalar(select(func.count(Software.id))) or 0
+    products = await session.scalar(select(func.count(Product.id))) or 0
+    text_msg = (
+        "📦 **ТОВАРЫ И СКЛАД**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡 Софт: `{softwares}` · 🧾 Тарифов: `{products}`\n"
+        f"🔑 В наличии: `{stock}`"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить софт", callback_data="admin_add_sw"), InlineKeyboardButton(text="🗑 Удалить софт", callback_data="admin_del_sw_select")],
+        [InlineKeyboardButton(text="➕ Создать тариф", callback_data="admin_add_prod"), InlineKeyboardButton(text="✏️ Изменить цену", callback_data="admin_edit_price_select")],
+        [InlineKeyboardButton(text="🗑 Удалить тариф", callback_data="admin_del_prod_select")],
+        [InlineKeyboardButton(text="📥 Загрузить ключи", callback_data="admin_add_keys_select"), InlineKeyboardButton(text="🗑 Очистить ключи", callback_data="admin_del_keys_select")],
+        [InlineKeyboardButton(text="📊 Склад по тарифам", callback_data="admin_stock")],
+        [InlineKeyboardButton(text="🖼 Фото/описание", callback_data="admin_sw_media_select")],
+        [InlineKeyboardButton(text="🔗 Ссылки на файлы", callback_data="admin_sw_link_select")],
+        [InlineKeyboardButton(text="🔋 Пополнение аккаунтов", callback_data="admin_topup_accounts")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_stock", F.from_user.id.in_(ADMIN_IDS))
+async def admin_stock_handler(callback: CallbackQuery, session: AsyncSession):
+    # One grouped query instead of two COUNT queries per tariff (N+1).
+    stock_result = await session.execute(
+        select(
+            Product,
+            Software,
+            func.count(case((LicenseKey.is_sold.is_(False), 1))).label("available"),
+            func.count(case((LicenseKey.is_sold.is_(True), 1))).label("sold"),
+        )
+        .join(Software, Product.software_id == Software.id)
+        .outerjoin(LicenseKey, LicenseKey.product_id == Product.id)
+        .group_by(Product.id, Software.id)
+        .order_by(Software.name.asc(), Product.id.asc())
+    )
+    rows = stock_result.all()
+    lines = ["📊 **СКЛАД ПО ТАРИФАМ**\n━━━━━━━━━━━━━━━━━━━"]
+    buttons = []
+    if not rows:
+        lines.append("Тарифов пока нет.")
+    for product, software, available, sold in rows:
+        icon = "🟢" if available else "🔴"
+        lines.append(f"{icon} **{escape_md(software.name)}** • `{escape_md(product.duration)}` → `{available}` шт. · продано `{sold}`")
+        buttons.append([InlineKeyboardButton(text=f"📥 Добавить в «{product.duration[:25]}»", callback_data=f"add_keys_prod_{product.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Товары и склад", callback_data="admin_catalog")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_sales", F.from_user.id.in_(ADMIN_IDS))
+async def admin_sales_menu(callback: CallbackQuery, session: AsyncSession):
+    today = datetime.now(timezone.utc).date()
+    total_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0))) or 0
+    today_revenue = await session.scalar(select(func.coalesce(func.sum(Purchase.price_paid), 0)).where(func.date(Purchase.purchased_at) == today)) or 0
+    avg_check = await session.scalar(select(func.coalesce(func.avg(Purchase.price_paid), 0))) or 0
+    purchases = await session.scalar(select(func.count(Purchase.id))) or 0
+    text_msg = (
+        "💳 **ПРОДАЖИ И ФИНАНСЫ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 За всё время: `{float(total_revenue):.2f} грн`\n"
+        f"📅 Сегодня: `{float(today_revenue):.2f} грн`\n"
+        f"🛒 Покупок: `{purchases}`\n"
+        f"🧾 Средний чек: `{float(avg_check):.2f} грн`"
+    )
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 Неподтвержденные заявки", callback_data="admin_pending_orders")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_users", F.from_user.id.in_(ADMIN_IDS))
+async def admin_users_menu(callback: CallbackQuery, session: AsyncSession):
+    users = await session.scalar(select(func.count(User.id))) or 0
+    banned = await session.scalar(select(func.count(User.id)).where(User.is_banned == True)) or 0
+    buyers = await session.scalar(select(func.count(func.distinct(Purchase.user_id)))) or 0
+    text_msg = (
+        "👥 **ПОЛЬЗОВАТЕЛИ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Всего: `{users}`\n"
+        f"🛒 Покупали: `{buyers}`\n"
+        f"🚫 Заблокированы: `{banned}`"
+    )
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Найти / управлять", callback_data="admin_user_manage")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]), parse_mode="Markdown")
+    await callback.answer()
+
+
+# --- НОВОЕ: НЕПОДТВЕРЖДЕННЫЕ ЗАЯВКИ (ПОПОЛНЕНИЯ + ВЫВОДЫ) ---
+# Раньше заявки на пополнение/вывод уходили админу только один раз,
+# при создании — если сообщение потерялось (например, у другого админа
+# в другом чате, или было случайно закрыто), найти "зависшую" заявку
+# можно было только вручную через базу данных. Теперь все заявки со
+# статусом "pending" собраны в одном разделе панели администратора.
+@router.callback_query(F.data == "admin_pending_orders", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.startswith("admin_pending_page_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_pending_orders(callback: CallbackQuery, session: AsyncSession):
+    page = 0
+    if callback.data.startswith("admin_pending_page_"):
+        page = int(callback.data.split("_")[3])
+
+    dep_res = await session.execute(
+        select(DepositRequest).where(DepositRequest.status == "pending").order_by(DepositRequest.created_at.asc())
+    )
+    deposits = dep_res.scalars().all()
+
+    wdr_res = await session.execute(
+        select(WithdrawalRequest).where(WithdrawalRequest.status == "pending").order_by(WithdrawalRequest.created_at.asc())
+    )
+    withdrawals = wdr_res.scalars().all()
+
+    # Объединяем оба типа заявок в единый список, отсортированный по времени создания
+    combined = [("deposit", d) for d in deposits] + [("withdrawal", w) for w in withdrawals]
+    combined.sort(key=lambda item: item[1].created_at)
+
+    total = len(combined)
+    per_page = 5
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, total_pages - 1))
+    offset = page * per_page
+    page_items = combined[offset:offset + per_page]
+
+    header = (
+        f"🧾 **Неподтвержденные заявки**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📥 Пополнений в ожидании: `{len(deposits)}`\n"
+        f"📤 Выводов в ожидании: `{len(withdrawals)}`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not page_items:
+        text_msg = header + "\n✅ Все заявки обработаны, ожидающих нет."
+    else:
+        lines = [header]
+        for kind, req in page_items:
+            date_str = req.created_at.strftime("%d.%m.%Y %H:%M")
+            if kind == "deposit":
+                lines.append(
+                    f"📥 **Пополнение #{req.id}**\n"
+                    f"👤 Пользователь: `{req.user_id}`\n"
+                    f"💰 Сумма: `{req.amount:.2f} грн`\n"
+                    f"💳 Реквизиты: `{escape_md(req.payment_card or 'не сохранены')}`\n"
+                    f"🕒 _{date_str}_"
+                )
+            else:
+                lines.append(
+                    f"📤 **Вывод #{req.id}**\n"
+                    f"👤 Пользователь: `{req.user_id}`\n"
+                    f"💰 Сумма: `{req.amount:.2f} грн`\n"
+                    f"💳 Карта: `{escape_md(req.card)}`\n"
+                    f"🕒 _{date_str}_"
+                )
+        text_msg = "\n\n".join(lines)
+
+    buttons = []
+    for kind, req in page_items:
+        prefix = "dep" if kind == "deposit" else "wdr"
+        icon = "📥" if kind == "deposit" else "📤"
+        buttons.append([
+            InlineKeyboardButton(text=f"✅ {icon}#{req.id}", callback_data=f"approve_{prefix}_{req.id}"),
+            InlineKeyboardButton(text=f"❌ {icon}#{req.id}", callback_data=f"reject_{prefix}_{req.id}"),
+        ])
+        if kind == "deposit":
+            buttons.append([InlineKeyboardButton(
+                text=f"📎 Чек пополнения #{req.id}",
+                callback_data=f"admin_deposit_receipt_{req.id}",
+            )])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_pending_page_{page - 1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"admin_pending_page_{page + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_pending_page_{page}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        text_msg,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "noop")
+async def noop_handler(callback: CallbackQuery):
+    # Кнопка-индикатор страницы — ничего не делает, просто гасит "часики" на кнопке
+    await callback.answer()
+
+
+# --- ⭐ ПРОФЕССИОНАЛЬНАЯ МОДЕРАЦИЯ ОТЗЫВОВ ---
+REVIEW_FILTERS = {
+    "pending": ("🕒 На модерации", "pending"),
+    "approved": ("✅ Опубликованные", "approved"),
+    "hidden": ("🙈 Скрытые", "hidden"),
+    "all": ("📋 Все", None),
+}
+
+
+@router.callback_query(F.data == "admin_reviews_manage", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.startswith("admin_rev_filter_"), F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.startswith("admin_rev_page_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_reviews_list(callback: CallbackQuery, session: AsyncSession):
+    status = "pending"
+    page = 0
+    if callback.data.startswith("admin_rev_filter_"):
+        status = callback.data.split("_")[3]
+    elif callback.data.startswith("admin_rev_page_"):
+        parts = callback.data.split("_")
+        if len(parts) > 3 and parts[3].isdigit():
+            status = "pending"
+            page = int(parts[3])
+        else:
+            status = parts[3] if len(parts) > 3 else "pending"
+            page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+    if status not in REVIEW_FILTERS:
+        status = "pending"
+    _, status_value = REVIEW_FILTERS[status]
+    where = [] if status_value is None else [Review.status == status_value]
+    total = await session.scalar(select(func.count(Review.id)).where(*where)) or 0
+    pending = await session.scalar(select(func.count(Review.id)).where(Review.status == "pending")) or 0
+    approved = await session.scalar(select(func.count(Review.id)).where(Review.status == "approved")) or 0
+    hidden = await session.scalar(select(func.count(Review.id)).where(Review.status == "hidden")) or 0
+    per_page = 5
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, total_pages - 1))
+    result = await session.execute(
+        select(Review, User.username, Software.name, Product.duration)
+        .join(User, Review.user_id == User.id, isouter=True)
+        .join(Product, Review.product_id == Product.id, isouter=True)
+        .join(Software, Product.software_id == Software.id, isouter=True)
+        .where(*where).order_by(Review.created_at.desc()).offset(page * per_page).limit(per_page)
+    )
+    rows = result.all()
+    text_msg = (
+        "⭐ **ОТЗЫВЫ / МОДЕРАЦИЯ**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 `{pending}` · ✅ `{approved}` · 🙈 `{hidden}`\n"
+        f"Раздел: **{REVIEW_FILTERS[status][0]}** · `{page + 1}/{total_pages}`\n━━━━━━━━━━━━━━━━━━━\n"
+    )
+    if not rows:
+        text_msg += "Здесь пока нет отзывов."
+    buttons = []
+    for review, username, sw_name, duration in rows:
+        author = f"@{username}" if username else f"ID {review.user_id}"
+        label = (
+            f"{sw_name} • {duration}" if sw_name
+            else (review.product_label or "Старый отзыв")
+        )
+        status_icon = {"pending": "🕒", "approved": "✅", "hidden": "🙈"}.get(review.status, "❔")
+        snippet = review.text[:45] + "…" if len(review.text) > 45 else review.text
+        text_msg += (
+            f"{status_icon} **#{review.id}** · {escape_md(author)} · {review_stars(review.rating)}\n"
+            f"📦 `{escape_md(label)}`\n_{escape_md(snippet)}_\n──────────────\n"
+        )
+        buttons.append([InlineKeyboardButton(text=f"🔎 Открыть #{review.id}", callback_data=f"admin_review_view_{review.id}")])
+    buttons.insert(0, [
+        InlineKeyboardButton(text="🕒", callback_data="admin_rev_filter_pending"),
+        InlineKeyboardButton(text="✅", callback_data="admin_rev_filter_approved"),
+        InlineKeyboardButton(text="🙈", callback_data="admin_rev_filter_hidden"),
+        InlineKeyboardButton(text="📋", callback_data="admin_rev_filter_all"),
+    ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_rev_page_{status}_{page - 1}"))
+    if total_pages > 1:
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_rev_page_{status}_{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons += [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"admin_rev_filter_{status}")],
+        [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+    ]
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_review_view_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_review_view(callback: CallbackQuery, session: AsyncSession):
+    try:
+        review_id = int(callback.data.split("_")[3])
+    except (ValueError, IndexError):
+        await callback.answer("❌ Некорректный ID отзыва.", show_alert=True)
+        return
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
+        return
+    user = await session.get(User, review.user_id)
+    product = await session.get(Product, review.product_id) if review.product_id else None
+    software = await session.get(Software, product.software_id) if product else None
+    author = f"@{user.username}" if user and user.username else f"ID {review.user_id}"
+    label = (
+        f"{software.name} • {product.duration}" if software and product
+        else (review.product_label or "Старый отзыв без товара")
+    )
+    status_label = {"pending": "🕒 На модерации", "approved": "✅ Опубликован", "hidden": "🙈 Скрыт"}.get(review.status, review.status)
+    text_msg = (
+        f"⭐ **Отзыв #{review.id}**\n━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Автор: `{escape_md(author)}`\n"
+        f"🆔 Telegram ID: `{review.user_id}`\n"
+        f"📦 `{escape_md(label)}`\n"
+        f"⭐ {review_stars(review.rating)}\n"
+        f"📌 Статус: **{status_label}**\n"
+        f"🕒 `{review.created_at.strftime('%d.%m.%Y %H:%M')}`\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        f"💬 **Текст:**\n_{escape_md(review.text)}_"
+    )
+    buttons = []
+    if review.status != "approved":
+        buttons.append([InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"admin_approve_review_{review.id}")])
+    if review.status != "hidden":
+        buttons.append([InlineKeyboardButton(text="🙈 Скрыть", callback_data=f"admin_hide_review_{review.id}")])
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"admin_del_review_confirm_{review.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 К отзывам", callback_data="admin_reviews_manage")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_approve_review_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_approve_review(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    review_id = int(callback.data.split("_")[3])
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
+        return
+    if review.status == "approved":
+        await callback.answer("✅ Уже опубликован.", show_alert=True)
+        return
+    review.status = "approved"
+    await session.commit()
+    try:
+        await bot.send_message(review.user_id, "✅ Ваш отзыв прошёл модерацию и опубликован в разделе «⭐ Отзывы»!")
+    except Exception:
+        pass
+    await callback.answer("✅ Отзыв опубликован.", show_alert=True)
+    await admin_review_view(callback, session)
+
+
+@router.callback_query(F.data.startswith("admin_hide_review_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_hide_review(callback: CallbackQuery, session: AsyncSession):
+    review_id = int(callback.data.split("_")[3])
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв не найден.", show_alert=True)
+        return
+    review.status = "hidden"
+    await session.commit()
+    await callback.answer("🙈 Отзыв скрыт.", show_alert=True)
+    await admin_review_view(callback, session)
+
+
+@router.callback_query(F.data.startswith("admin_del_review_confirm_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_review_confirm(callback: CallbackQuery, session: AsyncSession):
+    review_id = int(callback.data.split("_")[4])
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв уже удалён.", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"⚠️ **Удаление отзыва #{review.id}**\n\nБез возможности восстановления.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"admin_del_review_{review.id}")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"admin_review_view_{review.id}")],
+        ]), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_del_review_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_review(callback: CallbackQuery, session: AsyncSession):
+    review_id = int(callback.data.split("_")[3])
+    review = await session.get(Review, review_id)
+    if not review:
+        await callback.answer("❌ Отзыв уже удалён.", show_alert=True)
+        return
+    await session.execute(delete(WheelSpin).where(WheelSpin.review_id == review.id))
+    await session.delete(review)
+    await session.commit()
+    await callback.answer("🗑 Отзыв удалён.", show_alert=True)
+    await admin_reviews_list(callback, session)
+
+
+# --- СОЗДАНИЕ ПРОМОКОДА АДМИНОМ ---
+@router.callback_query(F.data == "admin_create_promo", F.from_user.id.in_(ADMIN_IDS))
+async def admin_create_promo_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_promo_code)
+    await callback.message.edit_text(
+        "🎟 **Создание промокода (1/3)**\n\nВведите текстовый код промокода (например: `START2026`):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_promo_code, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_code_entered(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Введите текст промокода.")
+        return
+    code = message.text.strip()
+
+    if len(code) > MAX_PROMO_CODE_LENGTH:
+        await message.answer(
+            f"❌ Код слишком длинный ({len(code)} символов). Максимум — {MAX_PROMO_CODE_LENGTH}. Введите другой:",
+            reply_markup=cancel_kb("admin_panel")
+        )
+        return
+
+    # ФИКС: проверяем уникальность кода заранее, чтобы дать админу понятную ошибку,
+    # а не падать с необработанным IntegrityError на последнем шаге.
+    existing = await session.execute(select(PromoCode).filter_by(code=code))
+    if existing.scalars().first():
+        await message.answer(
+            f"❌ Промокод `{escape_md(code)}` уже существует. Введите другой код:",
+            reply_markup=cancel_kb("admin_panel"),
+            parse_mode="Markdown"
+        )
+        return
+
+    await state.update_data(code=code)
+    await state.set_state(AdminStates.waiting_for_promo_amount)
+    await message.answer("🎟 **Создание промокода (2/3)**\n\nВведите бонусную сумму в гривнах (число):", reply_markup=cancel_kb("admin_panel"))
+
+@router.message(AdminStates.waiting_for_promo_amount, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_amount_entered(message: Message, state: FSMContext):
+    amount = parse_positive_amount(message.text)
+    if amount is None:
+        await message.answer("❌ Введите корректное положительное число для суммы.")
+        return
+    await state.update_data(amount=amount)
+    await state.set_state(AdminStates.waiting_for_promo_uses)
+    await message.answer("🎟 **Создание промокода (3/3)**\n\nВведите максимальное количество активаций (число):", reply_markup=cancel_kb("admin_panel"))
+
+@router.message(AdminStates.waiting_for_promo_uses, F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_uses_entered(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text or not message.text.strip().lstrip("-").isdigit():
+        await message.answer("❌ Введите целое число для активаций.")
+        return
+    uses = int(message.text.strip())
+    if uses <= 0:
+        await message.answer("❌ Количество активаций должно быть больше нуля.")
+        return
+
+    data = await state.get_data()
+    code = data.get("code")
+    amount = data.get("amount")
+
+    try:
+        promo = PromoCode(code=code, amount=amount, uses_left=uses)
+        session.add(promo)
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await message.answer(
+            f"❌ Промокод `{escape_md(code)}` уже существует (создан параллельно). Начните заново.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+        await state.clear()
+        return
+
+    await state.clear()
+    await message.answer(
+        f"✅ Промокод `{escape_md(code)}` на `{amount:.2f} грн` (активаций: `{uses}`) успешно создан!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- СПИСОК И УДАЛЕНИЕ ПРОМОКОДОВ ---
+@router.callback_query(F.data == "admin_promo_list", F.from_user.id.in_(ADMIN_IDS))
+@router.callback_query(F.data.startswith("admin_promo_page_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_promo_list_handler(callback: CallbackQuery, session: AsyncSession):
+    page = 0
+    if callback.data.startswith("admin_promo_page_"):
+        page = int(callback.data.split("_")[3])
+
+    per_page = 8
+    offset = page * per_page
+
+    total_res = await session.execute(select(func.count(PromoCode.id)))
+    total_promos = total_res.scalar() or 0
+
+    if total_promos == 0:
+        await callback.message.edit_text(
+            "📋 **Список промокодов**\n\nПромокодов пока не создано.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+        await callback.answer()
+        return
+
+    res = await session.execute(
+        select(PromoCode).order_by(PromoCode.id.desc()).offset(offset).limit(per_page)
+    )
+    promos = res.scalars().all()
+
+    text_msg = f"📋 **Список промокодов** (Страница {page + 1})\nВсего: `{total_promos}`\n━━━━━━━━━━━━━━━━━━━\n"
+    buttons = []
+
+    for p in promos:
+        status_icon = "🟢" if p.uses_left > 0 else "🔴"
+        text_msg += (
+            f"{status_icon} **ID {p.id}** | `{escape_md(p.code)}` | "
+            f"{p.amount:.2f} грн | осталось активаций: `{p.uses_left}`\n"
+        )
+        buttons.append([InlineKeyboardButton(text=f"🗑 Удалить «{p.code}»", callback_data=f"confirm_del_promo_{p.id}")])
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_promo_page_{page - 1}"))
+    if offset + per_page < total_promos:
+        nav_buttons.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"admin_promo_page_{page + 1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+
+    buttons.append([InlineKeyboardButton(text="🎟 Создать промокод", callback_data="admin_create_promo")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        text_msg,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_promo_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_promo(callback: CallbackQuery, session: AsyncSession):
+    promo_id = int(callback.data.split("_")[3])
+    promo = await session.get(PromoCode, promo_id)
+    if not promo:
+        await callback.answer("❌ Промокод не найден или уже был удален!", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить промокод", callback_data=f"do_del_promo_{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_promo_list")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\n"
+        f"Удалить промокод `{escape_md(promo.code)}` (`{promo.amount:.2f} грн`, "
+        f"осталось активаций: `{promo.uses_left}`)?\n\n"
+        f"*История уже совершённых активаций сохранится в логах баланса.*",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_promo_"), F.from_user.id.in_(ADMIN_IDS))
+async def do_delete_promo(callback: CallbackQuery, session: AsyncSession):
+    promo_id = int(callback.data.split("_")[3])
+    promo = await session.get(PromoCode, promo_id)
+    if not promo:
+        await callback.answer("❌ Промокод не найден или уже был удален!", show_alert=True)
+        return
+
+    code_name = promo.code
+    # Сначала удаляем записи об активациях (нет каскада на уровне ORM-связи),
+    # затем сам промокод, чтобы не упереться в FK-констрейнт.
+    await session.execute(delete(PromoCodeUsage).where(PromoCodeUsage.promo_id == promo_id))
+    await session.delete(promo)
+    await session.commit()
+
+    await callback.answer("✅ Промокод удален!", show_alert=True)
+    await admin_promo_list_handler(callback, session)
+
+# --- 📢 ПРОДВИНУТАЯ РАССЫЛКА ---
+@router.callback_query(F.data == "admin_start_broadcast", F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_broadcast_audience)
+    await callback.message.edit_text(
+        "📢 **Новая рассылка**\n\nВыберите аудиторию:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Все", callback_data="broadcast_audience_all")],
+            [InlineKeyboardButton(text="🛒 Только покупатели", callback_data="broadcast_audience_buyers")],
+            [InlineKeyboardButton(text="🌱 Без покупок", callback_data="broadcast_audience_nonbuyers")],
+            [InlineKeyboardButton(text="💰 С балансом", callback_data="broadcast_audience_balance")],
+            [InlineKeyboardButton(text="🔙 В dashboard", callback_data="admin_panel")],
+        ]), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("broadcast_audience_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_choose_audience(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    audience = callback.data.replace("broadcast_audience_", "", 1)
+    if audience not in BROADCAST_AUDIENCES:
+        await callback.answer("❌ Неизвестная аудитория.", show_alert=True)
+        return
+    count = len(await get_broadcast_user_ids(session, audience))
+    await state.update_data(broadcast_audience=audience)
+    await state.set_state(AdminStates.waiting_for_broadcast_text)
+    await callback.message.edit_text(
+        f"📢 **Аудитория:** {BROADCAST_AUDIENCES[audience]}\n"
+        f"👥 Получателей: `{count}`\n\n"
+        "Отправьте любое сообщение: текст, фото, видео или документ.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_broadcast_text, F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_prepare(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    audience = data.get("broadcast_audience", "all")
+    if audience not in BROADCAST_AUDIENCES:
+        audience = "all"
+    count = len(await get_broadcast_user_ids(session, audience))
+    if count == 0:
+        await state.clear()
+        await message.answer("⚠️ В этой аудитории нет пользователей.", reply_markup=admin_back_kb())
+        return
+    await state.update_data(broadcast_chat_id=message.chat.id, broadcast_message_id=message.message_id, broadcast_count=count)
+    try:
+        await message.send_copy(chat_id=message.chat.id)
+    except Exception:
+        pass
+    await message.answer(
+        "📢 **Предпросмотр выше**\n\n"
+        f"🎯 {BROADCAST_AUDIENCES[audience]}\n"
+        f"👥 Получателей: `{count}`\n\n"
+        "Запустить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton(text="🔄 Выбрать аудиторию", callback_data="admin_start_broadcast")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")],
+        ]), parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "broadcast_confirm", F.from_user.id.in_(ADMIN_IDS))
+async def admin_broadcast_execute(callback: CallbackQuery, state: FSMContext, session: AsyncSession, bot: Bot):
+    # A callback can be delivered more than once. Fail fast while a campaign is
+    # already running, then keep the state read/clear inside one lock as well.
+    if BROADCAST_LOCK.locked():
+        await callback.answer("Рассылка уже выполняется. Повторный запуск заблокирован.", show_alert=True)
+        return
+    async with BROADCAST_LOCK:
+        data = await state.get_data()
+        chat_id = data.get("broadcast_chat_id")
+        message_id = data.get("broadcast_message_id")
+        audience = data.get("broadcast_audience", "all")
+        if not chat_id or not message_id or audience not in BROADCAST_AUDIENCES:
+            await state.clear()
+            await callback.answer("❌ Черновик устарел или уже обработан. Создайте рассылку заново.", show_alert=True)
+            return
+
+        user_ids = await get_broadcast_user_ids(session, audience)
+        await state.clear()
+        await callback.message.edit_text(
+            f"⏳ **Рассылка запущена**\n\n🎯 {BROADCAST_AUDIENCES[audience]}\n"
+            f"👥 Получателей: `{len(user_ids)}`\n\nДоставка выполняется…", parse_mode="Markdown"
+        )
+        await callback.answer()
+
+        success = 0
+        failed = 0
+        for index, uid in enumerate(user_ids, start=1):
+            delivered = False
+            for attempt in range(3):
+                try:
+                    await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=message_id)
+                    success += 1
+                    delivered = True
+                    break
+                except TelegramRetryAfter as e:
+                    if attempt >= 2:
+                        break
+                    await asyncio.sleep(min(float(e.retry_after), 30.0))
+                except TelegramForbiddenError:
+                    break
+                except Exception as e:
+                    logger.warning("Broadcast failed uid=%s: %s", uid, e)
+                    break
+            if not delivered:
+                failed += 1
+            await asyncio.sleep(BROADCAST_DELAY_SECONDS)
+            if index % 100 == 0:
+                try:
+                    await callback.message.edit_text(
+                        f"📢 **Рассылка выполняется**\n\n📨 Обработано: `{index}/{len(user_ids)}`\n"
+                        f"✅ Доставлено: `{success}`\n❌ Не доставлено: `{index - success}`", parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+        try:
+            await callback.message.edit_text(
+                "✅ **РАССЫЛКА ЗАВЕРШЕНА**\n━━━━━━━━━━━━━━━━━━━\n"
+                f"🎯 {BROADCAST_AUDIENCES[audience]}\n"
+                f"👥 Всего: `{len(user_ids)}`\n"
+                f"✅ Доставлено: `{success}`\n"
+                f"❌ Не доставлено: `{failed}`",
+                reply_markup=admin_back_kb(), parse_mode="Markdown"
+            )
+        except Exception:
+            logger.exception("Не удалось обновить итоговое сообщение рассылки")
+
+
+# --- УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЕМ ---
+@router.callback_query(F.data == "admin_user_manage", F.from_user.id.in_(ADMIN_IDS))
+async def admin_user_manage_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await callback.message.edit_text(
+        "👤 **Управление пользователем**\n\nВведите Telegram ID или username (например `@ivan123`) пользователя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_user_id, F.from_user.id.in_(ADMIN_IDS))
+async def admin_user_info_show(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text or not message.text.strip():
+        await message.answer("❌ Введите ID (числом) или username пользователя.")
+        return
+
+    # НОВОЕ: поиск не только по Telegram ID, но и по username
+    user = await find_user_by_identifier(session, message.text)
+    if not user:
+        await message.answer(
+            "❌ Пользователь не найден в базе данных (проверьте ID или username).",
+            reply_markup=cancel_kb("admin_panel")
+        )
+        return
+
+    target_id = user.id
+    await state.update_data(target_user_id=target_id)
+    purchases_cnt = await session.scalar(select(func.count(Purchase.id)).where(Purchase.user_id == target_id))
+
+    username_display = f"@{escape_md(user.username)}" if user.username else "отсутствует"
+    info_text = (
+        f"👤 **Информация о пользователе**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"👤 Username: {username_display}\n"
+        f"💰 Баланс: `{user.balance:.2f} грн`\n"
+        f"🛍 Покупок: `{purchases_cnt}`\n"
+        f"🚫 Заблокирован: `{'Да' if user.is_banned else 'Нет'}`\n"
+        f"🌐 Язык: `{user.language}`\n"
+        f"📅 Регистрация: `{user.created_at.strftime('%d.%m.%Y %H:%M')}`"
+    )
+
+    ban_btn_text = "🔓 Разблокировать" if user.is_banned else "🔒 Заблокировать"
+    ban_action = f"admin_unban_{target_id}" if user.is_banned else f"admin_ban_{target_id}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Изменить баланс", callback_data=f"admin_ch_bal_{target_id}")],
+        [InlineKeyboardButton(text="📜 История баланса", callback_data=f"admin_bal_history_{target_id}_0")],
+        [InlineKeyboardButton(text=ban_btn_text, callback_data=ban_action)],
+        [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]
+    ])
+    await state.clear()
+    await message.answer(info_text, reply_markup=keyboard, parse_mode="Markdown")
+
+# --- НОВОЕ: ИСТОРИЯ ОПЕРАЦИЙ С БАЛАНСОМ КОНКРЕТНОГО ПОЛЬЗОВАТЕЛЯ ---
+BALANCE_LOG_REASON_LABELS = {
+    "purchase": "🛒 Покупка",
+    "deposit_approved": "📥 Пополнение (одобрено)",
+    "withdrawal_request": "📤 Заявка на вывод",
+    "withdrawal_rejected_refund": "↩️ Возврат (вывод отклонён)",
+    "referral_bonus": "🤝 Реферальный бонус",
+    "promo_code": "🎟 Промокод",
+    "wheel_bonus": "🎰 Приз колеса фортуны",
+    "admin_adjust": "🛠 Ручная корректировка (админ)",
+}
+
+@router.callback_query(F.data.startswith("admin_bal_history_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_balance_history(callback: CallbackQuery, session: AsyncSession):
+    parts = callback.data.split("_")
+    target_id = int(parts[3])
+    page = int(parts[4])
+
+    user = await session.get(User, target_id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+        return
+
+    per_page = 8
+    total = await session.scalar(select(func.count(BalanceLog.id)).where(BalanceLog.user_id == target_id))
+    total = total or 0
+    total_pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, total_pages - 1))
+    offset = page * per_page
+
+    res = await session.execute(
+        select(BalanceLog)
+        .where(BalanceLog.user_id == target_id)
+        .order_by(BalanceLog.created_at.desc())
+        .offset(offset)
+        .limit(per_page)
+    )
+    logs = res.scalars().all()
+
+    username_display = f"@{escape_md(user.username)}" if user.username else "без юзернейма"
+    header = (
+        f"📜 **История баланса**\n"
+        f"👤 `{target_id}` ({username_display})\n"
+        f"💰 Текущий баланс: `{user.balance:.2f} грн`\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+    )
+
+    if not logs:
+        body = "Операций пока нет."
+    else:
+        lines = []
+        for log in logs:
+            sign = "+" if log.amount >= 0 else ""
+            reason_label = BALANCE_LOG_REASON_LABELS.get(log.reason, f"❔ {log.reason}")
+            date_str = log.created_at.strftime("%d.%m.%Y %H:%M")
+            related = f" (ID: `{log.related_id}`)" if log.related_id is not None else ""
+            lines.append(
+                f"{reason_label}{related}\n"
+                f"{sign}`{log.amount:.2f} грн` → баланс `{log.balance_after:.2f} грн`\n"
+                f"🕒 _{date_str}_"
+            )
+        body = "\n\n┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n\n".join(lines)
+
+    text_msg = header + body
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_bal_history_{target_id}_{page - 1}"))
+    if total_pages > 1:
+        nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_bal_history_{target_id}_{page + 1}"))
+
+    buttons = []
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        text_msg,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin_ban_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_ban_user(callback: CallbackQuery, session: AsyncSession):
+    uid = int(callback.data.split("_")[2])
+    user = await session.get(User, uid)
+    if user:
+        user.is_banned = True
+        await session.commit()
+        await callback.answer("✅ Пользователь заблокирован!", show_alert=True)
+    else:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_unban_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_unban_user(callback: CallbackQuery, session: AsyncSession):
+    uid = int(callback.data.split("_")[2])
+    user = await session.get(User, uid)
+    if user:
+        user.is_banned = False
+        await session.commit()
+        await callback.answer("✅ Пользователь разблокирован!", show_alert=True)
+    else:
+        await callback.answer("❌ Пользователь не найден.", show_alert=True)
+
+@router.callback_query(F.data.startswith("admin_ch_bal_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_change_balance_start(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.split("_")[3])
+    await state.update_data(target_user_id=uid)
+    await state.set_state(AdminStates.waiting_for_user_balance_change)
+    await callback.message.edit_text(
+        "💰 **Изменение баланса**\n\n"
+        "Введите новое значение баланса (например `500`) "
+        "или относительное изменение со знаком (например `+100` / `-50`):",
+        reply_markup=cancel_kb("admin_panel"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_user_balance_change, F.from_user.id.in_(ADMIN_IDS))
+async def admin_change_balance_finish(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    uid = data.get("target_user_id")
+    if not message.text:
+        return
+
+    raw = message.text.strip().replace(",", ".")
+    is_relative = raw.startswith("+") or raw.startswith("-")
+
+    try:
+        val = float(raw)
+    except ValueError:
+        await message.answer("❌ Введите корректное число.")
+        return
+
+    if not math.isfinite(val) or abs(val) > MAX_AMOUNT:
+        await message.answer("❌ Введите корректное конечное число в разумных пределах.")
+        return
+
+    # ФИКС: реализована заявленная в тексте логика +/- для относительного изменения баланса.
+    # Раньше в любом случае происходила полная перезапись (user.balance = val),
+    # что не соответствовало подсказке "+100 / -50".
+    user_res = await session.execute(select(User).where(User.id == uid).with_for_update())
+    user = user_res.scalar_one_or_none()
+    if not user:
+        await message.answer("❌ Пользователь не найден.")
+        await state.clear()
+        return
+
+    old_balance = user.balance
+
+    if is_relative:
+        new_balance = money_add(user.balance, val)
+        if new_balance < 0:
+            await message.answer(f"❌ Итоговый баланс не может быть отрицательным (получилось бы {new_balance:.2f} грн).")
+            return
+        user.balance = new_balance
+    else:
+        if val < 0:
+            await message.answer("❌ Баланс не может быть отрицательным.")
+            return
+        user.balance = money_round(val)
+
+    # НОВОЕ: логируем ручную корректировку баланса администратором
+    delta = money_round(user.balance - old_balance)
+    log_balance_change(session, user.id, delta, "admin_adjust", user.balance, related_id=message.from_user.id)
+
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        f"✅ Баланс пользователя `{uid}` успешно изменен. Новый баланс: `{user.balance:.2f} грн`.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- СОЗДАНИЕ ТАРИФОВ И УПРАВЛЕНИЕ СОФТОМ ---
+@router.callback_query(F.data == "admin_add_sw", F.from_user.id.in_(ADMIN_IDS))
+async def add_sw_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    await state.set_state(AdminStates.waiting_for_software_platform)
+    text_msg = "➕ **Добавление софта (Шаг 1/2)**\n\nВыберите платформу:"
+
+    # ИЗМЕНЕНО: список платформ берётся из БД динамически (а не хардкодится),
+    # чтобы новые разделы (например "Аккаунты • Taiwan") появлялись тут сами.
+    res = await session.execute(select(Platform))
+    platforms = res.scalars().all()
+    buttons = []
+    for p in platforms:
+        name_lower = p.name.lower()
+        if "android" in name_lower:
+            icon = "🤖"
+        elif "ios" in name_lower:
+            icon = "🍏"
+        elif "аккаунт" in name_lower:
+            icon = "🎮"
+        else:
+            icon = "📦"
+        buttons.append([InlineKeyboardButton(text=f"{icon} {p.name}", callback_data=f"sw_platform_{p.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("sw_platform_"), F.from_user.id.in_(ADMIN_IDS))
+async def add_sw_platform_chosen(callback: CallbackQuery, state: FSMContext):
+    platform_id = int(callback.data.split("_")[2])
+    await state.update_data(platform_id=platform_id)
+    await state.set_state(AdminStates.waiting_for_software_name)
+
+    text_msg = "➕ **Добавление софта (Шаг 2/2)**\n\nВведите название софта (например: `Flexnote`):"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_add_sw")]])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_software_name, F.from_user.id.in_(ADMIN_IDS))
+async def save_software(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❌ Введите название софта текстом.")
+        return
+
+    name = message.text.strip()
+    if len(name) > MAX_SOFTWARE_NAME_LENGTH:
+        await message.answer(
+            f"❌ Название слишком длинное ({len(name)} символов). Максимум — {MAX_SOFTWARE_NAME_LENGTH}. Введите другое:"
+        )
+        return
+
+    try:
+        data = await state.get_data()
+        platform_id = data.get("platform_id")
+
+        platform = await session.get(Platform, platform_id)
+        if not platform:
+            await message.answer(f"❌ Платформа ID `{platform_id}` не найдена в системе.")
+            await state.clear()
+            return
+
+        new_sw = Software(platform_id=platform_id, name=name)
+        session.add(new_sw)
+        await session.commit()
+        await state.clear()
+
+        await message.answer(
+            f"✅ Софт `{escape_md(name)}` успешно добавлен!\n🔑 ID софта: `{new_sw.id}`",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Ошибка сохранения софта: {e}")
+        await message.answer("⚠️ Не удалось сохранить софт.")
+
+# --- ФОТО / ОПИСАНИЕ СОФТА ---
+@router.callback_query(F.data == "admin_sw_media_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_sw_media_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
+    if not softwares:
+        await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
+        return
+
+    buttons = []
+    for sw in softwares:
+        mark = "🖼" if sw.photo_file_id else "🛡"
+        buttons.append([InlineKeyboardButton(text=f"{mark} {sw.name}", callback_data=f"sw_media_sel_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "🖼 **Фото/описание софта**\n\nВыберите софт:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("sw_media_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_sw_media_start(callback: CallbackQuery, state: FSMContext):
+    sw_id = int(callback.data.split("_")[3])
+    await state.update_data(software_id=sw_id)
+    await state.set_state(AdminStates.waiting_for_software_media)
+
+    text_msg = (
+        "🖼 **Фото/описание софта**\n\n"
+        "Отправьте фото (можно с подписью — подпись станет текстом-описанием, "
+        "который показывается над кнопками при выборе этого софта). "
+        "Фото будет отображаться НАД текстом, как вы просили.\n\n"
+        "Либо просто отправьте текст — тогда обновится только описание, без фото."
+    )
+    await callback.message.edit_text(text_msg, reply_markup=cancel_kb("admin_panel"), parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_software_media, F.from_user.id.in_(ADMIN_IDS), F.photo)
+async def admin_sw_media_save_photo(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    sw_id = data.get("software_id")
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await message.answer("❌ Софт не найден.")
+        await state.clear()
+        return
+
+    sw.photo_file_id = message.photo[-1].file_id
+    if message.caption:
+        sw.description = message.caption.strip()[:1024]
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Фото для `{escape_md(sw.name)}` сохранено" + (" вместе с описанием." if message.caption else "."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+@router.message(AdminStates.waiting_for_software_media, F.from_user.id.in_(ADMIN_IDS), F.text)
+async def admin_sw_media_save_text(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    sw_id = data.get("software_id")
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await message.answer("❌ Софт не найден.")
+        await state.clear()
+        return
+
+    sw.description = message.text.strip()[:1024]
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        f"✅ Описание для `{escape_md(sw.name)}` обновлено.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- ССЫЛКА НА ФАЙЛЫ (выдаётся покупателю вместе с ключом) ---
+@router.callback_query(F.data == "admin_sw_link_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_sw_link_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
+    if not softwares:
+        await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
+        return
+
+    buttons = []
+    for sw in softwares:
+        mark = "🔗" if sw.files_link else "🛡"
+        buttons.append([InlineKeyboardButton(text=f"{mark} {sw.name}", callback_data=f"sw_link_sel_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "🔗 **Ссылка на файлы для софта**\n\nВыберите софт:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("sw_link_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_sw_link_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    sw_id = int(callback.data.split("_")[3])
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    await state.update_data(software_id=sw_id)
+    await state.set_state(AdminStates.waiting_for_software_files_link)
+
+    current = f"\n\nТекущая ссылка: `{escape_md(sw.files_link)}`" if sw.files_link else ""
+    text_msg = (
+        f"🔗 **Ссылка на файлы для «{escape_md(sw.name)}»**{current}\n\n"
+        "Пришлите ссылку на файлы (например, на облако/архив/инструкцию) — "
+        "она будет автоматически добавляться в сообщение покупателю вместе "
+        "с выданным ключом.\n\n"
+        "Чтобы удалить ссылку — отправьте `-`."
+    )
+    await callback.message.edit_text(text_msg, reply_markup=cancel_kb("admin_panel"), parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_software_files_link, F.from_user.id.in_(ADMIN_IDS), F.text)
+async def admin_sw_link_save(message: Message, state: FSMContext, session: AsyncSession):
+    data = await state.get_data()
+    sw_id = data.get("software_id")
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await message.answer("❌ Софт не найден.")
+        await state.clear()
+        return
+
+    raw = message.text.strip()
+    if raw == "-":
+        sw.files_link = None
+        result_text = f"✅ Ссылка для `{escape_md(sw.name)}` удалена."
+    else:
+        if len(raw) > 500 or not raw.startswith(("https://", "http://")):
+            await message.answer("❌ Укажите ссылку, начинающуюся с https:// или http://, максимум 500 символов.")
+            return
+        sw.files_link = raw
+        result_text = f"✅ Ссылка для `{escape_md(sw.name)}` сохранена и теперь будет выдаваться вместе с ключом."
+
+    await session.commit()
+    await state.clear()
+
+    await message.answer(
+        result_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+# --- ПОПОЛНЕНИЕ АККАУНТОВ (быстрый доступ к загрузке ключей для раздела "Аккаунты") ---
+@router.callback_query(F.data == "admin_topup_accounts", F.from_user.id.in_(ADMIN_IDS))
+async def admin_topup_accounts_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(
+        select(Product, Software)
+        .join(Software, Product.software_id == Software.id)
+        .join(Platform, Software.platform_id == Platform.id)
+        .where(Platform.name.ilike("%аккаунт%"))
+    )
+    rows = res.all()
+    if not rows:
+        await callback.answer("❌ Пока нет ни одного раздела «Аккаунты» с тарифами.", show_alert=True)
+        return
+
+    buttons = []
+    for p, sw in rows:
+        keys_res = await session.execute(select(func.count(LicenseKey.id)).filter_by(product_id=p.id, is_sold=False))
+        available = keys_res.scalar() or 0
+        buttons.append([InlineKeyboardButton(
+            text=f"🔋 {sw.name} — {p.duration} ({p.price:.2f} грн) · в наличии: {available}",
+            callback_data=f"add_keys_prod_{p.id}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "🔋 **Пополнение аккаунтов**\n\nВыберите позицию — затем пришлите аккаунты списком "
+        "(каждый аккаунт с новой строки, например `login:password`):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_add_prod", F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_prod_select_sw(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
+    if not softwares:
+        await callback.answer("❌ Сначала добавьте хотя бы один софт!", show_alert=True)
+        return
+
+    buttons = []
+    for sw in softwares:
+        buttons.append([InlineKeyboardButton(text=f"🛡 {sw.name}", callback_data=f"prod_sw_sel_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "➕ **Создание тарифа (1/3)**\n\nВыберите софт, к которому привязать тариф:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("prod_sw_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_prod_duration(callback: CallbackQuery, state: FSMContext):
+    sw_id = int(callback.data.split("_")[3])
+    await state.update_data(software_id=sw_id)
+    await state.set_state(AdminStates.waiting_for_duration)
+
+    buttons = []
+    for d in DURATIONS:
+        buttons.append([InlineKeyboardButton(text=d, callback_data=f"prod_dur_sel_{d}")])
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="admin_panel")])
+
+    await callback.message.edit_text(
+        "➕ **Создание тарифа (2/3)**\n\nВыберите или введите длительность тарифа (например: `1 день`, `7 дней`, `30 дней` или `Навсегда`):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("prod_dur_sel_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_prod_duration_callback(callback: CallbackQuery, state: FSMContext):
+    duration = normalize_duration(callback.data.replace("prod_dur_sel_", ""))
+    await state.update_data(duration=duration)
+    await state.set_state(AdminStates.waiting_for_price)
+
+    await callback.message.edit_text(
+        f"➕ **Создание тарифа (3/3)**\nВыбран срок: `{duration}`\n\nВведите цену в гривнах (числом):",
+        reply_markup=cancel_kb("admin_panel"),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_duration, F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_prod_duration_text(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❌ Введите текстовое значение для срока.")
+        return
+    duration = normalize_duration(message.text)
+    if len(duration) > MAX_DURATION_LENGTH:
+        await message.answer(
+            f"❌ Слишком длинный текст ({len(duration)} символов). Максимум — {MAX_DURATION_LENGTH}. Введите другой:"
+        )
+        return
+    await state.update_data(duration=duration)
+    await state.set_state(AdminStates.waiting_for_price)
+    await message.answer("➕ **Создание тарифа (3/3)**\n\nВведите цену в гривнах (числом):", reply_markup=cancel_kb("admin_panel"))
+
+@router.message(AdminStates.waiting_for_price, F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_prod_finish(message: Message, state: FSMContext, session: AsyncSession):
+    price = parse_positive_amount(message.text)
+    if price is None:
+        await message.answer("❌ Введите корректное положительное число для цены.")
+        return
+
+    data = await state.get_data()
+    sw_id = data.get("software_id")
+    duration = normalize_duration(data.get("duration", ""))
+
+    existing = await session.execute(
+        select(Product).where(
+            Product.software_id == sw_id,
+            Product.duration == duration,
+        )
+    )
+    existing_product = existing.scalars().first()
+    if existing_product:
+        await state.clear()
+        await message.answer(
+            f"❌ У этого софта уже существует тариф `{escape_md(duration)}` "
+            f"с ценой `{existing_product.price:.2f} грн`.\n\n"
+            "Чтобы не создать два одинаковых тарифа, изменение существующей "
+            "цены нужно делать в базе/отдельной функции редактирования.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]
+            ),
+            parse_mode="Markdown",
+        )
+        return
+
+    product = Product(software_id=sw_id, duration=duration, price=price)
+    session.add(product)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        await state.clear()
+        await message.answer(
+            "⚠️ Не удалось создать тариф: конфликт данных. Попробуйте ещё раз.",
+            reply_markup=cancel_kb("admin_panel"),
+        )
+        return
+    await state.clear()
+
+    sw = await session.get(Software, sw_id)
+    sw_name = sw.name if sw else "Софт"
+
+    await message.answer(
+        f"✅ Тариф `{escape_md(sw_name)}` — `{escape_md(duration)}` по цене `{price:.2f} грн` успешно создан!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+
+# --- УДАЛЕНИЕ СОФТА И ТАРИФОВ ---
+@router.callback_query(F.data == "admin_del_sw_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_sw_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Software))
+    softwares = res.scalars().all()
+    if not softwares:
+        await callback.answer("❌ Нет доступного софта для удаления!", show_alert=True)
+        return
+
+    buttons = []
+    for sw in softwares:
+        buttons.append([InlineKeyboardButton(text=f"❌ {sw.name[:42]} [ID: {sw.id}]", callback_data=f"confirm_del_sw_{sw.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(
+        "🗑 **Удаление софта**\n\nВыберите софт для удаления (вместе с ним удалятся тарифы и ключи):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_sw_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_software(callback: CallbackQuery, session: AsyncSession):
+    sw_id = int(callback.data.split("_")[3])
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить окончательно", callback_data=f"do_del_sw_{sw_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_del_sw_select")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\nВы действительно хотите удалить софт `{escape_md(sw.name)}`?\n*Все связанные тарифы и ключи будут стерты безвозвратно!*",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_sw_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_software(callback: CallbackQuery, session: AsyncSession):
+    sw_id = int(callback.data.split("_")[3])
+    sw = await session.get(Software, sw_id)
+    if not sw:
+        await callback.answer("❌ Софт не найден!", show_alert=True)
+        return
+    
+    sw_name = sw.name
+    products_res = await session.execute(select(Product).where(Product.software_id == sw_id))
+    related_products = products_res.scalars().all()
+    # Не удаляем историю заказов и отзывы: отвязываем их от каталога,
+    # сохраняя снимок названия тарифа и выданный покупателю ключ.
+    for related_product in related_products:
+        historical_label = f"{sw_name} • {related_product.duration}"
+        await session.execute(
+            update(Purchase)
+            .where(Purchase.product_id == related_product.id)
+            .values(product_id=None)
+        )
+        await session.execute(
+            update(Review)
+            .where(Review.product_id == related_product.id)
+            .values(
+                product_id=None,
+                product_label=func.coalesce(Review.product_label, historical_label),
+            )
+        )
+    await session.delete(sw)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        logger.exception("Не удалось удалить software_id=%s из-за связанных данных", sw_id)
+        await callback.answer("❌ Не удалось удалить софт: связанные записи не были изменены.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"✅ Софт `{escape_md(sw_name)}` успешно удален.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_edit_price_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_select(callback: CallbackQuery, session: AsyncSession):
+    rows = await session.execute(
+        select(Product, Software.name).join(Software, Product.software_id == Software.id)
+        .order_by(Software.name.asc(), Product.duration.asc())
+    )
+    products = rows.all()
+    if not products:
+        await callback.answer("Сначала добавьте тарифы.", show_alert=True)
+        return
+    buttons = []
+    for product, sw_name in products[:80]:
+        title = f"{sw_name[:20]} · {product.duration[:12]} · {product.price:.0f} грн"
+        buttons.append([InlineKeyboardButton(text=f"✏️ {title}", callback_data=f"edit_price_prod_{product.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В товары и склад", callback_data="admin_catalog")])
+    await callback.message.edit_text("✏️ **Изменение цены тарифа**\n\nВыберите тариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("edit_price_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    try:
+        product_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный тариф.", show_alert=True)
+        return
+    product = await session.get(Product, product_id)
+    if not product:
+        await callback.answer("Тариф не найден.", show_alert=True)
+        return
+    software = await session.get(Software, product.software_id)
+    await state.update_data(edit_price_product_id=product_id)
+    await state.set_state(AdminStates.waiting_for_product_price)
+    await callback.message.answer(
+        f"✏️ **Новая цена**\n\nТовар: `{escape_md(software.name if software else 'Товар')}`\n"
+        f"Срок: `{escape_md(product.duration)}`\nТекущая цена: `{product.price:.2f} грн`\n\n"
+        "Отправьте новую цену числом, например `99` или `99.50`.",
+        reply_markup=cancel_kb("admin_catalog"), parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_product_price, F.from_user.id.in_(ADMIN_IDS))
+async def admin_edit_price_finish(message: Message, state: FSMContext, session: AsyncSession):
+    price = parse_positive_amount(message.text or "", max_amount=MAX_AMOUNT)
+    if price is None:
+        await message.answer("❌ Введите цену от 0.01 до 1 000 000 грн.")
+        return
+    data = await state.get_data()
+    product_id = data.get("edit_price_product_id")
+    if not isinstance(product_id, int):
+        await state.clear()
+        await message.answer("Сессия изменения цены устарела. Начните заново.", reply_markup=admin_back_kb("admin_catalog"))
+        return
+    product_res = await session.execute(select(Product).where(Product.id == product_id).with_for_update())
+    product = product_res.scalar_one_or_none()
+    if not product:
+        await state.clear()
+        await message.answer("Тариф уже удалён.", reply_markup=admin_back_kb("admin_catalog"))
+        return
+    old_price = float(product.price)
+    product.price = price
+    await session.commit()
+    await state.clear()
+    software = await session.get(Software, product.software_id)
+    await message.answer(
+        f"✅ **Цена обновлена**\n\n{escape_md(software.name if software else 'Товар')} · {escape_md(product.duration)}\n"
+        f"Было: `{old_price:.2f} грн`\nСтало: `{price:.2f} грн`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить ещё", callback_data="admin_edit_price_select")],
+            [InlineKeyboardButton(text="📦 Товары и склад", callback_data="admin_catalog")],
+        ]), parse_mode="Markdown"
+    )
+
+
+@router.callback_query(F.data == "admin_del_prod_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_prod_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Product))
+    products = res.scalars().all()
+    if not products:
+        await callback.answer("❌ Нет доступных тарифов для удаления!", show_alert=True)
+        return
+
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"❌ {sw_name[:22]} · {p.duration[:14]} · {p.price:.2f} грн", callback_data=f"confirm_del_prod_{p.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(
+        "🗑 **Удаление тарифа**\n\nВыберите тариф для удаления:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_delete_product(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    sw = await session.get(Software, prod.software_id)
+    sw_name = sw.name if sw else "Софт"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить тариф", callback_data=f"do_del_prod_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_del_prod_select")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ **Подтверждение удаления**\n\nУдалить тариф `{escape_md(sw_name)}` — `{escape_md(prod.duration)}` (`{prod.price:.2f} грн`)?",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("do_del_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_delete_product(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    sw = await session.get(Software, prod.software_id)
+    historical_label = f"{sw.name if sw else 'Товар'} • {prod.duration}"
+    # Покупки не удаляем: ключ и сумма остаются в истории. Снимаем только
+    # FK на товар, чтобы Postgres не блокировал удаление тарифа.
+    await session.execute(
+        update(Purchase).where(Purchase.product_id == prod_id).values(product_id=None)
+    )
+    await session.execute(
+        update(Review)
+        .where(Review.product_id == prod_id)
+        .values(
+            product_id=None,
+            product_label=func.coalesce(Review.product_label, historical_label),
+        )
+    )
+    await session.delete(prod)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        logger.exception("Не удалось удалить product_id=%s", prod_id)
+        await callback.answer("❌ Не удалось удалить тариф: операция отменена.", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "✅ Тариф удалён. История покупок, выданные ключи и отзывы сохранены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]]),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_del_keys_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_del_keys_select(callback: CallbackQuery, session: AsyncSession):
+    products_res = await session.execute(select(Product))
+    products = products_res.scalars().all()
+
+    if not products:
+        await callback.answer("❌ Нет доступных тарифов!", show_alert=True)
+        return
+
+    text_msg = "🗑 **Очистка ключей**\n\nВыберите тариф для управления ключами:"
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"🧹 {sw_name} ({p.duration})", callback_data=f"clear_keys_prod_{p.id}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+    await callback.message.edit_text(text_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("clear_keys_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def clear_keys_menu(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    product = await session.get(Product, prod_id)
+    if not product:
+        await callback.answer("❌ Тариф не найден!", show_alert=True)
+        return
+
+    software = await session.get(Software, product.software_id)
+    sw_name = software.name if software else "Софт"
+
+    unsold_res = await session.execute(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
+    unsold_count = unsold_res.scalar() or 0
+
+    sold_res = await session.execute(select(func.count(LicenseKey.id)).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == True))
+    sold_count = sold_res.scalar() or 0
+
+    text_msg = (
+        f"🗑 **Управление ключами тарифа**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Софт: `{escape_md(sw_name)}`\n"
+        f"⏳ Срок: `{escape_md(product.duration)}`\n\n"
+        f"🟢 Непроданных ключей: `{unsold_count}`\n"
+        f"🔴 Проданных ключей: `{sold_count}`\n"
+        f"━━━━━━━━━━━━━━━━━━━"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 Удалить непроданные ({unsold_count})", callback_data=f"confirm_del_unsold_{prod_id}")],
+        [InlineKeyboardButton(text=f"🔥 Удалить абсолютно ВСЕ ключи", callback_data=f"confirm_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="🔙 К списку тарифов", callback_data="admin_del_keys_select")],
+        [InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]
+    ])
+    await callback.message.edit_text(text_msg, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_del_unsold(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[3])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить непроданные", callback_data=f"do_del_unsold_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
+    ])
+    await callback.message.edit_text("⚠️ Вы уверены, что хотите удалить ВСЕ непроданные ключи этого тарифа?", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("do_del_unsold_"), F.from_user.id.in_(ADMIN_IDS))
+async def do_del_unsold(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[3])
+    await session.execute(delete(LicenseKey).where(LicenseKey.product_id == prod_id, LicenseKey.is_sold == False))
+    await session.commit()
+    await callback.message.edit_text(
+        "✅ Непроданные ключи успешно удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
+    )
+
+@router.callback_query(F.data.startswith("confirm_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
+async def confirm_del_all_keys(callback: CallbackQuery):
+    prod_id = int(callback.data.split("_")[4])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Да, удалить абсолютно ВСЕ ключи", callback_data=f"do_del_all_keys_{prod_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"clear_keys_prod_{prod_id}")]
+    ])
+    await callback.message.edit_text("⚠️ Вы уверены? Это удалит и проданные, и непроданные ключи этого тарифа!", reply_markup=keyboard)
+
+@router.callback_query(F.data.startswith("do_del_all_keys_"), F.from_user.id.in_(ADMIN_IDS))
+async def do_del_all_keys(callback: CallbackQuery, session: AsyncSession):
+    prod_id = int(callback.data.split("_")[4])
+    await session.execute(delete(LicenseKey).where(LicenseKey.product_id == prod_id))
+    await session.commit()
+    await callback.message.edit_text(
+        "🔥 Все ключи тарифа успешно удалены.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")]])
+    )
+
+# --- ЗАГРУЗКА КЛЮЧЕЙ ---
+@router.callback_query(F.data == "admin_add_keys_select", F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_keys_select(callback: CallbackQuery, session: AsyncSession):
+    res = await session.execute(select(Product))
+    products = res.scalars().all()
+    if not products:
+        await callback.answer("❌ Сначала создайте хотя бы один тариф!", show_alert=True)
+        return
+
+    buttons = []
+    for p in products:
+        sw = await session.get(Software, p.software_id)
+        sw_name = sw.name if sw else "Софт"
+        buttons.append([InlineKeyboardButton(text=f"🔑 {sw_name[:28]} ({p.duration[:18]})", callback_data=f"add_keys_prod_{p.id}")])
+    buttons.append([InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel")])
+
+    await callback.message.edit_text("📥 **Загрузка ключей**\n\nВыберите тариф:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("add_keys_prod_"), F.from_user.id.in_(ADMIN_IDS))
+async def admin_add_keys_start(callback: CallbackQuery, state: FSMContext):
+    prod_id = int(callback.data.split("_")[3])
+    await state.update_data(product_id=prod_id)
+    await state.set_state(AdminStates.waiting_for_keys)
+    await callback.message.edit_text("📥 **Загрузка ключей**\n\nОтправьте ключи списком (каждый ключ с новой строки):", reply_markup=cancel_kb("admin_panel"), parse_mode="Markdown")
+    await callback.answer()
+
+@router.message(AdminStates.waiting_for_keys, F.from_user.id.in_(ADMIN_IDS))
+async def process_keys_upload(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    # Администратор может вставить список в чат или отправить .txt/.csv.
+    # Ограничиваем размер до скачивания, чтобы не расходовать память сервера.
+    upload_text = message.text or ""
+    if message.document:
+        document = message.document
+        filename = (document.file_name or "").lower()
+        mime_type = (document.mime_type or "").lower()
+        allowed_extension = filename.endswith((".txt", ".csv", ".log"))
+        allowed_mime = mime_type in {"text/plain", "text/csv", "application/csv", "application/vnd.ms-excel"}
+        if not (allowed_extension or allowed_mime):
+            await message.answer("❌ Пришлите файл .txt или .csv со списком ключей.")
+            return
+        if document.file_size is not None and document.file_size > 1_000_000:
+            await message.answer("❌ Файл слишком большой. Максимальный размер списка — 1 МБ.")
+            return
+        try:
+            downloaded = await bot.download(document.file_id)
+            if downloaded is None:
+                raise RuntimeError("Telegram не вернул содержимое файла")
+            if isinstance(downloaded, (bytes, bytearray)):
+                file_bytes = bytes(downloaded)
+            elif hasattr(downloaded, "getvalue"):
+                file_bytes = downloaded.getvalue()
+            else:
+                file_bytes = downloaded.read()
+            if len(file_bytes) > 1_000_000:
+                await message.answer("❌ Файл слишком большой. Максимальный размер списка — 1 МБ.")
+                return
+            try:
+                upload_text = file_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                try:
+                    upload_text = file_bytes.decode("utf-16")
+                except UnicodeDecodeError:
+                    upload_text = file_bytes.decode("cp1251")
+        except Exception:
+            logger.exception("Не удалось скачать файл ключей от admin_id=%s", message.from_user.id)
+            await message.answer("❌ Не удалось прочитать файл. Сохраните его как UTF-8 .txt или .csv и повторите.")
+            return
+
+    if not upload_text.strip():
+        await message.answer("❌ Отправьте ключи текстом или файлом .txt/.csv, каждый ключ с новой строки.")
+        return
+
+    data = await state.get_data()
+    prod_id = data.get("product_id")
+
+    if not isinstance(prod_id, int):
+        await state.clear()
+        await message.answer(
+            "❌ Сессия загрузки ключей потеряна. Откройте админ-панель и начните загрузку заново.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")]]
+            ),
+        )
+        return
+
+    prod = await session.get(Product, prod_id)
+    if not prod:
+        await state.clear()
+        await message.answer(
+            "❌ Выбранный тариф больше не существует.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")]]
+            ),
+        )
+        return
+
+    # Можно вставлять ключи построчно, через запятую/точку с запятой или
+    # одним рядом через пробел. Для одного ряда пробелы считаем разделителем,
+    # когда каждый элемент похож на отдельный ключ.
+    raw_keys = []
+    normalized_text = upload_text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    lines = [line.strip() for line in normalized_text.split("\n") if line.strip()]
+    if len(lines) == 1:
+        line = lines[0].replace(",", " ").replace(";", " ")
+        tokens = [part.strip() for part in line.split() if part.strip()]
+        if len(tokens) > 1 and all(len(token) >= 8 for token in tokens):
+            raw_keys = tokens
+        else:
+            raw_keys = [lines[0]]
+    else:
+        for line in lines:
+            raw_keys.extend(part.strip() for part in line.replace(",", "\n").replace(";", "\n").split("\n") if part.strip())
+
+    if not raw_keys:
+        await message.answer("❌ Не найдено ни одного непустого ключа. Пришлите ключи построчно.")
+        return
+
+    if len(raw_keys) > MAX_KEYS_PER_UPLOAD:
+        await message.answer(
+            f"❌ За одну загрузку можно добавить максимум {MAX_KEYS_PER_UPLOAD} ключей.\n"
+            f"Сейчас получено: {len(raw_keys)}.\n\n"
+            "Разделите список на несколько сообщений."
+        )
+        return
+
+    # Убираем дубликаты внутри самого сообщения, сохраняя порядок.
+    seen = set()
+    keys = []
+    for key in raw_keys:
+        if key not in seen:
+            seen.add(key)
+            keys.append(key)
+
+    # Не принимаем слишком длинные ключи, чтобы гарантированно попасть в VARCHAR(255).
+    too_long = [key for key in keys if len(key) > 255]
+    if too_long:
+        await message.answer(
+            f"❌ Найдено {len(too_long)} ключ(ей) длиннее 255 символов.\n"
+            "Сократите их и отправьте список заново. База не изменена."
+        )
+        return
+
+    existing_res = await session.execute(
+        select(LicenseKey.key_string).where(LicenseKey.key_string.in_(keys))
+    )
+    dup_in_db = set(existing_res.scalars().all())
+
+    new_keys = [key for key in keys if key not in dup_in_db]
+    skipped_count = len(raw_keys) - len(new_keys)
+
+    added_count = 0
+    if new_keys:
+        session.add_all(
+            [LicenseKey(product_id=prod_id, key_string=key) for key in new_keys]
+        )
+        try:
+            await session.commit()
+            added_count = len(new_keys)
+        except IntegrityError:
+            await session.rollback()
+            await message.answer(
+                "⚠️ Не удалось сохранить ключи из-за конфликта данных.\n"
+                "Ничего из этой загрузки не добавлено. Проверьте список и повторите."
+            )
+            return
+
+    # Критически важно: после успешной обработки сбрасываем FSM,
+    # иначе следующее сообщение админа снова попадёт сюда как «ключ».
+    await state.clear()
+
+    result_text = (
+        f"✅ **Загрузка завершена**\n"
+        f"📦 Тариф: `{escape_md(prod.duration)}`\n"
+        f"➕ Добавлено: `{added_count}`\n"
+    )
+    if skipped_count > 0:
+        result_text += f"♻️ Пропущено дубликатов: `{skipped_count}`\n"
+
+    # Даём администратору точную сводку по остатку.
+    available_now = await session.scalar(
+        select(func.count(LicenseKey.id)).where(
+            LicenseKey.product_id == prod_id,
+            LicenseKey.is_sold == False,
+        )
+    ) or 0
+    result_text += f"📊 Сейчас в наличии: `{available_now}`"
+
+    if added_count > 0:
+        subs_res = await session.execute(
+            select(RestockSubscription).where(RestockSubscription.product_id == prod_id)
+        )
+        subs = subs_res.scalars().all()
+        sw = await session.get(Software, prod.software_id)
+        sw_name = sw.name if sw else "Товар"
+
+        for sub in subs:
+            try:
+                await bot.send_message(
+                    sub.user_id,
+                    f"🔔 **Пополнение товара!**\n\n"
+                    f"Товар **{escape_md(sw_name)}** ({escape_md(prod.duration)}) снова в наличии!",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                logger.info(f"Не удалось уведомить пользователя {sub.user_id} о пополнении.")
+            await session.delete(sub)
+        await session.commit()
+
+    await message.answer(
+        result_text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="📦 Склад", callback_data="admin_stock"),
+                InlineKeyboardButton(text="🔙 В админку", callback_data="admin_panel"),
+            ]]
+        ),
+        parse_mode="Markdown",
+    )
+
+
+# ==========================================
+# ЗАГЛУШКА ДЛЯ "ПОТЕРЯННЫХ" СООБЩЕНИЙ
+# ==========================================
+# НОВОЕ: если сообщение пришло вне активного FSM-состояния (например, состояние
+# уже слетело — MemoryStorage не переживает перезапуск процесса на Render Free,
+# либо админ ввёл значение до того, как нажал нужную кнопку), раньше бот
+# просто молчал, что выглядело как "бот игнорит". Теперь явно отвечаем и
+# подсказываем, что делать — это ловит ЛЮБОЙ текст без активного состояния,
+# поэтому регистрируется самым последним.
+@router.message(F.text, F.from_user.id.in_(ADMIN_IDS))
+async def fallback_admin_message(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is not None:
+        return  # сюда не должны попадать активные состояния — но на всякий случай не мешаем им
+    await message.answer(
+        "⚠️ Не понял это сообщение — активное действие не найдено "
+        "(возможно, сессия сбросилась из-за перезапуска бота).\n\n"
+        "Откройте панель администратора и начните действие заново:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🛠 Панель администратора", callback_data="admin_panel")]])
+    )
+
+@router.message(F.text)
+async def fallback_user_message(message: Message, state: FSMContext, session: AsyncSession):
+    current_state = await state.get_state()
+    if current_state is not None:
+        return
+    user = await session.get(User, message.from_user.id)
+    lang = user.language if user and user.language in LANGUAGES else "uk"
+    balance = user.balance if user else 0.0
+    await message.answer(
+        get_main_menu_text(balance, lang),
+        reply_markup=get_main_menu_kb(message.from_user.id, lang),
+        parse_mode="Markdown"
+    )
+
+# ==========================================
+# HTTP-ЗАГЛУШКА ДЛЯ RENDER FREE
+# ==========================================
+# Render Free Web Service "усыпляет" сервис и считает деплой неуспешным,
+# если процесс не слушает $PORT и не отвечает на HTTP. Бот работает через
+# long polling и сам по себе порт не открывает, поэтому поднимаем рядом
+# лёгкий aiohttp-сервер с простой HTML-страницей и /health для healthcheck.
+RENDER_STUB_HTML = (
+    "<!DOCTYPE html>"
+    "<html lang='ru'><head><meta charset='utf-8'>"
+    "<title>Kranin Shop Bot</title>"
+    "<style>"
+    "body{font-family:sans-serif;background:#0f172a;color:#e2e8f0;"
+    "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}"
+    "h1{font-size:1.4rem;font-weight:500;}"
+    "</style></head>"
+    "<body><h1>🤖 Kranin Shop Bot работает</h1></body></html>"
+)
+
+
+async def health_check(request: web.Request) -> web.Response:
+    try:
+        async with async_session_maker() as session:
+            await session.execute(text("SELECT 1"))
+        return web.json_response({"status": "ok", "database": "ok"})
+    except Exception as exc:
+        logger.warning("Healthcheck: database unavailable: %s", exc)
+        return web.json_response({"status": "degraded", "database": "error"}, status=503)
+
+
+async def index_page(request: web.Request) -> web.Response:
+    return web.Response(text=RENDER_STUB_HTML, content_type="text/html")
+
+
+async def run_stub_server():
+    # Лёгкий HTTP-сервер только для того, чтобы Render Free видел открытый
+    # порт и не считал сервис "упавшим". Никакой бизнес-логики здесь нет.
+    app = web.Application()
+    app.router.add_get("/", index_page)
+    app.router.add_get("/health", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info(f"HTTP-заглушка запущена на порту {PORT}")
+    return runner
+
+
+ACCOUNTS_PLATFORM_NAME = "Аккаунты • Taiwan"
+ACCOUNTS_SOFTWARE_NAME = "Аккаунты • Taiwan"
+ACCOUNTS_PRODUCT_DURATION = "1 аккаунт"
+ACCOUNTS_PRODUCT_PRICE = 60.0
+ACCOUNTS_DESCRIPTION = (
+    "Персональный аккаунт PUBG MOBILE Taiwan: 12-й уровень Metro и 12-й "
+    "уровень Classic. На аккаунте не будет других пользователей. "
+    "Версия Taiwan лучше всего подходит для игры с "
+    "нашими продуктами: условия использования заметно безопаснее, чем в "
+    "других версиях."
+    "‼️ВХОД ЧЕРЕЗ FACEBOOK‼️"
+)
+
+
+async def seed_platforms(session_pool) -> None:
+    # Гарантируем, что платформы Android (id=1) и iOS (id=2) существуют,
+    # так как на них жёстко завязаны callback_data "sw_platform_1"/"sw_platform_2"
+    # в разделе добавления софта администратором.
+    async with session_pool() as session:
+        existing_res = await session.execute(select(Platform.name))
+        existing_names = set(existing_res.scalars().all())
+
+        to_add = []
+        if "Android" not in existing_names:
+            to_add.append(Platform(name="Android"))
+        if "iOS" not in existing_names:
+            to_add.append(Platform(name="iOS"))
+        if ACCOUNTS_PLATFORM_NAME not in existing_names:
+            to_add.append(Platform(name=ACCOUNTS_PLATFORM_NAME))
+
+        if to_add:
+            session.add_all(to_add)
+            await session.commit()
+            logger.info(f"Добавлены базовые платформы: {[p.name for p in to_add]}")
+
+        # НОВОЕ: раздел каталога "Аккаунты • Taiwan" -> софт "PUBG MOBILE" ->
+        # тариф "1 аккаунт" по 60 грн, с описанием как в референсном скриншоте.
+        accounts_platform_res = await session.execute(
+            select(Platform).filter_by(name=ACCOUNTS_PLATFORM_NAME)
+        )
+        accounts_platform = accounts_platform_res.scalar_one_or_none()
+        if accounts_platform:
+            sw_res = await session.execute(
+                select(Software).filter_by(platform_id=accounts_platform.id, name=ACCOUNTS_SOFTWARE_NAME)
+            )
+            sw = sw_res.scalar_one_or_none()
+            if not sw:
+                sw = Software(
+                    platform_id=accounts_platform.id,
+                    name=ACCOUNTS_SOFTWARE_NAME,
+                    description=ACCOUNTS_DESCRIPTION,
+                )
+                session.add(sw)
+                await session.commit()
+                logger.info(f"Добавлен софт '{ACCOUNTS_SOFTWARE_NAME}' в раздел '{ACCOUNTS_PLATFORM_NAME}'.")
+
+            prod_res = await session.execute(
+                select(Product).filter_by(software_id=sw.id, duration=ACCOUNTS_PRODUCT_DURATION)
+            )
+            prod = prod_res.scalar_one_or_none()
+            if not prod:
+                session.add(Product(
+                    software_id=sw.id,
+                    duration=ACCOUNTS_PRODUCT_DURATION,
+                    price=ACCOUNTS_PRODUCT_PRICE,
+                ))
+                await session.commit()
+                logger.info(f"Добавлен тариф '{ACCOUNTS_PRODUCT_DURATION}' ({ACCOUNTS_PRODUCT_PRICE} грн) для '{ACCOUNTS_SOFTWARE_NAME}'.")
+
+
+async def run_migrations() -> None:
+    # НОВОЕ: ручные миграции для изменений схемы в уже существующих таблицах.
+    # Base.metadata.create_all создаёт только отсутствующие таблицы и никогда
+    # не делает ALTER TABLE для уже существующих — поэтому изменения типов
+    # колонок нужно применять здесь вручную. Выполняется при каждом старте,
+    # но идемпотентно: если колонка уже нужного типа, Postgres не ошибается.
+    if DATABASE_URL.startswith("sqlite"):
+        # SQLite не поддерживает ADD COLUMN IF NOT EXISTS. Обновляем все
+        # колонки, добавленные после первоначальной версии, не трогая данные.
+        sqlite_columns = {
+            "softwares": {
+                "photo_file_id": "VARCHAR(255)",
+                "description": "VARCHAR(1024)",
+                "files_link": "VARCHAR(500)",
+            },
+            "purchases": {
+                "product_id": "INTEGER REFERENCES products(id)",
+                "price_paid": "FLOAT NOT NULL DEFAULT 0",
+                "order_token": "VARCHAR(64)",
+            },
+            "deposit_requests": {
+                "payment_card": "VARCHAR(100)",
+                "receipt_file_id": "VARCHAR(255)",
+                "receipt_type": "VARCHAR(20)",
+                "purchase_product_id": "INTEGER",
+            },
+            "reviews": {
+                "product_id": "INTEGER REFERENCES products(id)",
+                "purchase_id": "INTEGER REFERENCES purchases(id)",
+                "product_label": "VARCHAR(150)",
+                "status": "VARCHAR(20) NOT NULL DEFAULT 'pending'",
+            },
+            "wheel_spins": {
+                "review_id": "INTEGER REFERENCES reviews(id)",
+            },
+        }
+        legacy_reviews_need_approval = False
+        try:
+            async with engine.begin() as conn:
+                for table_name, columns in sqlite_columns.items():
+                    table_check = await conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,)
+                    )
+                    if not table_check.first():
+                        continue
+                    current = await conn.exec_driver_sql(f"PRAGMA table_info({table_name})")
+                    present = {row[1] for row in current.fetchall()}
+                    for column_name, column_type in columns.items():
+                        if column_name not in present:
+                            await conn.exec_driver_sql(
+                                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+                            )
+                            if table_name == "reviews" and column_name == "status":
+                                legacy_reviews_need_approval = True
+                            logger.info("SQLite migration: %s.%s добавлен", table_name, column_name)
+                if legacy_reviews_need_approval:
+                    await conn.exec_driver_sql("UPDATE reviews SET status='approved'")
+                # Удаляем старые дубли подписок перед созданием уникального индекса.
+                await conn.exec_driver_sql(
+                    "DELETE FROM restock_subscriptions WHERE id NOT IN "
+                    "(SELECT MIN(id) FROM restock_subscriptions GROUP BY user_id, product_id)"
+                )
+                await conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_restock_user_product "
+                    "ON restock_subscriptions(user_id, product_id)"
+                )
+                await conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS wheel_spins_review_id_uniq "
+                    "ON wheel_spins(review_id) WHERE review_id IS NOT NULL"
+                )
+                await conn.exec_driver_sql(
+                    "UPDATE reviews SET product_id=NULL WHERE product_id IS NOT NULL AND id NOT IN "
+                    "(SELECT MIN(id) FROM reviews WHERE product_id IS NOT NULL GROUP BY user_id, product_id)"
+                )
+                await conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS reviews_user_product_uniq "
+                    "ON reviews(user_id, product_id) WHERE product_id IS NOT NULL"
+                )
+                await conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS purchases_order_token_uniq "
+                    "ON purchases(order_token) WHERE order_token IS NOT NULL"
+                )
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_softwares_platform_name ON softwares(platform_id, name)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_products_software_duration ON products(software_id, duration)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_license_keys_product_sold ON license_keys(product_id, is_sold)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_purchases_user_date_v2 ON purchases(user_id, purchased_at)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_deposit_user_status ON deposit_requests(user_id, status)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_withdrawal_user_status ON withdrawal_requests(user_id, status)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_balance_logs_user_date_v2 ON balance_logs(user_id, created_at)")
+                await conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_reviews_user_date ON reviews(user_id, created_at)")
+            # В старой SQLite-БД purchase_id в wheel_spins был NOT NULL. Для
+            # спина за отзыв это поле должно допускать NULL, поэтому безопасно
+            # перестраиваем только эту таблицу, сохраняя все существующие спины.
+            async with engine.connect() as conn:
+                info = await conn.exec_driver_sql("PRAGMA table_info(wheel_spins)")
+                wheel_cols = {row[1]: row for row in info.fetchall()}
+                purchase_col = wheel_cols.get("purchase_id")
+                if purchase_col and int(purchase_col[3]) == 1:
+                    await conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+                    await conn.commit()
+                    async with conn.begin():
+                        await conn.exec_driver_sql("DROP TABLE IF EXISTS wheel_spins__new")
+                        await conn.exec_driver_sql(
+                            "CREATE TABLE wheel_spins__new ("
+                            "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                            "purchase_id INTEGER NULL, review_id INTEGER NULL, "
+                            "user_id BIGINT NOT NULL, result VARCHAR(20) NOT NULL, "
+                            "created_at DATETIME NOT NULL, "
+                            "FOREIGN KEY(purchase_id) REFERENCES purchases(id), "
+                            "FOREIGN KEY(review_id) REFERENCES reviews(id), "
+                            "FOREIGN KEY(user_id) REFERENCES users(id))"
+                        )
+                        review_expr = "review_id" if "review_id" in wheel_cols else "NULL"
+                        await conn.exec_driver_sql(
+                            "INSERT INTO wheel_spins__new (id, purchase_id, review_id, user_id, result, created_at) "
+                            f"SELECT id, purchase_id, {review_expr}, user_id, result, created_at FROM wheel_spins"
+                        )
+                        await conn.exec_driver_sql("DROP TABLE wheel_spins")
+                        await conn.exec_driver_sql("ALTER TABLE wheel_spins__new RENAME TO wheel_spins")
+                        await conn.exec_driver_sql(
+                            "CREATE UNIQUE INDEX wheel_spins_purchase_id_uniq "
+                            "ON wheel_spins(purchase_id) WHERE purchase_id IS NOT NULL"
+                        )
+                        await conn.exec_driver_sql(
+                            "CREATE UNIQUE INDEX wheel_spins_review_id_uniq "
+                            "ON wheel_spins(review_id) WHERE review_id IS NOT NULL"
+                        )
+                    await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+                    await conn.commit()
+            try:
+                async with async_session_maker() as session:
+                    products_res = await session.execute(
+                        select(Product.id, Product.price, Product.duration, Software.name)
+                        .join(Software, Product.software_id == Software.id)
+                    )
+                    product_map = {
+                        (name, duration): (pid, float(price))
+                        for pid, price, duration, name in products_res.all()
+                    }
+                    purchases_res = await session.execute(select(Purchase).where(Purchase.product_id.is_(None)))
+                    for purchase in purchases_res.scalars().all():
+                        for (name, duration), (product_id, price) in product_map.items():
+                            if purchase.product_name == f"{name} ({duration})" and purchase.duration == duration:
+                                purchase.product_id = product_id
+                                purchase.price_paid = price
+                                break
+                    labels_res = await session.execute(
+                        select(Review, Software.name, Product.duration)
+                        .join(Product, Review.product_id == Product.id)
+                        .join(Software, Product.software_id == Software.id)
+                        .where(Review.product_label.is_(None))
+                    )
+                    for review, sw_name, duration in labels_res.all():
+                        review.product_label = f"{sw_name} • {duration}"[:150]
+                    await session.commit()
+            except Exception as e:
+                logger.warning("SQLite backfill истории не выполнен: %s", e)
+        except Exception as e:
+            logger.exception("SQLite migrations failed: %s", e)
+            raise
+        return
+    if not DATABASE_URL.startswith("postgresql"):
+        return
+    try:
+        async with engine.begin() as conn:
+            # related_id раньше был INTEGER (int32) — падал с DataError
+            # "value out of int32 range" при записи туда Telegram user_id
+            # (например, в реферальных бонусах и ручной корректировке баланса).
+            await conn.execute(text("ALTER TABLE balance_logs ALTER COLUMN related_id TYPE BIGINT"))
+        logger.info("Миграция: balance_logs.related_id приведён к BIGINT.")
+    except Exception as e:
+        logger.warning(f"Миграция related_id -> BIGINT не выполнена (возможно, таблицы ещё нет): {e}")
+
+    try:
+        async with engine.begin() as conn:
+            # НОВОЕ: фото и описание софта (для раздела "Аккаунты" и фото у Flexnote и т.д.)
+            await conn.execute(text("ALTER TABLE softwares ADD COLUMN IF NOT EXISTS photo_file_id VARCHAR(255)"))
+            await conn.execute(text("ALTER TABLE softwares ADD COLUMN IF NOT EXISTS description VARCHAR(1024)"))
+            await conn.execute(text("ALTER TABLE softwares ADD COLUMN IF NOT EXISTS files_link VARCHAR(500)"))
+        logger.info("Миграция: softwares.photo_file_id / description / files_link добавлены.")
+    except Exception as e:
+        logger.warning(f"Миграция softwares photo/description/files_link не выполнена: {e}")
+
+    # НОВОЕ: синхронизация sequence автоинкремента с реальными данными в
+    # таблицах, куда пишет seed_platforms(). На проде sequence "platforms_id_seq"
+    # оказался рассинхронизирован с данными (стоял на 1, хотя строка с id=1 уже
+    # существовала) — вероятно, из-за ручных INSERT с явным id в прошлом. Из-за
+    # этого INSERT новой платформы падал с UniqueViolationError на platforms_pkey.
+    # setval выставляет sequence на MAX(id), поэтому следующий nextval() всегда
+    # выдаст свободный id, вне зависимости от того, как разъехался счётчик.
+    try:
+        async with engine.begin() as conn:
+            # НОВОЕ: спин колеса фортуны теперь может быть привязан к отзыву,
+            # а не только к покупке — purchase_id стал необязательным,
+            # добавлена колонка review_id с уникальностью (один спин на отзыв).
+            await conn.execute(text("ALTER TABLE wheel_spins ALTER COLUMN purchase_id DROP NOT NULL"))
+            await conn.execute(text("ALTER TABLE wheel_spins ADD COLUMN IF NOT EXISTS review_id INTEGER REFERENCES reviews(id)"))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS wheel_spins_review_id_uniq ON wheel_spins(review_id) WHERE review_id IS NOT NULL"
+            ))
+        logger.info("Миграция: wheel_spins.review_id добавлен, purchase_id стал nullable.")
+    except Exception as e:
+        logger.warning(f"Миграция wheel_spins.review_id не выполнена: {e}")
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"))
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS price_paid DOUBLE PRECISION NOT NULL DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS order_token VARCHAR(64)"))
+            await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS purchases_order_token_uniq ON purchases(order_token) WHERE order_token IS NOT NULL"))
+            await conn.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS product_id INTEGER REFERENCES products(id)"))
+            await conn.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS purchase_id INTEGER REFERENCES purchases(id)"))
+            await conn.execute(text(
+                "UPDATE reviews r SET product_id = NULL WHERE product_id IS NOT NULL AND id NOT IN "
+                "(SELECT MIN(id) FROM reviews WHERE product_id IS NOT NULL GROUP BY user_id, product_id)"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS reviews_user_product_uniq "
+                "ON reviews(user_id, product_id) WHERE product_id IS NOT NULL"
+            ))
+        logger.info("Миграция: product_id/price_paid и review links добавлены.")
+    except Exception as e:
+        logger.warning(f"Миграция purchase/review metadata не выполнена: {e}")
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "DELETE FROM restock_subscriptions a USING restock_subscriptions b "
+                "WHERE a.id > b.id AND a.user_id = b.user_id AND a.product_id = b.product_id"
+            ))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_restock_user_product "
+                "ON restock_subscriptions(user_id, product_id)"
+            ))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_purchases_user_date ON purchases(user_id, purchased_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_balance_logs_user_date ON balance_logs(user_id, created_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_reviews_status_date ON reviews(status, created_at DESC)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_softwares_platform_name ON softwares(platform_id, name)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_products_software_duration ON products(software_id, duration)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_license_keys_product_sold ON license_keys(product_id, is_sold)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_deposit_user_status ON deposit_requests(user_id, status)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_withdrawal_user_status ON withdrawal_requests(user_id, status)"))
+            await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_reviews_user_date ON reviews(user_id, created_at DESC)"))
+        logger.info("Миграция: индексы истории и уникальность подписок на пополнение созданы.")
+    except Exception as e:
+        logger.warning("Миграция индексов/подписок не выполнена: %s", e)
+
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS payment_card VARCHAR(100)"))
+            await conn.execute(text("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS receipt_file_id VARCHAR(255)"))
+            await conn.execute(text("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS receipt_type VARCHAR(20)"))
+            await conn.execute(text("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS purchase_product_id INTEGER"))
+        logger.info("Миграция: метаданные чеков и связь пополнения с покупкой добавлены.")
+    except Exception as e:
+        logger.warning("Миграция метаданных чеков не выполнена: %s", e)
+
+    # Отдельная миграция снимка названия товара в отзыве. Она не должна
+    # откатываться вместе с индексом уникальности, если в старых данных
+    # случайно уже есть дубли отзывов.
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS product_label VARCHAR(150)"))
+            await conn.execute(text(
+                "UPDATE reviews r SET product_label = s.name || ' • ' || p.duration "
+                "FROM products p JOIN softwares s ON s.id = p.software_id "
+                "WHERE r.product_id = p.id AND (r.product_label IS NULL OR r.product_label = '')"
+            ))
+        logger.info("Миграция: reviews.product_label добавлен и заполнен.")
+    except Exception as e:
+        logger.warning(f"Миграция reviews.product_label не выполнена: {e}")
+
+    # Backfill старых покупок: по историческому имени и сроку восстанавливаем
+    # product_id и цену, чтобы профиль и статистика работали и для старых продаж.
+    try:
+        async with async_session_maker() as session:
+            products_res = await session.execute(
+                select(Product.id, Product.price, Product.duration, Software.name)
+                .join(Software, Product.software_id == Software.id)
+            )
+            product_map = {
+                (name, duration): (pid, float(price))
+                for pid, price, duration, name in products_res.all()
+            }
+            purchases_res = await session.execute(select(Purchase).where(Purchase.product_id.is_(None)))
+            changed = 0
+            for purchase in purchases_res.scalars().all():
+                for (name, duration), (product_id, price) in product_map.items():
+                    if purchase.product_name == f"{name} ({duration})" and purchase.duration == duration:
+                        purchase.product_id = product_id
+                        purchase.price_paid = price
+                        changed += 1
+                        break
+            if changed:
+                await session.commit()
+                logger.info(f"Backfill purchases: восстановлено {changed} исторических покупок.")
+    except Exception as e:
+        logger.warning(f"Backfill исторических покупок не выполнен: {e}")
+
+    try:
+        async with engine.begin() as conn:
+            # НОВОЕ: модерация отзывов — статус по умолчанию "pending" для новых
+            # записей. Проверяем, существовала ли колонка ДО этого запуска: если
+            # нет — это первое включение модерации, и все уже накопленные отзывы
+            # (которые раньше публиковались мгновенно, без модерации) одноразово
+            # помечаем "approved", чтобы не потерять их из раздела "⭐ Отзывы".
+            # На всех последующих запусках колонка уже существует, поэтому этот
+            # backfill не выполняется повторно и не "одобряет" новые pending-отзывы.
+            col_exists_res = await conn.execute(text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'reviews' AND column_name = 'status'"
+            ))
+            column_already_existed = col_exists_res.first() is not None
+
+            await conn.execute(text(
+                "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS status VARCHAR(20) NOT NULL DEFAULT 'pending'"
+            ))
+
+            if not column_already_existed:
+                await conn.execute(text("UPDATE reviews SET status = 'approved'"))
+        logger.info("Миграция: reviews.status добавлен (старые отзывы помечены approved).")
+    except Exception as e:
+        logger.warning(f"Миграция reviews.status не выполнена: {e}")
+
+    for table_name in ("platforms", "softwares", "products"):
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    f"SELECT setval(pg_get_serial_sequence('{table_name}', 'id'), "
+                    f"COALESCE((SELECT MAX(id) FROM {table_name}), 1), "
+                    f"(SELECT MAX(id) IS NOT NULL FROM {table_name}))"
+                ))
+            logger.info(f"Миграция: sequence {table_name}.id синхронизирован с данными.")
+        except Exception as e:
+            logger.warning(f"Синхронизация sequence {table_name}.id не выполнена: {e}")
+
+
+async def build_fsm_storage():
+    if REDIS_URL:
+        if RedisStorage is None:
+            logger.warning("REDIS_URL задан, но пакет redis не установлен. FSM будет временным; добавьте redis>=5.")
+        else:
+            storage = None
+            try:
+                storage = RedisStorage.from_url(REDIS_URL)
+                await storage.redis.ping()
+                logger.info("FSM storage: Redis (состояния переживают перезапуск процесса).")
+                return storage
+            except Exception:
+                logger.exception("Не удалось проверить Redis. Используется MemoryStorage.")
+                if storage is not None:
+                    try:
+                        await storage.close()
+                    except Exception:
+                        pass
+    logger.warning("FSM storage: MemoryStorage. Состояния диалогов сбросятся при перезапуске; задайте REDIS_URL для Redis.")
+    return MemoryStorage()
+
+
+async def main() -> None:
+    if not BOT_TOKEN:
+        logger.error("Переменная окружения BOT_TOKEN не задана. Останавливаю запуск.")
+        return
+
+    # Создаём таблицы, если их ещё нет
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    await run_migrations()
+    await seed_platforms(async_session_maker)
+
+    # До polling проверяем соединение с БД: лучше упасть на старте с понятным
+    # логом, чем запустить магазин с недоступной базой.
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+
+    bot = Bot(token=BOT_TOKEN)
+    storage = await build_fsm_storage()
+    dp = Dispatcher(storage=storage)
+    dp.update.middleware(DbSessionMiddleware(session_pool=async_session_maker))
+    dp.include_router(router)
+    server_runner = None
+
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Открыть главное меню"),
+            BotCommand(command="help", description="Помощь по магазину"),
+            BotCommand(command="cancel", description="Отменить текущий ввод"),
+            BotCommand(command="id", description="Показать мой Telegram ID"),
+        ])
+        server_runner = await run_stub_server()
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Бот запущен, начинаю polling...")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        if server_runner:
+            await server_runner.cleanup()
+        try:
+            await storage.close()
+        except Exception:
+            pass
+        await bot.session.close()
+        await engine.dispose()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
