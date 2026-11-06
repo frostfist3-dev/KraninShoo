@@ -1552,9 +1552,56 @@ async def show_games(callback: CallbackQuery, session: AsyncSession, state: FSMC
     await callback.answer()
 
 
+def _is_no_os_platform(platform_name: str | None) -> bool:
+    """Распознаёт техническую платформу-заглушку, которая не должна показываться покупателю."""
+    value = (platform_name or "").strip().casefold()
+    normalized = "".join(ch for ch in value if ch.isalnum())
+    return normalized in {
+        "noos", "безос", "нетос", "неуказано", "неприменимо", "none", "null",
+    }
+
+
+async def _render_game_softwares(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    game: Game,
+    platform: Platform,
+    *,
+    no_os: bool = False,
+):
+    """Общий экран софта; для заглушки NO_OS не показываем пользователю техническую ОС."""
+    result = await session.execute(
+        select(Software)
+        .where(Software.game_id == game.id, Software.platform_id == platform.id)
+        .order_by(Software.name.asc(), Software.id.asc())
+    )
+    softwares = result.scalars().all()
+    if not softwares:
+        await callback.answer("Для этой игры пока не добавлен софт.", show_alert=True)
+        return
+
+    buttons = [
+        [InlineKeyboardButton(text=f"🛡 {sw.name[:48]}", callback_data=f"software_{sw.id}")]
+        for sw in softwares
+    ]
+    back_text = "🔙 К выбору игры" if no_os else "🔙 К выбору ОС"
+    back_data = "shop" if no_os else f"game_{game.id}"
+    buttons.append([InlineKeyboardButton(text=back_text, callback_data=back_data)])
+
+    header = f"🎮 **{escape_md(game.name)}**\n"
+    if not no_os:
+        header += f"📱 **{escape_md(platform.name)}**\n"
+    await callback.message.edit_text(
+        header + "━━━━━━━━━━━━━━━━━━━\n🛡 Теперь выберите софт:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("game_"))
 async def show_game_os(callback: CallbackQuery, session: AsyncSession):
-    """Шаг 2: показываем ОС, на которых есть софт выбранной игры."""
+    """Шаг 2: если ОС есть — выбор ОС; если только заглушка NO_OS — сразу список софта."""
     try:
         game_id = int(callback.data.rsplit("_", 1)[1])
     except (TypeError, ValueError):
@@ -1574,13 +1621,20 @@ async def show_game_os(callback: CallbackQuery, session: AsyncSession):
         .order_by(Platform.name.asc())
     )
     platforms = rows.all()
-
     if not platforms:
         await callback.answer("Для этой игры пока не добавлен софт.", show_alert=True)
         return
 
+    visible_platforms = [(pid, name) for pid, name in platforms if not _is_no_os_platform(name)]
+    if not visible_platforms:
+        # В БД всё ещё нужен platform_id, но техническое значение NO_OS не показываем.
+        no_os_id, _ = platforms[0]
+        platform = await session.get(Platform, no_os_id)
+        await _render_game_softwares(callback, session, game, platform, no_os=True)
+        return
+
     buttons = []
-    for platform_id, platform_name in platforms:
+    for platform_id, platform_name in visible_platforms:
         lower_name = platform_name.lower()
         if "android" in lower_name:
             icon = "🤖"
@@ -1606,7 +1660,7 @@ async def show_game_os(callback: CallbackQuery, session: AsyncSession):
 
 @router.callback_query(F.data.startswith("gameos_"))
 async def show_game_os_products(callback: CallbackQuery, session: AsyncSession):
-    """Шаг 3: после выбора ОС всегда показываем отдельный список софта."""
+    """Шаг 3: после выбора настоящей ОС показываем отдельный список софта."""
     try:
         _, game_id_raw, platform_id_raw = callback.data.split("_")
         game_id, platform_id = int(game_id_raw), int(platform_id_raw)
@@ -1619,29 +1673,9 @@ async def show_game_os_products(callback: CallbackQuery, session: AsyncSession):
     if not game or not platform:
         await callback.answer("Игра или ОС больше не найдена. Откройте каталог заново.", show_alert=True)
         return
-
-    result = await session.execute(
-        select(Software)
-        .where(Software.game_id == game.id, Software.platform_id == platform.id)
-        .order_by(Software.name.asc(), Software.id.asc())
+    await _render_game_softwares(
+        callback, session, game, platform, no_os=_is_no_os_platform(platform.name)
     )
-    softwares = result.scalars().all()
-    if not softwares:
-        await callback.answer("Для этой игры нет софта на выбранной ОС.", show_alert=True)
-        return
-
-    buttons = [
-        [InlineKeyboardButton(text=f"🛡 {sw.name[:48]}", callback_data=f"software_{sw.id}")]
-        for sw in softwares
-    ]
-    buttons.append([InlineKeyboardButton(text="🔙 К выбору ОС", callback_data=f"game_{game.id}")])
-    await callback.message.edit_text(
-        f"🎮 **{escape_md(game.name)}**\n📱 **{escape_md(platform.name)}**\n"
-        "━━━━━━━━━━━━━━━━━━━\n🛡 Теперь выберите софт:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="Markdown",
-    )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("platform_"))
