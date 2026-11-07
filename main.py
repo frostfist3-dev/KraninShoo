@@ -675,7 +675,7 @@ def get_main_menu_kb(user_id: int, lang: str = "uk"):
         [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile"),
          InlineKeyboardButton(text="💳 Пополнить баланс", callback_data="deposit")],
         [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promo"),
-         InlineKeyboardButton(text="⭐ Отзывы", callback_data="show_reviews")],
+         InlineKeyboardButton(text="⭐ Отзывы", url=REVIEWS_CHANNEL_URL)],
         [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="ref_program")],
         [InlineKeyboardButton(text=texts["lang_btn"], callback_data="change_lang")],
         [InlineKeyboardButton(text="🆘 Поддержка", url=SUPPORT_URL)],
