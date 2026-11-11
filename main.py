@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "KRANIN_SUPPORT").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "gregor_support").strip()
 REVIEWS_CHANNEL_URL = os.getenv("REVIEWS_CHANNEL_URL", "https://t.me/KRANIN_REVIEWS").strip()
 if SUPPORT_USERNAME.startswith("https://t.me/"):
     SUPPORT_URL = SUPPORT_USERNAME
